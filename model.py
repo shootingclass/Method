@@ -35,11 +35,11 @@ class Block(nn.Module):
     
 
 class MW2StackRNNPooling(nn.Module):
-    def __init__(self, input_dim=32, size_embeddings: int = 128):
+    def __init__(self, input_dim=32, size_embeddings: int = 128, in_channels=97):
         super().__init__()
         self.backbone = nn.Sequential(
-            nn.GroupNorm(2, 6),
-            Block(6, input_dim, 10),
+            nn.GroupNorm(1, in_channels),
+            Block(in_channels, input_dim, 10),
             Block(input_dim, input_dim, 5),
             Block(input_dim, input_dim, 5, pool_type="adaptive", embedding_size=32),
             nn.GroupNorm(4, input_dim),

@@ -13,7 +13,7 @@ import os
 # model.py에 저장된 모델 클래스를 임포트합니다.
 from model import Clip4ClipVisionModel
 from visualization import visualize_cam_on_video_grid, visualize_features_on_video_grid
-
+from clustering_model import *
 
 ####################################################################
 
@@ -21,21 +21,38 @@ from visualization import visualize_cam_on_video_grid, visualize_features_on_vid
 def calculate_sensor_stats(dataset):
     """
     Calculates mean and std for each sensor channel across the entire dataset.
+    Uses pandas approach for consistency with z_score_channel_stats.py
     """
-    all_sensor_data = []
-    print("Calculating sensor statistics...")
+    import pandas as pd
+    
+    print("Calculating sensor statistics (pandas method)...")
+    
+    # 데이터셋에서 센서 데이터 추출하여 변환할 리스트
+    all_samples = []
     
     for i in tqdm(range(len(dataset)), desc="Collecting sensor data"):
-        _, sensor_data, _ = dataset[i]        
-        all_sensor_data.append(sensor_data)
+        _, sensor_data, _ = dataset[i]
+        # sensor_data 형태: (센서 수, 시간 스텝)
+        
+        # 데이터를 전치하여 시간 스텝이 행이 되도록 함
+        transposed_data = sensor_data.T  # 형태: (시간 스텝, 센서 수)
+        
+        # 각 시간 스텝을 개별 샘플로 취급
+        for t in range(transposed_data.shape[0]):
+            all_samples.append(transposed_data[t])
     
-    concatenated_data = np.concatenate(all_sensor_data, axis=1)
+    # 모든 샘플을 행으로 포함하는 데이터프레임 생성
+    # 각 열은 하나의 센서 채널에 해당
+    df = pd.DataFrame(all_samples)
     
-    mean = np.mean(concatenated_data, axis=1)
-    std = np.std(concatenated_data, axis=1)
+    print(f"데이터프레임 형태: {df.shape} (샘플 수, 센서 수)")
+    
+    # 판다스의 mean, std 함수를 사용하여 각 센서(열)별 통계 계산
+    means = df.mean().values
+    stds = df.std().values
     
     print("Calculation complete.")
-    return {'mean': mean, 'std': std}
+    return {'mean': means, 'std': stds}
 
 
 #################################################################
@@ -64,18 +81,53 @@ def load_stats(path):
 #################################################################
 
 
-def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, device, epoch, output_dir):
+def train_one_epoch_with_cam(video_model, clustering_model, dataloader, criterion, optimizer, device, epoch, output_dir, args):
     video_model.train()
+    clustering_model.train()
     total_loss = 0.0
     correct_predictions = 0
     total_frames = 0 # [수정] 샘플 수를 비디오가 아닌 프레임 기준으로 변경
+    
 
     for batch_idx, (videos, sensors, labels) in enumerate(tqdm(dataloader, desc=f"Epoch {epoch} Training")):
         videos = videos.to(device)
         sensors = sensors.to(device)
         labels = labels.to(device)
+        # print("sensors", sensors)
+        # print("labels", labels)
+        # assert False
+
 
         optimizer.zero_grad()
+        # 0. 클러스터링 모델 순전파 및 손실 계산 (비지도 학습)
+        num_sensors = sensors.shape[1]
+        rule_based_feature = get_representative_sensor_feature(sensors, labels, num_sensors, args.top_k)
+        scores_cluster, final_feature_cluster, alpha = clustering_model(sensors, rule_based_feature)
+        scores_sk = sinkhorn_knopp(scores_cluster, args.temperature, args.sk_iterations, device)
+        # wandb.log({"train_alpha": alpha})
+    
+        with torch.no_grad():
+            pseudo_labels = torch.argmax(scores_sk, dim=1)
+            
+        mse_loss = F.mse_loss(final_feature_cluster, clustering_model.prototypes[pseudo_labels])
+        
+        prototypes = clustering_model.prototypes
+        p1 = prototypes.unsqueeze(1)
+        p2 = prototypes.unsqueeze(0)
+        mse_matrix = F.mse_loss(p1, p2, reduction='none').mean(dim=2)
+        n_proto = args.num_classes
+        diversity_loss = - (mse_matrix.sum()) / (n_proto * (n_proto - 1))
+        
+        loss_cluster = mse_loss + diversity_loss
+
+        if epoch < args.threshold_epoch:
+            # 9-epoch까지는 클러스터링 모델만 학습
+            loss_cluster.backward()
+            optimizer.step()
+            total_loss += loss_cluster.item()
+            continue
+        # 일단 rule-based feature 사용 (almost 0.7 accuracy)
+        labels = pseudo_labels
 
         # 1단계: 단일 순전파로 모든 결과 얻기
         model_output = video_model(videos)
@@ -195,7 +247,7 @@ def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, devi
         # ==================================================================================
         # 4단계: 최종 손실 계산 및 학습
         # ==================================================================================
-        main_loss = classification_loss
+        main_loss = classification_loss + loss_cluster
         main_loss.backward()
         optimizer.step()
 
@@ -207,9 +259,19 @@ def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, devi
         total_frames += (batch_size * n_frames)
 
     # [수정] 평균 손실과 정확도 계산
+    if total_frames == 0:
+        return total_loss, 0
     avg_loss = total_loss / len(dataloader.dataset)
     avg_acc = correct_predictions / total_frames
 
     # wandb.log({"Train/Loss": avg_loss, "Train/Accuracy": avg_acc, "epoch": epoch})
 
     return avg_loss, avg_acc
+
+def validation_one_epoch_with_cam(video_model, clustering_model, dataloader, criterion, device, epoch, output_dir, args):
+    video_model.eval()
+    total_loss = 0.0
+    correct_predictions = 0
+    total_frames = 0
+
+    evaluate(clustering_model, dataloader, device, args, epoch, stage="val")

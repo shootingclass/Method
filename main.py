@@ -8,12 +8,15 @@ from tqdm import tqdm # tqdm 라이브러리 임포트 추가
 import wandb
 import numpy as np
 import random
+import argparse
 
 # --- 사용자 정의 모듈 임포트 ---
 from dataset import VideoSensorDataset, SensorTransform
 from model import Clip4ClipVisionModel, MW2StackRNNPooling, ViTWithCAM
+from clustering_model import HybridClusteringModule, initialize_prototypes
 from utils import (
     train_one_epoch_with_cam, 
+    validation_one_epoch_with_cam,
     calculate_sensor_stats, save_stats, load_stats
 )
 
@@ -34,29 +37,33 @@ def set_random_seed(seed):
 ####################################################################
 
 
-def main():
+def main(args):
     
     set_random_seed(42)
 
-    # wandb.init(
-    #     project="Method_Test",  # 원하는 프로젝트 이름으로 변경 가능
-    #     name=f"CNN_SpatialPooling_Resize_HorizontalFlip_Door1",
-    #     )
+    wandb.init(
+        project="Method_Test",  # 원하는 프로젝트 이름으로 변경 가능
+        name=f"CNN_SpatialPooling_Resize_HorizontalFlip_Door1",
+        )
 
     # ==================================================================
     # 1. 하이퍼파라미터 및 설정 정의
     # ==================================================================
     DATA_ROOT = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-    JSON_TRAIN_PATH = "/mnt/hdd4tb/junho/Opportunity++/actionMerge/custom_train.json"
-    JSON_VAL_PATH = "/mnt/hdd4tb/junho/Opportunity++/actionMerge/custom_val.json" 
-    STATS_FILE_PATH = '/home/junho/Method/sensor_stats/sensor_stats.npy' # 센서 데이터 통계 파일 경로
-    NUM_CLASSES = 10
+    JSON_TRAIN_PATH = "/home/jaemo/jaemo_Opportunity++/custom_train.json"
+    JSON_VAL_PATH = "/home/jaemo/jaemo_Opportunity++/custom_val.json" 
+    STATS_FILE_PATH = '/home/jaemo/Method/sensor_stats/sensor_stats.npy' # 센서 데이터 통계 파일 경로
+    NUM_CLASSES = args.num_classes
     NUM_FRAMES = 16
-    BATCH_SIZE = 16
-    EPOCHS = 10
-    LEARNING_RATE = 1e-4
+    BATCH_SIZE = args.batch_size
+    EPOCHS = args.epochs
+    LEARNING_RATE = args.lr
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     NUM_WORKERS = 4
+    EMBEDDING_DIM = args.embedding_dim
+    NUM_SENSORS = args.num_sensors
+    ALPHA_FIXED = args.alpha_fixed
+    THRESHOLD_EPOCH = args.threshold_epoch
 
     print(f"Using device: {DEVICE}")
     print(f"Number of classes: {NUM_CLASSES}")
@@ -138,7 +145,6 @@ def main():
     else:
         # 파일이 없으면, 통계치를 계산하고 저장합니다.
         print(f"Statistics file not found. Calculating for the first time...")
-        
         # 통계 계산용 임시 데이터셋 생성 (전처리 없음)
         temp_train_dataset = VideoSensorDataset(
             json_path=JSON_TRAIN_PATH,
@@ -163,13 +169,14 @@ def main():
         data_root=DATA_ROOT,
         num_frames=NUM_FRAMES,
         transform=train_transform,
-        sensor_transform=sensor_preprocessor # 센서 전처리 적용
+        sensor_transform=sensor_preprocessor, # 센서 전처리 적용
+        threshold_epoch=THRESHOLD_EPOCH
     )
 
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
         drop_last=True
@@ -203,14 +210,46 @@ def main():
 
 
     # ==================================================================
-    # 5. 모델, 손실 함수, 옵티마이저 정의
+    # 5. 모델, 손실 함수, 옵티마이저, 필요 파라미터 정의
     # ==================================================================
+
+    # 첫 배치에서 데이터를 가져와 프로토타입 초기화
+    # print("Initializing prototypes from first batch...")
+    # prototypes = initialize_prototypes(
+    #     train_dataloader, 
+    #     num_clusters, 
+    #     embedding_dim, 
+    #     num_sensors, 
+    #     device,
+    #     args
+    # )
+    
+    # 모델 초기화 (초기화된 프로토타입 전달)
+    prototypes = initialize_prototypes(
+        train_loader, 
+        NUM_CLASSES, 
+        EMBEDDING_DIM, 
+        NUM_SENSORS, 
+        DEVICE, 
+        args
+    )
+    clustering_model = HybridClusteringModule(
+        embedding_dim=EMBEDDING_DIM,
+        num_sensors=NUM_SENSORS, 
+        num_clusters=NUM_CLASSES,
+        # val_dataloader=val_loader,
+        prototypes=prototypes,
+        alpha_fixed=ALPHA_FIXED,
+        total_epochs=EPOCHS,
+        threshold_epoch=THRESHOLD_EPOCH
+    ).to(DEVICE)
+
     video_model = ViTWithCAM(num_classes=NUM_CLASSES).to(DEVICE)
-    sensor_model = MW2StackRNNPooling().to(DEVICE)
+    # sensor_model = MW2StackRNNPooling().to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
 
-    parameters = list(video_model.parameters())
+    parameters = list(video_model.parameters()) + list(clustering_model.parameters())
     optimizer = optim.AdamW(parameters, lr=LEARNING_RATE)
     # ==================================================================
 
@@ -247,12 +286,15 @@ def main():
     print("\n--- Starting Training ---")
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch + 1}/{EPOCHS}")
-        
+        train_dataset.set_epoch(epoch)
+        val_dataset.set_epoch(epoch)
+        clustering_model.update_epoch(epoch)
         # --- 1. 학습 단계 ---
-        train_loss, train_acc = train_one_epoch_with_cam(video_model, train_loader, criterion, optimizer, DEVICE, epoch, output_dir)
+        train_loss, train_acc = train_one_epoch_with_cam(video_model=video_model, clustering_model=clustering_model, dataloader=train_loader, criterion=criterion, optimizer=optimizer, device=DEVICE, epoch=epoch, output_dir=output_dir, args=args)
         print(f"[Train] Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
-
     #     # --- 2. 검증 단계 ---
+        validation_one_epoch_with_cam(video_model=video_model, clustering_model=clustering_model, dataloader=val_loader, criterion=criterion, device=DEVICE, epoch=epoch, output_dir=output_dir, args=args)
+
     #     # val_loader가 정의되었을 경우에만 실행
     #     if val_loader:
     #         # val_loss, val_acc = validate(model, val_loader, criterion, DEVICE, epoch, PATCH_SIZE)
@@ -275,4 +317,24 @@ def main():
     # ==================================================================
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Pure PyTorch version of SwAV for IMU Clustering")
+    
+    # 기존 인자들을 그대로 사용
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--embedding_dim", type=int, default=512)
+    parser.add_argument("--num_classes", type=int, default=9) # 더미데이터는 10개 클래스
+    parser.add_argument("--temperature", type=float, default=0.03)
+    parser.add_argument("--sk_iterations", type=int, default=3)
+    parser.add_argument("--project_name", type=str, default="SwAV_IMU_Clustering_PyTorch")
+    parser.add_argument("--run_name", type=str, default="swav_hybrid_pytorch")
+    parser.add_argument('--config', type=str, default='path/to/your/config.yaml') # 실제 경로로 수정 필요
+    parser.add_argument("--alpha_fixed", type=bool, default=False) # --alpha_fixed 사용시 True
+    parser.add_argument("--top_k", type=int, default=3)
+    parser.add_argument("--num_sensors", type=int, default=97)
+    parser.add_argument("--threshold_epoch", type=int, default=15)
+    
+    args = parser.parse_args()
+    main(args)
