@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
 from typing import List
 import torchvision.transforms.functional as TF
+from sklearn.manifold import TSNE
+import os
 
 
 #################################################################
@@ -353,3 +355,48 @@ def visualize_features_on_video_grid(video_tensor, feature_map_tensor, grid_size
 
     return final_grid_image
 
+
+#################################################################
+
+
+def visualize_v_motion_tsne(v_motions_list, epoch, output_dir):
+    """
+    수집된 v_motion 벡터들에 대해 t-SNE를 실행하고 결과를 저장합니다.
+    """
+    # 리스트가 비어있으면 함수 종료
+    if not v_motions_list:
+        print(f"Epoch {epoch}: v_motion 리스트가 비어있어 t-SNE 시각화를 건너뜁니다.")
+        return
+
+    print(f"Epoch {epoch}: t-SNE 시각화를 시작합니다...")
+
+    # v_motion 텐서들을 하나의 넘파이 배열로 결합
+    # 리스트에 있는 모든 텐서를 GPU에서 CPU로 이동시킨 후 넘파이 배열로 변환
+    v_motions_np = np.concatenate(v_motions_list, axis=0)
+
+    # 샘플 수가 perplexity 값(기본 30)보다 적을 경우 t-SNE 실행이 불가하므로 조정
+    n_samples = v_motions_np.shape[0]
+    perplexity_value = min(30, n_samples - 1)
+
+    if n_samples <= 1:
+        print(f"Epoch {epoch}: 샘플 수가 부족하여 t-SNE를 실행할 수 없습니다.")
+        return
+
+    # t-SNE 모델 초기화 및 실행
+    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity_value, n_iter=300)
+    tsne_results = tsne.fit_transform(v_motions_np)
+
+    # Matplotlib을 사용한 시각화
+    plt.figure(figsize=(12, 10))
+    plt.scatter(tsne_results[:, 0], tsne_results[:, 1], alpha=0.7)
+    plt.title(f't-SNE Visualization of v_motion at Epoch {epoch + 1}')
+    plt.xlabel('t-SNE Dimension 1')
+    plt.ylabel('t-SNE Dimension 2')
+    plt.grid(True)
+
+    # 결과 이미지 저장
+    save_path = os.path.join(output_dir, f"epoch_{epoch+1}_v_motion_tsne.png")
+    plt.savefig(save_path)
+    plt.close() # 메모리 해제를 위해 plot을 닫음
+
+    print(f"t-SNE 시각화 결과가 {save_path} 에 저장되었습니다.")

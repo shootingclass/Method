@@ -62,7 +62,7 @@ def main():
     print(f"Number of classes: {NUM_CLASSES}")
 
     # 시각화 결과물을 저장할 폴더 이름
-    output_dir = "cam_visualizations_Door2_Augmentation_ver2"
+    output_dir = "Visualization/T-SNE"
     
     # 폴더가 없으면 생성
     os.makedirs(output_dir, exist_ok=True)
@@ -79,7 +79,6 @@ def main():
     # 훈련(Training)용 변환
     train_transform = transforms.Compose([
         
-        # RandomResizedCrop 제거 -> Resize로 변경
         # 프레임 전체의 정보를 보존하여 모델이 스스로 중요한 위치를 찾도록 함
         transforms.Resize(size=(224, 224), antialias=True),
 
@@ -88,17 +87,17 @@ def main():
         
         # 배경 편향 방지를 위한 데이터 증강 추가
         # ColorJitter: 배경의 색감/조명에 대한 의존도를 낮춤
-        # transforms.ColorJitter(
-        #     brightness=0.5, # 기존 0.4 -> 0.5
-        #     contrast=0.5,   # 기존 0.4 -> 0.5
-        #     saturation=0.5, # 기존 0.4 -> 0.5
-        #     hue=0.2         # 기존 0.1 -> 0.2
-        # ),
+        transforms.ColorJitter(
+            brightness=0.4, # 기존 0.4 -> 0.5
+            contrast=0.4,   # 기존 0.4 -> 0.5
+            saturation=0.4, # 기존 0.4 -> 0.5
+            hue=0.1         # 기존 0.1 -> 0.2
+        ),
         
         # GaussianBlur: 배경의 미세한 질감을 뭉개서 큰 구조에 집중하도록 함
         transforms.GaussianBlur(
-            kernel_size=(3, 3), # 커널 크기 범위 증가
-            sigma=(0.1, 3.0)    # 시그마(흐림 강도) 범위 증가
+            kernel_size=(5, 5), # 커널 크기 범위 증가
+            sigma=(0.1, 2.0)    # 시그마(흐림 강도) 범위 증가
         ),
 
         # 텐서 변환 및 후속 증강
@@ -117,6 +116,7 @@ def main():
         # 모델에 입력하기 직전, 표준 정규화 수행
         transforms.Normalize(mean=clip_mean, std=clip_std),
     ])
+
 
     # 검증(Validation) 및 테스트(Test)용 변환
     # 데이터 증강 없이, 리사이즈와 정규화만 수행
