@@ -12,7 +12,7 @@ import os
 
 # model.py에 저장된 모델 클래스를 임포트합니다.
 from model import Clip4ClipVisionModel
-from visualization import visualize_cam_on_video_grid, visualize_features_on_video_grid, visualize_v_motion_tsne
+from visualization import save_video_grid
 
 
 ####################################################################
@@ -82,7 +82,23 @@ def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, devi
         model_output = video_model(videos)
         logits = model_output['logits']              # (B, T, C)
         all_class_cam = model_output['cam']          # (B, T, C, H, W)
-        intermediate_features = model_output['intermediate_features']
+        
+        # [추가] 2단계(어텐션 브릿지)의 출력 V'을 받아옵니다.
+        # 이 변수는 3단계(모션 스트림)의 입력으로 사용될 예정입니다.
+        transformed_video = model_output['transformed_video']
+
+        # 시각화
+        # ==================================================================================
+        # [추가] 첫 번째 배치에 대한 transformed_video 시각화
+        # ==================================================================================
+        if batch_idx == 0:
+            
+            # 저장 경로를 epoch별로 다르게 설정합니다.
+            vis_output_path = os.path.join(output_dir, "transformed_video", f"epoch_{epoch}.png")
+
+            # 시각화 함수를 호출합니다.
+            save_video_grid(transformed_video, vis_output_path)
+        # ==================================================================================
 
         batch_size, n_frames, n_classes = logits.shape
 
@@ -98,121 +114,6 @@ def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, devi
         # 결과 shape: (B, T)
         predicted_classes = torch.argmax(logits, dim=2)
 
-        # [수정] torch.gather를 사용하여 예측 클래스에 해당하는 CAM을 안전하게 선택
-        # gather를 위해 cam과 predicted_classes의 차원을 조정합니다.
-        # cam: (B, T, C, H, W) -> 그대로 사용
-        # pred: (B, T) -> (B, T, 1, 1, 1)로 확장하여 인덱싱 준비
-        pred_indices_expanded = predicted_classes.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        pred_indices_expanded = pred_indices_expanded.expand(-1, -1, -1, all_class_cam.shape[3], all_class_cam.shape[4])
-
-        # all_class_cam의 클래스 차원(dim=2)에서 예측 인덱스에 해당하는 CAM을 수집
-        # 결과 shape: (B, T, 1, H, W)
-        gathered_cam = torch.gather(all_class_cam, 2, pred_indices_expanded)
-
-        # 클래스 차원을 제거하여 최종 마스크 획득
-        # 결과 shape: (B, T, H, W)
-        cam_masks_tensor = gathered_cam.squeeze(2)
-
-        # # ==================================================================================
-        # # 시각화 로직 (첫 번째 배치에 대해서만 실행)
-        # # ==================================================================================
-        # if batch_idx == 0:
-            
-        #     # 여기 수정!!!
-        #     # 시각화할 샘플 인덱스 결정 (기존 로직 유지 - 좋은 방식)
-        #     target_indices = (labels == 1).nonzero(as_tuple=True)[0]
-            
-        #     if len(target_indices) > 0:
-        #         idx_to_visualize = target_indices[0].item()
-        #     else:
-        #         idx_to_visualize = torch.randint(0, batch_size, (1,)).item()
-
-        #     # 결정된 인덱스로 시각화할 데이터 선택
-        #     video_to_viz = videos[idx_to_visualize].detach()
-        #     cam_to_viz = all_class_cam[idx_to_visualize].detach() # 모든 클래스 CAM 전달
-        #     pred_to_viz = predicted_classes[idx_to_visualize].detach() # [수정] 올바르게 계산된 예측 전달
-
-        #     # 시각화 함수 호출
-        #     grid_image = visualize_cam_on_video_grid(
-        #         video_tensor=video_to_viz,
-        #         cam_tensor=cam_to_viz,
-        #         predicted_class_indices=pred_to_viz
-        #     )
-
-        #     if grid_image:
-        #         filename = os.path.join(output_dir, f"epoch_{epoch+1}_cam_visualization.png")
-        #         grid_image.save(filename)
-        #         print(f"CAM visualization saved to {filename}")
-
-                # wandb.log({"Train/CAM_Visualization": wandb.Image(grid_image, caption=f"Epoch {epoch+1}")}, step=epoch)
-
-        # ==================================================================================
-        # 3단계: 어텐션 마스킹 및 최종 임베딩 생성 (기존 로직과 거의 동일)
-        # ==================================================================================
-        patch_features = intermediate_features[:, :, 1:, :]
-        b, t, num_patches, hidden_dim = patch_features.shape
-        patch_grid_size = int(np.sqrt(num_patches))
-
-        resized_cam = F.interpolate(cam_masks_tensor, size=(patch_grid_size, patch_grid_size), mode='bilinear', align_corners=False)
-        resized_cam_flat = resized_cam.view(b, t, -1).unsqueeze(-1)
-        masked_patch_features = patch_features * resized_cam_flat # (B, T, num_patches, hidden_dim) --> (16, 16, 49, 768)
-
-
-        # # ==================================================================================
-        # # [추가] 마스킹된 피처맵 시각화 로직
-        # # ==================================================================================
-        # # 시각화할 샘플의 마스킹된 피처맵 선택 (CAM 시각화와 동일한 인덱스 사용)
-        # features_to_viz = masked_patch_features[idx_to_visualize].detach()
-
-        # # 1. 피처맵 가공: (T, num_patches, hidden_dim) -> (T, H_feat, W_feat)
-        # # hidden_dim 차원에 대해 평균을 내어 차원 축소
-        # feature_strengths = features_to_viz.mean(dim=-1) # -> (T, num_patches)
-
-        # # 2D 그리드로 재구성
-        # # patch_grid_size는 이전에 계산된 값을 사용해야 합니다. (예: 14)
-        # # 만약 이전에 없다면, 여기서 다시 계산: patch_grid_size = int(np.sqrt(num_patches))
-        # feature_map_2d = feature_strengths.view(
-        #     -1, patch_grid_size, patch_grid_size
-        # ) # -> (T, patch_grid_size, patch_grid_size)
-
-        # # 2. 새로운 시각화 함수 호출
-        # # 원본 비디오(video_to_viz)와 가공된 피처맵(feature_map_2d)을 전달
-        # feature_grid_image = visualize_features_on_video_grid(
-        #     video_tensor=video_to_viz,
-        #     feature_map_tensor=feature_map_2d
-        # )
-
-        # # 3. 결과 저장 및 로깅
-        # if feature_grid_image:
-        #     feature_filename = os.path.join(output_dir, f"epoch_{epoch+1}_feature_visualization.png")
-        #     feature_grid_image.save(feature_filename)
-        #     print(f"Feature map visualization saved to {feature_filename}")
-
-
-        # Motion Feature
-        # ==================================================================================
-        # [추가] 프레임 차분을 이용한 모션 벡터(v_motion) 생성
-        # ==================================================================================
-        # 1. 연속 프레임 특징 준비 (f_t, f_t+1)
-        # masked_patch_features의 Shape: (B, T, num_patches, hidden_dim)
-        features_t = masked_patch_features[:, :-1, :, :]
-        features_t_plus_1 = masked_patch_features[:, 1:, :, :]
-
-        # 2. 프레임 차분 계산 (d_t = f_t+1 - f_t)
-        # frame_diffs Shape: (B, T-1, num_patches, hidden_dim)
-        frame_diffs = features_t_plus_1 - features_t
-
-        # 3. 시간 축 통합 (Temporal Average Pooling)
-        # aggregated_diff_map Shape: (B, num_patches, hidden_dim)
-        aggregated_diff_map = frame_diffs.mean(dim=1)
-
-        # 4. 공간 축 통합 (Global Average Pooling)
-        # v_motion Shape: (B, hidden_dim) --> (16, 768)
-        v_motion = aggregated_diff_map.mean(dim=1)
-
-        # v_motion 텐서를 CPU로 옮긴 후 NumPy 배열로 변환
-        epoch_v_motions.append(v_motion.detach().cpu().numpy())
-
         # ==================================================================================
         # 4단계: 최종 손실 계산 및 학습
         # ==================================================================================
@@ -226,8 +127,6 @@ def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, devi
         # [수정] 정확도는 프레임 단위로 계산
         correct_predictions += (predicted_classes == labels_expanded).sum().item()
         total_frames += (batch_size * n_frames)
-
-    visualize_v_motion_tsne(epoch_v_motions, epoch, output_dir)
 
     # [수정] 평균 손실과 정확도 계산
     avg_loss = total_loss / len(dataloader.dataset)

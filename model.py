@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPVisionModelWithProjection
+from transformers import CLIPVisionModelWithProjection, ViTModel, AutoModel
 from peft import LoraConfig, get_peft_model
 import random
 from einops import rearrange, repeat
@@ -135,6 +135,63 @@ class Clip4ClipVisionModel(nn.Module):
 #################################################################
 
 
+class DinoVisionModel(nn.Module):
+    """
+    DINO로 사전 학습된 ViT를 특징 추출기로 사용하는 클래스 (수정본).
+    """
+    def __init__(self): # num_classes는 특징 추출만 하므로 필요 없음
+        super().__init__()
+
+        # 1. Hugging Face Hub에서 올바른 클래스로 DINO ViT 모델 로드
+        self.video_model = AutoModel.from_pretrained("facebook/dinov2-small")
+
+        # 2. ViTModel 아키텍처에 맞는 LoRA 설정
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=[
+                "attention.attention.query",
+                "attention.attention.key",
+                "attention.attention.value",
+                "attention.output.dense",
+                "intermediate.dense",
+                "output.dense",
+            ],
+            lora_dropout=0.05,
+            bias="none"
+        )
+
+        self.video_model = get_peft_model(self.video_model, lora_config)
+        self.video_model.print_trainable_parameters() # 학습 가능한 파라미터 수 확인
+
+
+    def forward(self, video: torch.Tensor):
+        if video.dim() == 4:
+            video = video.unsqueeze(1)
+
+        batch_size, n_frames, c, h, w = video.shape
+        video_reshaped = video.view(batch_size * n_frames, c, h, w)
+
+        # 1. output_hidden_states=True 옵션 없이 모델 호출
+        visual_output = self.video_model(video_reshaped)
+
+        # 2. .hidden_states 대신 .last_hidden_state를 직접 사용
+        final_features = visual_output.last_hidden_state
+
+        # 최종 특징 텐서의 형태를 원래 비디오 차원에 맞게 복원
+        seq_len = final_features.shape[1]
+        hidden_size = final_features.shape[2]
+        final_features = final_features.view(batch_size, n_frames, seq_len, hidden_size)
+
+        # 최종 특징만 반환하도록 수정
+        return {
+            "final_features": final_features
+        }
+
+
+#################################################################
+
+
 class CAMGenerator(nn.Module):
     """
     ViT 특징 맵으로부터 1x1 Conv를 사용하여 프레임별 CAM과 Logits를 생성합니다.
@@ -210,42 +267,191 @@ class CAMGenerator(nn.Module):
 #################################################################
 
 
-class ViTWithCAM(nn.Module):
-    def __init__(self, num_classes: int):
+class LocalisationNetwork(nn.Module):
+    """
+    F_A를 입력받아 어파인 변환 행렬 theta를 회귀하는 작은 CNN.
+    """
+    def __init__(self, input_channels: int, patch_grid_size: int):
         super().__init__()
+        # F_A를 처리하기 위한 CNN 구조
+        self.cnn = nn.Sequential(
+            nn.Conv2d(input_channels, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, stride=2), # H, W -> H/2, W/2
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, stride=2) # H/2, W/2 -> H/4, W/4
+        )
 
-        # 1. 특징 추출기: LoRA가 적용된 Clip4ClipVisionModel을 그대로 사용합니다.
-        # 이 모델 내부의 classifier는 무시하고, 특징 추출 결과만 사용합니다.
-        self.feature_extractor = Clip4ClipVisionModel(num_classes=num_classes)
+        # CNN 출력 크기를 동적으로 계산
+        final_grid_size = patch_grid_size // 4
+        final_channels = 64
+        flattened_size = final_channels * final_grid_size * final_grid_size
 
-        # 2. CAM 생성기: ViT가 추출한 특징을 받아 CAM과 최종 logits를 생성합니다.
-        hidden_size = self.feature_extractor.video_model.config.hidden_size # 768
+        # 어파인 변환 행렬 theta (2x3)의 6개 파라미터를 회귀
+        self.regressor = nn.Linear(flattened_size, 6)
+
+        # 학습 안정성을 위해 항등 변환(identity transform)으로 초기화
+        self.regressor.weight.data.zero_()
+        self.regressor.bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+    def forward(self, features_2d: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features_2d (torch.Tensor): (B*T, C, H_patch, W_patch) 형태의 특징 맵
+        Returns:
+            torch.Tensor: (B*T, 2, 3) 형태의 어파인 변환 행렬 theta
+        """
+        x = self.cnn(features_2d)
+        x = x.reshape(x.size(0), -1)
+        theta = self.regressor(x)
+        theta = theta.view(-1, 2, 3) # (B*T, 2, 3) 형태로 변환
+        return theta
+
+
+#################################################################
+
+
+class AttentionBridge(nn.Module):
+    """
+    LocalisationNetwork와 STN을 통합하여 어텐션 브릿지 역할을 수행.
+    """
+    def __init__(self, input_hidden_size: int, patch_grid_size: int, target_size: tuple = (96, 96)):
+        super().__init__()
+        self.localisation_net = LocalisationNetwork(input_hidden_size, patch_grid_size)
+        self.target_size = target_size # V'의 목표 해상도 (H_t, W_t)
+
+    def forward(self, features: torch.Tensor, original_video: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features (torch.Tensor): (B, T, Seq_Len, Hidden_Size) 형태의 ViT 특징
+            original_video (torch.Tensor): (B, T, C, H, W) 형태의 원본 비디오
+        Returns:
+            torch.Tensor: (B, T, C, H_t, W_t) 형태의 변환된 비디오 클립 V'
+        """
+        batch_size, n_frames, seq_len, hidden_size = features.shape
+        _, _, c, h, w = original_video.shape
+
+        # --- 1. LocalisationNetwork 입력 준비 (CAMGenerator와 유사) ---
+        # CLS 토큰을 제외하고, (B*T, C, H, W) 형태로 변환
+        patch_features = features[:, :, 1:, :].reshape(batch_size * n_frames, seq_len - 1, hidden_size)
+        patch_grid_h = patch_grid_w = int((seq_len - 1) ** 0.5)
+        patch_features_2d = patch_features.permute(0, 2, 1).view(
+            batch_size * n_frames, hidden_size, patch_grid_h, patch_grid_w
+        )
+
+        # --- 2. LocalisationNetwork를 통해 theta 계산 ---
+        theta = self.localisation_net(patch_features_2d) # (B*T, 2, 3)
+
+        # --- 3. STN을 이용해 V' 생성 ---
+        video_reshaped = original_video.reshape(batch_size * n_frames, c, h, w)
+
+        # grid_sample에 사용할 목표 크기를 포함한 전체 사이즈 지정
+        grid_target_size = torch.Size([batch_size * n_frames, c, self.target_size[0], self.target_size[1]])
+
+        # theta를 이용해 샘플링 그리드 생성
+        grid = F.affine_grid(theta, grid_target_size, align_corners=False)
+
+        # 원본 비디오와 그리드를 이용해 변환된 비디오 샘플링
+        transformed_video = F.grid_sample(video_reshaped, grid, align_corners=False, padding_mode="border")
+
+        # --- 4. 최종 출력 형태 복원 ---
+        transformed_video = transformed_video.view(batch_size, n_frames, c, self.target_size[0], self.target_size[1])
+
+        return transformed_video
+
+
+
+#################################################################
+
+
+# class ViTWithCAM(nn.Module):
+#     def __init__(self, num_classes: int):
+#         super().__init__()
+
+#         # 1. 특징 추출기: LoRA가 적용된 Clip4ClipVisionModel을 그대로 사용합니다.
+#         self.feature_extractor = Clip4ClipVisionModel(num_classes=num_classes)
+
+#         # 2. CAM 생성기: ViT가 추출한 특징을 받아 CAM과 최종 logits를 생성합니다.
+#         hidden_size = self.feature_extractor.video_model.config.hidden_size # 768
         
-        self.cam_generator = CAMGenerator(input_hidden_size=hidden_size, num_classes=num_classes)
+#         self.cam_generator = CAMGenerator(input_hidden_size=hidden_size, num_classes=num_classes)
 
-    def forward(self, video: torch.Tensor):
+#     def forward(self, video: torch.Tensor):
         
-        # 1. LoRA가 적용된 ViT를 통해 특징을 추출합니다.
-        # 이 과정에서 그래디언트가 LoRA 파라미터로 흘러가도록 합니다.
-        # features_dict --> {"intermediate_features": intermediate_features, "final_features": final_features}
+#         # 1. LoRA가 적용된 ViT를 통해 특징을 추출합니다.
+#         # 이 과정에서 그래디언트가 LoRA 파라미터로 흘러가도록 합니다.
+#         # features_dict --> {"intermediate_features": intermediate_features, "final_features": final_features}
+#         features_dict = self.feature_extractor(video)
+        
+#         # ViT의 레이어에서 나온 특징맵을 사용합니다.
+#         # Shape: (B, T, Seq_Len, Hidden_Size)
+#         final_features = features_dict["final_features"]
+#         intermediate_features = features_dict["intermediate_features"]
+        
+#         # 2. 추출된 특징맵을 CAM 생성기에 전달하여 최종 출력(logits, cam)을 얻습니다.
+#         # 이 모듈의 파라미터는 전체가 학습됩니다 (full-tuning).
+#         # output_dict --> {"logits": logits, "cam": activated_cam}
+#         output_dict = self.cam_generator(final_features)
+        
+#         output_dict["intermediate_features"] = intermediate_features
+#         output_dict["final_features"] = final_features
+        
+#         return output_dict
+        
+        
+#################################################################
+
+
+class MethodModel(nn.Module):
+    def __init__(self, num_classes: int, image_size: int, target_size: tuple = (96, 96)):
+        
+        super().__init__()
+        
+        # --- 1단계 모듈 (Appearance & Localization Stream) ---
+        # self.feature_extractor = Clip4ClipVisionModel(num_classes=num_classes)
+        self.feature_extractor = DinoVisionModel()  # DINO ViT로 변경
+        hidden_size = self.feature_extractor.video_model.config.hidden_size
+        self.cam_generator = CAMGenerator(input_hidden_size=hidden_size,  num_classes=num_classes)
+
+        # --- 2단계 모듈 (Attention Bridge) ---
+        patch_size = self.feature_extractor.video_model.config.patch_size
+        patch_grid_size = image_size // patch_size
+
+        self.attention_bridge = AttentionBridge(
+            input_hidden_size=hidden_size,
+            patch_grid_size=patch_grid_size,
+            target_size=target_size
+        )
+
+    def forward(self, video: torch.Tensor) -> dict:
+        """
+        Args:
+            video (torch.Tensor): (B, T, C, H, W) 형태의 원본 비디오
+        Returns:
+            dict: 모델의 모든 출력을 포함하는 딕셔너리
+        """
+        # --- 1단계 실행 ---
+        # 특징 추출
         features_dict = self.feature_extractor(video)
-        
-        # ViT의 레이어에서 나온 특징맵을 사용합니다.
-        # Shape: (B, T, Seq_Len, Hidden_Size)
         final_features = features_dict["final_features"]
-        intermediate_features = features_dict["intermediate_features"]
-        
-        # 2. 추출된 특징맵을 CAM 생성기에 전달하여 최종 출력(logits, cam)을 얻습니다.
-        # 이 모듈의 파라미터는 전체가 학습됩니다 (full-tuning).
-        # output_dict --> {"logits": logits, "cam": activated_cam}
-        output_dict = self.cam_generator(final_features)
-        
-        output_dict["intermediate_features"] = intermediate_features
-        output_dict["final_features"] = final_features
-        
-        return output_dict
-        
-        
+
+        # 1단계의 로짓과 CAM 계산
+        output_dict_A = self.cam_generator(final_features)
+
+        # --- 2단계 실행 ---
+        # 어텐션 브릿지를 통해 변환된 비디오(V') 생성
+        transformed_video = self.attention_bridge(final_features, video)
+
+        # --- 최종 출력 통합 ---
+        # 1단계 결과로 나온 딕셔너리를 기반으로 모든 결과물을 통합
+        final_output = output_dict_A
+        final_output["transformed_video"] = transformed_video
+        final_output["final_features"] = final_features
+
+        return final_output
+
+
 #################################################################
 
 

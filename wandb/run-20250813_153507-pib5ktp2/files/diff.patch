@@ -1,0 +1,224 @@
+diff --git a/main.py b/main.py
+index c7dbc1c..fa804c7 100644
+--- a/main.py
++++ b/main.py
+@@ -42,8 +42,8 @@ def main(args):
+     set_random_seed(42)
+ 
+     wandb.init(
+-        project="Method_Test",  # 원하는 프로젝트 이름으로 변경 가능
+-        name=f"CNN_SpatialPooling_Resize_HorizontalFlip_Door1",
++        project="Method_Test_with_Sensor",  # 원하는 프로젝트 이름으로 변경 가능
++        name=f"testing",
+         )
+ 
+     # ==================================================================
+@@ -71,8 +71,8 @@ def main(args):
+     # 시각화 결과물을 저장할 폴더 이름
+     output_dir = "cam_visualizations_Door2_Augmentation_ver2"
+     
+-    # 폴더가 없으면 생성
+-    os.makedirs(output_dir, exist_ok=True)
++    # # 폴더가 없으면 생성
++    # os.makedirs(output_dir, exist_ok=True)
+ 
+     # ==================================================================
+ 
+@@ -95,17 +95,17 @@ def main(args):
+         
+         # 배경 편향 방지를 위한 데이터 증강 추가
+         # ColorJitter: 배경의 색감/조명에 대한 의존도를 낮춤
+-        # transforms.ColorJitter(
+-        #     brightness=0.5, # 기존 0.4 -> 0.5
+-        #     contrast=0.5,   # 기존 0.4 -> 0.5
+-        #     saturation=0.5, # 기존 0.4 -> 0.5
+-        #     hue=0.2         # 기존 0.1 -> 0.2
+-        # ),
++        transforms.ColorJitter(
++            brightness=0.4, # 기존 0.4 -> 0.5
++            contrast=0.4,   # 기존 0.4 -> 0.5
++            saturation=0.4, # 기존 0.4 -> 0.5
++            hue=0.1         # 기존 0.1 -> 0.2
++        ),
+         
+         # GaussianBlur: 배경의 미세한 질감을 뭉개서 큰 구조에 집중하도록 함
+         transforms.GaussianBlur(
+-            kernel_size=(3, 3), # 커널 크기 범위 증가
+-            sigma=(0.1, 3.0)    # 시그마(흐림 강도) 범위 증가
++            kernel_size=(5, 5), # 커널 크기 범위 증가
++            sigma=(0.1, 2.0)    # 시그마(흐림 강도) 범위 증가
+         ),
+ 
+         # 텐서 변환 및 후속 증강
+@@ -145,6 +145,7 @@ def main(args):
+     else:
+         # 파일이 없으면, 통계치를 계산하고 저장합니다.
+         print(f"Statistics file not found. Calculating for the first time...")
++        
+         # 통계 계산용 임시 데이터셋 생성 (전처리 없음)
+         temp_train_dataset = VideoSensorDataset(
+             json_path=JSON_TRAIN_PATH,
+@@ -212,17 +213,6 @@ def main(args):
+     # ==================================================================
+     # 5. 모델, 손실 함수, 옵티마이저, 필요 파라미터 정의
+     # ==================================================================
+-
+-    # 첫 배치에서 데이터를 가져와 프로토타입 초기화
+-    # print("Initializing prototypes from first batch...")
+-    # prototypes = initialize_prototypes(
+-    #     train_dataloader, 
+-    #     num_clusters, 
+-    #     embedding_dim, 
+-    #     num_sensors, 
+-    #     device,
+-    #     args
+-    # )
+     
+     # 모델 초기화 (초기화된 프로토타입 전달)
+     prototypes = initialize_prototypes(
+@@ -233,6 +223,12 @@ def main(args):
+         DEVICE, 
+         args
+     )
++    
++    
++    print(f"Prototypes initialized with shape: {prototypes.shape}")
++    
++    
++    
+     clustering_model = HybridClusteringModule(
+         embedding_dim=EMBEDDING_DIM,
+         num_sensors=NUM_SENSORS, 
+@@ -242,10 +238,9 @@ def main(args):
+         alpha_fixed=ALPHA_FIXED,
+         total_epochs=EPOCHS,
+         threshold_epoch=THRESHOLD_EPOCH
+-    ).to(DEVICE)
++        ).to(DEVICE)
+ 
+     video_model = ViTWithCAM(num_classes=NUM_CLASSES).to(DEVICE)
+-    # sensor_model = MW2StackRNNPooling().to(DEVICE)
+ 
+     criterion = nn.CrossEntropyLoss()
+ 
+@@ -289,11 +284,13 @@ def main(args):
+         train_dataset.set_epoch(epoch)
+         val_dataset.set_epoch(epoch)
+         clustering_model.update_epoch(epoch)
++        
+         # --- 1. 학습 단계 ---
+         train_loss, train_acc = train_one_epoch_with_cam(video_model=video_model, clustering_model=clustering_model, dataloader=train_loader, criterion=criterion, optimizer=optimizer, device=DEVICE, epoch=epoch, output_dir=output_dir, args=args)
+         print(f"[Train] Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+-    #     # --- 2. 검증 단계 ---
+-        validation_one_epoch_with_cam(video_model=video_model, clustering_model=clustering_model, dataloader=val_loader, criterion=criterion, device=DEVICE, epoch=epoch, output_dir=output_dir, args=args)
++        
++        # --- 2. 검증 단계 ---
++        # validation_one_epoch_with_cam(video_model=video_model, clustering_model=clustering_model, dataloader=val_loader, criterion=criterion, device=DEVICE, epoch=epoch, output_dir=output_dir, args=args)
+ 
+     #     # val_loader가 정의되었을 경우에만 실행
+     #     if val_loader:
+diff --git a/utils.py b/utils.py
+index 1b60ddd..b6f99e4 100644
+--- a/utils.py
++++ b/utils.py
+@@ -93,18 +93,14 @@ def train_one_epoch_with_cam(video_model, clustering_model, dataloader, criterio
+         videos = videos.to(device)
+         sensors = sensors.to(device)
+         labels = labels.to(device)
+-        # print("sensors", sensors)
+-        # print("labels", labels)
+-        # assert False
+-
+ 
+         optimizer.zero_grad()
++        
+         # 0. 클러스터링 모델 순전파 및 손실 계산 (비지도 학습)
+         num_sensors = sensors.shape[1]
+         rule_based_feature = get_representative_sensor_feature(sensors, labels, num_sensors, args.top_k)
+         scores_cluster, final_feature_cluster, alpha = clustering_model(sensors, rule_based_feature)
+         scores_sk = sinkhorn_knopp(scores_cluster, args.temperature, args.sk_iterations, device)
+-        # wandb.log({"train_alpha": alpha})
+     
+         with torch.no_grad():
+             pseudo_labels = torch.argmax(scores_sk, dim=1)
+@@ -126,6 +122,7 @@ def train_one_epoch_with_cam(video_model, clustering_model, dataloader, criterio
+             optimizer.step()
+             total_loss += loss_cluster.item()
+             continue
++        
+         # 일단 rule-based feature 사용 (almost 0.7 accuracy)
+         labels = pseudo_labels
+ 
+@@ -164,36 +161,36 @@ def train_one_epoch_with_cam(video_model, clustering_model, dataloader, criterio
+         # 결과 shape: (B, T, H, W)
+         cam_masks_tensor = gathered_cam.squeeze(2)
+ 
+-        # ==================================================================================
+-        # 시각화 로직 (첫 번째 배치에 대해서만 실행)
+-        # ==================================================================================
+-        if batch_idx == 0:
++        # # ==================================================================================
++        # # 시각화 로직 (첫 번째 배치에 대해서만 실행)
++        # # ==================================================================================
++        # if batch_idx == 0:
+             
+-            # 여기 수정!!!
+-            # 시각화할 샘플 인덱스 결정 (기존 로직 유지 - 좋은 방식)
+-            target_indices = (labels == 1).nonzero(as_tuple=True)[0]
++        #     # 여기 수정!!!
++        #     # 시각화할 샘플 인덱스 결정 (기존 로직 유지 - 좋은 방식)
++        #     target_indices = (labels == 1).nonzero(as_tuple=True)[0]
+             
+-            if len(target_indices) > 0:
+-                idx_to_visualize = target_indices[0].item()
+-            else:
+-                idx_to_visualize = torch.randint(0, batch_size, (1,)).item()
+-
+-            # 결정된 인덱스로 시각화할 데이터 선택
+-            video_to_viz = videos[idx_to_visualize].detach()
+-            cam_to_viz = all_class_cam[idx_to_visualize].detach() # 모든 클래스 CAM 전달
+-            pred_to_viz = predicted_classes[idx_to_visualize].detach() # [수정] 올바르게 계산된 예측 전달
+-
+-            # 시각화 함수 호출
+-            grid_image = visualize_cam_on_video_grid(
+-                video_tensor=video_to_viz,
+-                cam_tensor=cam_to_viz,
+-                predicted_class_indices=pred_to_viz
+-            )
+-
+-            if grid_image:
+-                filename = os.path.join(output_dir, f"epoch_{epoch+1}_cam_visualization.png")
+-                grid_image.save(filename)
+-                print(f"CAM visualization saved to {filename}")
++        #     if len(target_indices) > 0:
++        #         idx_to_visualize = target_indices[0].item()
++        #     else:
++        #         idx_to_visualize = torch.randint(0, batch_size, (1,)).item()
++
++        #     # 결정된 인덱스로 시각화할 데이터 선택
++        #     video_to_viz = videos[idx_to_visualize].detach()
++        #     cam_to_viz = all_class_cam[idx_to_visualize].detach() # 모든 클래스 CAM 전달
++        #     pred_to_viz = predicted_classes[idx_to_visualize].detach() # [수정] 올바르게 계산된 예측 전달
++
++        #     # 시각화 함수 호출
++        #     grid_image = visualize_cam_on_video_grid(
++        #         video_tensor=video_to_viz,
++        #         cam_tensor=cam_to_viz,
++        #         predicted_class_indices=pred_to_viz
++        #     )
++
++        #     if grid_image:
++        #         filename = os.path.join(output_dir, f"epoch_{epoch+1}_cam_visualization.png")
++        #         grid_image.save(filename)
++        #         print(f"CAM visualization saved to {filename}")
+ 
+                 # wandb.log({"Train/CAM_Visualization": wandb.Image(grid_image, caption=f"Epoch {epoch+1}")}, step=epoch)
+ 
+@@ -261,6 +258,7 @@ def train_one_epoch_with_cam(video_model, clustering_model, dataloader, criterio
+     # [수정] 평균 손실과 정확도 계산
+     if total_frames == 0:
+         return total_loss, 0
++    
+     avg_loss = total_loss / len(dataloader.dataset)
+     avg_acc = correct_predictions / total_frames
+ 

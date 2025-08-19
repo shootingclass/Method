@@ -1,4 +1,5 @@
 import torch
+import torchvision
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.cm as cm
@@ -8,28 +9,6 @@ from typing import List
 import torchvision.transforms.functional as TF
 from sklearn.manifold import TSNE
 import os
-
-
-#################################################################
-
-
-def _select_cam_for_prediction(
-    cam_tensor_for_clip: torch.Tensor,
-    predicted_class_idx: int
-) -> torch.Tensor:
-    """
-    전체 클래스에 대한 CAM 텐서에서, 예측된 클래스에 해당하는 CAM만 선택합니다.
-
-    Args:
-        cam_tensor_for_clip (torch.Tensor): 단일 비디오 클립에 대한 CAM 텐서.
-            - Shape: (Num_Classes, T, 7, 7)
-        predicted_class_idx (int): 예측된 클래스의 인덱스.
-
-    Returns:
-        torch.Tensor: 선택된 클래스의 CAM.
-            - Shape: (T, 7, 7)
-    """
-    return cam_tensor_for_clip[predicted_class_idx]
 
 
 #################################################################
@@ -202,201 +181,44 @@ def visualize_cam_on_video_grid(
 #################################################################
 
 
-def visualize_features_on_video_grid(
-    video_tensor: torch.Tensor,
-    feature_tensor: torch.Tensor,
-    max_frames: int = 16,
-    grid_cols: int = 4,
-    heatmap_alpha: float = 0.5
-) -> 'Image.Image':
+def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = None):
     """
-    비디오 텐서와 (마스킹된) 특징 텐서를 받아, 특징 벡터의 크기를 히트맵으로 시각화하여
-    원본 프레임에 오버레이한 그리드 이미지를 생성합니다.
-    배치(batch) 데이터가 들어올 경우, 첫 번째 샘플만 사용합니다.
+    비디오 텐서로부터 프레임 그리드 이미지를 저장합니다.
 
     Args:
-        video_tensor (torch.Tensor): 원본 비디오 프레임 텐서.
-            - Shape: (B, T, C, H, W) 또는 (T, C, H, W)
-        feature_tensor (torch.Tensor): 시각화할 패치 특징 텐서.
-            - Shape: (B, T, Num_Patches, Hidden_Size) 또는 (T, Num_Patches, Hidden_Size)
-        max_frames (int): 시각화할 최대 프레임 수.
-        grid_cols (int): 그리드 이미지의 열(column) 수.
-        heatmap_alpha (float): 원본 이미지 위에 겹칠 히트맵의 투명도.
-
-    Returns:
-        PIL.Image.Image: 모든 시각화 결과가 포함된 하나의 그리드 이미지.
+        video_tensor (torch.Tensor): (B, T, C, H, W) 형태의 비디오 텐서. 배치의 첫 번째 비디오(B=0)를 시각화합니다.
+        output_path (str): 결과 이미지 그리드를 저장할 경로.
+        nrow (int, optional): 그리드의 각 행에 표시할 이미지 수. None이면 모든 프레임(T)을 한 줄로 표시합니다. 기본값은 None.
     """
-    # 1. 입력 텐서 차원 처리 (배치 유무 확인)
-    if video_tensor.dim() == 5: # (B, T, C, H, W)
-        video_clip = video_tensor[0]
-        feature_clip = feature_tensor[0]
-    else: # (T, C, H, W)
-        video_clip = video_tensor
-        feature_clip = feature_tensor
+    # 저장할 디렉토리가 없으면 생성
+    output_dir = os.path.dirname(output_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    # 2. 시각화할 프레임 선택
-    num_frames = video_clip.shape[0]
-    if num_frames > max_frames:
-        indices = np.linspace(0, num_frames - 1, max_frames, dtype=int)
-    else:
-        indices = np.arange(num_frames)
+    # 배치에서 첫 번째 비디오를 선택 (T, C, H, W)
+    video_to_show = video_tensor[0].detach().cpu()
 
-    video_frames_to_viz = video_clip[indices]
-    features_to_viz = feature_clip[indices] # Shape: (max_frames, Num_Patches, Hidden_Size)
+    # nrow가 지정되지 않으면, 프레임 수를 행의 수로 설정하여 한 줄로 만듦
+    if nrow is None:
+        nrow = video_to_show.shape[0]
 
-    # 3. 특징 텐서를 히트맵으로 변환 (핵심 로직)
-    # 3a. 각 특징 벡터의 L2-norm을 계산하여 특징의 강도를 구합니다.
-    # Shape: (max_frames, Num_Patches)
-    feature_magnitudes = torch.norm(features_to_viz, p=2, dim=-1)
+    # 텐서 값을 [0, 1] 범위로 클램핑하여 시각화에 적합하게 만듦
+    # 참고: 만약 텐서가 [-1, 1] 범위로 정규화되었다면,
+    # video_to_show = (video_to_show + 1) / 2 와 같은 코드가 필요할 수
+    # 있습니다.
+    video_to_show = video_to_show.clamp(0, 1)
 
-    # 3b. 패치 그리드 크기를 계산하고 2D 히트맵으로 재구성합니다.
-    num_patches = feature_magnitudes.shape[1]
-    grid_size = int(np.sqrt(num_patches))
-    if grid_size * grid_size != num_patches:
-        raise ValueError(f"The number of patches ({num_patches}) is not a perfect square.")
+    # 프레임들로 이미지 그리드 생성
+    grid = torchvision.utils.make_grid(video_to_show, nrow=nrow, padding=2, normalize=False)
 
-    # Shape: (max_frames, grid_size, grid_size) -> (16, 7, 7)
-    heatmaps = feature_magnitudes.view(-1, grid_size, grid_size)
+    # 텐서 그리드를 PIL 이미지로 변환
+    # (C, H, W) -> (H, W, C) 차원 변경 후, [0, 255] 범위의 uint8 타입으로
+    # 변환
+    grid_np = grid.permute(1, 2, 0).numpy()
+    grid_img = Image.fromarray((grid_np * 255).astype(np.uint8))
 
-    # 4. 각 프레임에 대해 오버레이 이미지 생성
-    overlayed_images = []
-    for frame, heatmap in zip(video_frames_to_viz, heatmaps):
-        overlay = _superimpose_heatmap_on_image(
-            frame_tensor=frame,
-            heatmap_tensor=heatmap,
-            alpha=heatmap_alpha
-        )
-        overlayed_images.append(overlay)
-
-    # 5. 이미지 그리드 생성
-    grid = _create_image_grid(overlayed_images, grid_cols)
-
-    return grid
+    # 이미지 저장
+    grid_img.save(output_path)
+    print(f"Transformed video visualization saved to {output_path}")
 
 
-#################################################################
-
-
-def visualize_features_on_video_grid(video_tensor, feature_map_tensor, grid_size=None):
-
-    if video_tensor.dim() != 4 or feature_map_tensor.dim() != 3:
-        print("Error: Incorrect tensor dimensions.")
-        return None
-
-    if video_tensor.shape[0] != feature_map_tensor.shape[0]:
-        print("Error: Mismatch in the number of frames (T).")
-        return None
-
-    # Ensure tensors are on CPU and detached from the computation graph
-    video_tensor = video_tensor.detach().cpu()
-    feature_map_tensor = feature_map_tensor.detach().cpu()
-
-    n_frames, _, H, W = video_tensor.shape
-
-    # --- Un-normalize video tensor for visualization ---
-    # Assumes standard ImageNet normalization. Adjust if yours is different.
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-    # Apply to the whole batch of frames at once for efficiency
-    video_tensor = video_tensor * std + mean
-    video_tensor = torch.clamp(video_tensor, 0, 1)
-
-    grid_cell_images = []
-
-    for t in range(n_frames):
-        # --- 1. Prepare the original video frame ---
-        frame_pil = TF.to_pil_image(video_tensor[t])
-
-        # --- 2. Prepare the feature map as a heatmap ---
-        feature_map = feature_map_tensor[t]
-
-        # Normalize the feature map to the [0, 1] range for the colormap
-        fmin, fmax = feature_map.min(), feature_map.max()
-        if fmax > fmin:
-            feature_map = (feature_map - fmin) / (fmax - fmin)
-        feature_map_np = feature_map.numpy()
-
-        # Apply a colormap (e.g., 'viridis') and convert to a PIL image
-        heatmap_np = plt.get_cmap('viridis')(feature_map_np)[:, :, :3]  # Drop the alpha channel
-        heatmap_pil = Image.fromarray((heatmap_np * 255).astype(np.uint8))
-
-        # Resize heatmap to match the original frame's dimensions
-        heatmap_resized = heatmap_pil.resize(frame_pil.size, Image.Resampling.BILINEAR)
-
-        # --- 3. Combine frame and heatmap side-by-side ---
-        combined_pil = Image.new('RGB', (W * 2, H))
-        combined_pil.paste(frame_pil, (0, 0))
-        combined_pil.paste(heatmap_resized, (W, 0))
-
-        # Add a label for the frame number for clarity
-        draw = ImageDraw.Draw(combined_pil)
-        draw.text((5, 5), f"Frame {t}", fill="white")
-
-        grid_cell_images.append(combined_pil)
-
-    if not grid_cell_images:
-        return None
-
-    # --- 4. Arrange all combined images into a single grid ---
-    if grid_size is None:
-        # Calculate a grid size that is as close to square as possible
-        cols = int(np.ceil(np.sqrt(len(grid_cell_images))))
-        rows = int(np.ceil(len(grid_cell_images) / cols))
-    else:
-        rows, cols = grid_size
-
-    cell_w, cell_h = grid_cell_images[0].width, grid_cell_images[0].height
-    final_grid_image = Image.new('RGB', (cols * cell_w, rows * cell_h))
-
-    for i, img in enumerate(grid_cell_images):
-        row_idx = i // cols
-        col_idx = i % cols
-        final_grid_image.paste(img, (col_idx * cell_w, row_idx * cell_h))
-
-    return final_grid_image
-
-
-#################################################################
-
-
-def visualize_v_motion_tsne(v_motions_list, epoch, output_dir):
-    """
-    수집된 v_motion 벡터들에 대해 t-SNE를 실행하고 결과를 저장합니다.
-    """
-    # 리스트가 비어있으면 함수 종료
-    if not v_motions_list:
-        print(f"Epoch {epoch}: v_motion 리스트가 비어있어 t-SNE 시각화를 건너뜁니다.")
-        return
-
-    print(f"Epoch {epoch}: t-SNE 시각화를 시작합니다...")
-
-    # v_motion 텐서들을 하나의 넘파이 배열로 결합
-    # 리스트에 있는 모든 텐서를 GPU에서 CPU로 이동시킨 후 넘파이 배열로 변환
-    v_motions_np = np.concatenate(v_motions_list, axis=0)
-
-    # 샘플 수가 perplexity 값(기본 30)보다 적을 경우 t-SNE 실행이 불가하므로 조정
-    n_samples = v_motions_np.shape[0]
-    perplexity_value = min(30, n_samples - 1)
-
-    if n_samples <= 1:
-        print(f"Epoch {epoch}: 샘플 수가 부족하여 t-SNE를 실행할 수 없습니다.")
-        return
-
-    # t-SNE 모델 초기화 및 실행
-    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity_value, n_iter=300)
-    tsne_results = tsne.fit_transform(v_motions_np)
-
-    # Matplotlib을 사용한 시각화
-    plt.figure(figsize=(12, 10))
-    plt.scatter(tsne_results[:, 0], tsne_results[:, 1], alpha=0.7)
-    plt.title(f't-SNE Visualization of v_motion at Epoch {epoch + 1}')
-    plt.xlabel('t-SNE Dimension 1')
-    plt.ylabel('t-SNE Dimension 2')
-    plt.grid(True)
-
-    # 결과 이미지 저장
-    save_path = os.path.join(output_dir, f"epoch_{epoch+1}_v_motion_tsne.png")
-    plt.savefig(save_path)
-    plt.close() # 메모리 해제를 위해 plot을 닫음
-
-    print(f"t-SNE 시각화 결과가 {save_path} 에 저장되었습니다.")

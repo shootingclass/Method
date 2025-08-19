@@ -1,0 +1,80 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        code_path: code/main.py
+        e:
+            zxuegjqx1uhzdqqm1191znascffxqy84:
+                codePath: main.py
+                codePathLocal: main.py
+                cpu_count: 20
+                cpu_count_logical: 40
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "502392610816"
+                        used: "344695742464"
+                email: junhoyoon0930@gmail.com
+                executable: /home/junho/anaconda3/envs/primus/bin/python
+                git:
+                    commit: d2e7573339c3167241e26dd8627974ffc054ba4b
+                    remote: https://github.com/shootingclass/Method.git
+                gpu: NVIDIA TITAN RTX
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 4608
+                      memoryTotal: "25769803776"
+                      name: NVIDIA TITAN RTX
+                      uuid: GPU-fa1573d9-7fb7-b6bf-3fb2-8c1c0bfd78bd
+                    - architecture: Turing
+                      cudaCores: 4608
+                      memoryTotal: "25769803776"
+                      name: NVIDIA TITAN RTX
+                      uuid: GPU-7ab2b706-ebf4-ad3b-e00c-01dbd1fb5f31
+                    - architecture: Turing
+                      cudaCores: 4608
+                      memoryTotal: "25769803776"
+                      name: NVIDIA TITAN RTX
+                      uuid: GPU-4df04bef-d991-d3f2-c021-9969727db04f
+                    - architecture: Ada
+                      cudaCores: 10240
+                      memoryTotal: "17171480576"
+                      name: NVIDIA GeForce RTX 4080 SUPER
+                      uuid: GPU-843cdb97-808d-446f-e601-796c9b78d209
+                host: eevee-server
+                memory:
+                    total: "270070497280"
+                os: Linux-6.8.0-52-generic-x86_64-with-glibc2.17
+                program: main.py
+                python: CPython 3.8.20
+                root: /home/junho/Method
+                startedAt: "2025-08-13T06:35:07.121853Z"
+                writerId: zxuegjqx1uhzdqqm1191znascffxqy84
+        m: []
+        python_version: 3.8.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 98
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 98
+            "3":
+                - 13
+            "4": 3.8.20
+            "5": 0.21.0
+            "6": 4.46.3
+            "12": 0.21.0
+            "13": linux-x86_64
