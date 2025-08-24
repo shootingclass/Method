@@ -5,13 +5,9 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm # tqdm 라이브러리 임포트 추가
 import wandb
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
 import os
 
 # model.py에 저장된 모델 클래스를 임포트합니다.
-from model import Clip4ClipVisionModel
 from visualization import save_video_grid
 
 
@@ -64,74 +60,67 @@ def load_stats(path):
 #################################################################
 
 
-def train_one_epoch_with_cam(video_model, dataloader, criterion, optimizer, device, epoch, output_dir):
+def train_one_epoch(video_model, sensor_model, dataloader, optimizer, device, epoch, output_dir, rank):
     video_model.train()
-    total_loss = 0.0
-    correct_predictions = 0
-    total_frames = 0 # [수정] 샘플 수를 비디오가 아닌 프레임 기준으로 변경
-    epoch_v_motions = [] 
+    sensor_model.train()
 
-    for batch_idx, (videos, sensors, labels) in enumerate(tqdm(dataloader, desc=f"Epoch {epoch} Training")):
+    total_loss = 0.0
+
+    # 하이퍼파라미터: InfoNCE Loss의 temperature
+    temperature = 0.07
+
+    # rank 0 프로세스에서만 tqdm 프로그레스 바를 사용합니다.
+    if rank == 0:
+        iterable = tqdm(dataloader, desc=f"Epoch {epoch} Training")
+    else:
+        iterable = dataloader
+
+    for batch_idx, (videos, sensors, _) in enumerate(iterable):
         videos = videos.to(device)
         sensors = sensors.to(device)
-        labels = labels.to(device)
 
         optimizer.zero_grad()
 
-        # 1단계: 단일 순전파로 모든 결과 얻기
+        # 1. 각 모델에서 임베딩 추출
+        # DDP로 래핑된 모델은 내부적으로 .module을 호출하므로 직접적인 접근은 필요 없습니다.
         model_output = video_model(videos)
-        logits = model_output['logits']              # (B, T, C)
-        all_class_cam = model_output['cam']          # (B, T, C, H, W)
-        
-        # [추가] 2단계(어텐션 브릿지)의 출력 V'을 받아옵니다.
-        # 이 변수는 3단계(모션 스트림)의 입력으로 사용될 예정입니다.
-        transformed_video = model_output['transformed_video']
+        v_motion = model_output['v_motion']
+        v_appearance = model_output['v_appearance']
 
-        # 시각화
-        # ==================================================================================
-        # [추가] 첫 번째 배치에 대한 transformed_video 시각화
-        # ==================================================================================
-        if batch_idx == 0:
-            
-            # 저장 경로를 epoch별로 다르게 설정합니다.
-            vis_output_path = os.path.join(output_dir, "transformed_video", f"epoch_{epoch}.png")
+        sensor_output = sensor_model(sensors)
+        sensor_emb = sensor_output['emb']
 
-            # 시각화 함수를 호출합니다.
-            save_video_grid(transformed_video, vis_output_path)
-        # ==================================================================================
+        # --- InfoNCE Loss 계산 (로직 동일) ---
+        v_motion_norm = F.normalize(v_motion, p=2, dim=1)
+        sensor_emb_norm = F.normalize(sensor_emb, p=2, dim=1)
+        sim_matrix = torch.matmul(v_motion_norm, sensor_emb_norm.T) / temperature
+        labels = torch.arange(sim_matrix.size(0), device=device)
+        info_nce_loss = (F.cross_entropy(sim_matrix, labels) + F.cross_entropy(sim_matrix.T, labels)) / 2
 
-        batch_size, n_frames, n_classes = logits.shape
+        # --- 직교성 제약 Loss 계산 (로직 동일) ---
+        v_appearance_norm = F.normalize(v_appearance, p=2, dim=1)
+        cosine_similarity = (v_motion_norm * v_appearance_norm).sum(dim=1)
+        ortho_loss = (cosine_similarity ** 2).mean()
 
-        # --- 프레임별 손실 계산 (기존 코드 유지 - 올바른 방식) ---
-        logits_permuted = logits.permute(0, 2, 1)    # (B, C, T)
-        labels_expanded = labels.unsqueeze(1).expand(batch_size, n_frames) # (B, T)
-        classification_loss = criterion(logits_permuted, labels_expanded)
+        # --- 최종 손실 계산 (로직 동일) ---
+        lambda_ortho = 0.1
+        lambda_info_nce = 0.9
+        final_loss = lambda_info_nce * info_nce_loss + lambda_ortho * ortho_loss
 
-        # ==================================================================================
-        # 2단계: 예측 클래스에 해당하는 CAM 선택 (수정된 로직)
-        # ==================================================================================
-        # [수정] 각 프레임별 예측 클래스를 계산 (dim=2 사용)
-        # 결과 shape: (B, T)
-        predicted_classes = torch.argmax(logits, dim=2)
-
-        # ==================================================================================
-        # 4단계: 최종 손실 계산 및 학습
-        # ==================================================================================
-        main_loss = classification_loss
-        main_loss.backward()
+        # --- 역전파 및 파라미터 업데이트 ---
+        # DDP가 모든 GPU에 걸쳐 그래디언트를 자동으로 동기화하고 평균냅니다.
+        final_loss.backward()
         optimizer.step()
 
-        # --- 통계 기록 (수정된 로직) ---
-        total_loss += main_loss.item() * batch_size # Loss는 배치 단위로 평균되므로 배치 크기를 곱함
+        total_loss += final_loss.item()
 
-        # [수정] 정확도는 프레임 단위로 계산
-        correct_predictions += (predicted_classes == labels_expanded).sum().item()
-        total_frames += (batch_size * n_frames)
+    # 각 프로세스별 평균 손실을 계산합니다.
+    # 정확한 전체 평균을 원하면 all_reduce 연산이 필요하지만,
+    # 일반적으로 rank 0의 값만으로도 충분히 경향을 파악할 수 있습니다.
+    avg_loss = total_loss / len(dataloader)
 
-    # [수정] 평균 손실과 정확도 계산
-    avg_loss = total_loss / len(dataloader.dataset)
-    avg_acc = correct_predictions / total_frames
+    return avg_loss
 
-    # wandb.log({"Train/Loss": avg_loss, "Train/Accuracy": avg_acc, "epoch": epoch})
 
-    return avg_loss, avg_acc
+
+

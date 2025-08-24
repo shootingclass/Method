@@ -4,16 +4,22 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from tqdm import tqdm # tqdm 라이브러리 임포트 추가
+from tqdm import tqdm 
 import wandb
 import numpy as np
 import random
+import itertools
+
+# 분산 학습 라이브러리
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 # --- 사용자 정의 모듈 임포트 ---
-from dataset import VideoSensorDataset, SensorTransform
-from model import Clip4ClipVisionModel, MW2StackRNNPooling, MethodModel
+from dataset import VideoSensorDataset, SensorTransform, ClipConsistentTransforms
+from model import  SensorModel, VisionModel
 from utils import (
-    train_one_epoch_with_cam, 
+    train_one_epoch, 
     calculate_sensor_stats, save_stats, load_stats
 )
 
@@ -35,31 +41,40 @@ def set_random_seed(seed):
 
 
 def main():
-    
+
+    # --- 분산 학습 설정 ---
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = dist.get_world_size()
+
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
     set_random_seed(42)
 
-    # wandb.init(
-    #     project="Method_Test",  # 원하는 프로젝트 이름으로 변경 가능
-    #     name=f"CNN_SpatialPooling_Resize_HorizontalFlip_Door1",
-    #     )
+    if rank == 0:
+        print(f"Using {world_size} GPUs for distributed training.")
+
+        # wandb.init(
+        #     project="Method_Test",
+        #     name=f"Test1",
+        # )
+    
+    set_random_seed(42)
 
     # ==================================================================
     # 1. 하이퍼파라미터 및 설정 정의
     # ==================================================================
     DATA_ROOT = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-    JSON_TRAIN_PATH = "/mnt/hdd4tb/junho/Opportunity++/actionMerge/custom_train.json"
-    JSON_VAL_PATH = "/mnt/hdd4tb/junho/Opportunity++/actionMerge/custom_val.json" 
+    JSON_TRAIN_PATH = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/noToggle/pretrain.json"
     STATS_FILE_PATH = '/home/junho/Method/sensor_stats/sensor_stats.npy' # 센서 데이터 통계 파일 경로
-    NUM_CLASSES = 10
     NUM_FRAMES = 16
-    BATCH_SIZE = 16
+    BATCH_SIZE = 4
     EPOCHS = 10
     LEARNING_RATE = 1e-4
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     NUM_WORKERS = 4
-
-    print(f"Using device: {DEVICE}")
-    print(f"Number of classes: {NUM_CLASSES}")
 
     # 시각화 결과물을 저장할 폴더 이름
     output_dir = "Visualization/transformed_video"
@@ -76,55 +91,13 @@ def main():
     clip_mean = [0.48145466, 0.4578275, 0.40821073]
     clip_std = [0.26862954, 0.26130258, 0.27577711]    
     
-    # 훈련(Training)용 변환
-    train_transform = transforms.Compose([
-        
-        # 프레임 전체의 정보를 보존하여 모델이 스스로 중요한 위치를 찾도록 함
-        transforms.Resize(size=(224, 224), antialias=True),
+    # 학습(Training)용 변환
+    train_transform = ClipConsistentTransforms(
+        size=(224, 224),
+        mean=clip_mean,
+        std=clip_std
+    )
 
-        # 수평 뒤집기 (50% 확률)
-        transforms.RandomHorizontalFlip(p=0.5),  
-        
-        # 배경 편향 방지를 위한 데이터 증강 추가
-        # ColorJitter: 배경의 색감/조명에 대한 의존도를 낮춤
-        transforms.ColorJitter(
-            brightness=0.4, # 기존 0.4 -> 0.5
-            contrast=0.4,   # 기존 0.4 -> 0.5
-            saturation=0.4, # 기존 0.4 -> 0.5
-            hue=0.1         # 기존 0.1 -> 0.2
-        ),
-        
-        # GaussianBlur: 배경의 미세한 질감을 뭉개서 큰 구조에 집중하도록 함
-        transforms.GaussianBlur(
-            kernel_size=(5, 5), # 커널 크기 범위 증가
-            sigma=(0.1, 2.0)    # 시그마(흐림 강도) 범위 증가
-        ),
-
-        # 텐서 변환 및 후속 증강
-        # 이미지를 텐서로 변환 (주의: 이 시점부터 픽셀 값은 0~1)
-        transforms.ToTensor(),
-        
-        # RandomErasing: 텐서에 적용. 이미지 일부를 가려 모델의 강건함을 높임
-        transforms.RandomErasing(
-            p=0.5,              # 확률을 다시 50%로 감소
-            scale=(0.1, 0.2),  # 삭제 면적을 5% ~ 20%로 감소
-            ratio=(0.3, 3.3),
-            value=0
-        ),
-        
-        # 정규화
-        # 모델에 입력하기 직전, 표준 정규화 수행
-        transforms.Normalize(mean=clip_mean, std=clip_std),
-    ])
-
-
-    # 검증(Validation) 및 테스트(Test)용 변환
-    # 데이터 증강 없이, 리사이즈와 정규화만 수행
-    val_transform = transforms.Compose([
-        transforms.Resize(size=(224, 224), antialias=True),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=clip_mean, std=clip_std),
-    ])
     # ==================================================================
 
 
@@ -166,52 +139,33 @@ def main():
         sensor_transform=sensor_preprocessor # 센서 전처리 적용
     )
 
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,  # DistributedSampler가 셔플링을 담당합니다.
         num_workers=NUM_WORKERS,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        sampler=train_sampler
     )
-
-    if JSON_VAL_PATH:
-        val_dataset = VideoSensorDataset(
-            json_path=JSON_VAL_PATH,
-            data_root=DATA_ROOT,
-            num_frames=NUM_FRAMES,
-            transform=val_transform,
-            sensor_transform=sensor_preprocessor # 검증셋에도 동일한 전처리 적용
-        )
-
-        val_loader = DataLoader(
-            dataset=val_dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=NUM_WORKERS,
-            pin_memory=True
-        )
-        
-    else:
-        val_loader = None
 
     print(f"Train dataset size: {len(train_dataset)}")
     
-    if val_loader:
-        print(f"Validation dataset size: {len(val_dataset)}")
     # ==================================================================
 
 
     # ==================================================================
     # 5. 모델, 손실 함수, 옵티마이저 정의
     # ==================================================================
-    # video_model = ViTWithCAM(num_classes=NUM_CLASSES).to(DEVICE)
-    video_model = MethodModel(num_classes=NUM_CLASSES, image_size=224).to(DEVICE)
-    sensor_model = MW2StackRNNPooling().to(DEVICE)
+    video_model = VisionModel(image_size=224).to(DEVICE)
+    sensor_model = SensorModel(sensor_channels=97).to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss()
+    video_model = DDP(video_model, device_ids=[local_rank], find_unused_parameters=True)
+    sensor_model = DDP(sensor_model, device_ids=[local_rank], find_unused_parameters=True)
 
-    parameters = list(video_model.parameters())
+    parameters = itertools.chain(video_model.parameters(), sensor_model.parameters())
     optimizer = optim.AdamW(parameters, lr=LEARNING_RATE)
     # ==================================================================
 
@@ -243,37 +197,33 @@ def main():
     # ==================================================================
     # 7. 학습 및 검증 루프 (Training & Validation Loop)
     # ==================================================================
-    best_val_loss = float('inf') # 최고 성능 저장을 위한 변수, 무한대로 초기화
 
-    print("\n--- Starting Training ---")
+    if rank == 0:
+        print("\n--- Starting Training ---")
+
     for epoch in range(EPOCHS):
-        print(f"\nEpoch {epoch + 1}/{EPOCHS}")
-        
+        train_loader.sampler.set_epoch(epoch)  # 중요: 에포크마다 샘플러 상태를 업데이트합니다.
+
+        if rank == 0:
+            print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+
         # --- 1. 학습 단계 ---
-        train_loss, train_acc = train_one_epoch_with_cam(video_model, train_loader, criterion, optimizer, DEVICE, epoch, output_dir)
-        print(f"[Train] Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+        # train_one_epoch 함수에 device 변수를 전달합니다.
+        train_loss = train_one_epoch(video_model, sensor_model, train_loader, optimizer,device, epoch, output_dir, rank)
 
-    #     # --- 2. 검증 단계 ---
-    #     # val_loader가 정의되었을 경우에만 실행
-    #     if val_loader:
-    #         # val_loss, val_acc = validate(model, val_loader, criterion, DEVICE, epoch, PATCH_SIZE)
-    #         val_loss, val_acc = validate(model, val_loader, criterion, DEVICE, epoch)
-    #         print(f"  [Val]   Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
-    #         current_loss = val_loss # 모델 저장의 기준은 검증 손실
-    #     else:
-    #         # 검증 로더가 없으면 학습 손실을 기준으로 모델 저장
-    #         current_loss = train_loss
+        # train_one_epoch 함수가 loss를 모든 프로세스에 브로드캐스팅하지 않는다면,
+        # 아래 코드는 각 프로세스별 loss를 출력할 수 있습니다.
+        # 모든 프로세스의 평균 loss를 보려면 추가적인 동기화 코드가 필요합니다.
+        if rank == 0:
+            print(f"[Train] Loss: {train_loss:.4f}")
 
-    #     # --- 3. 최고 성능 모델 저장 ---
-    #     # 현재 검증 손실이 이전에 기록된 최고 성능(최저 손실)보다 낮으면 모델을 저장
-    #     if current_loss < best_val_loss:
-    #         best_val_loss = current_loss
-    #         torch.save(model.state_dict(), 'best_model.pth')
-    #         print(f"  >> Best model saved with validation loss: {best_val_loss:.4f}")
+    if rank == 0:
+        print("\n--- Training Complete ---")
 
-    # print("\n--- Training Complete ---")
-    # print(f"Final best validation loss: {best_val_loss:.4f}")
     # ==================================================================
+
+    # 분산 처리 관련 리소스 정리
+    dist.destroy_process_group()
 
 if __name__ == '__main__':
     main()

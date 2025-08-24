@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPVisionModelWithProjection, ViTModel, AutoModel
+from transformers import CLIPVisionModelWithProjection, AutoModel
 from peft import LoraConfig, get_peft_model
 import random
 from einops import rearrange, repeat
@@ -34,12 +34,15 @@ class Block(nn.Module):
         return self.net(batch)
     
 
-class MW2StackRNNPooling(nn.Module):
-    def __init__(self, input_dim=32, size_embeddings: int = 128):
+class SensorModel(nn.Module):
+    def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
         super().__init__()
+
+        num_groups_for_input = 1
+
         self.backbone = nn.Sequential(
-            nn.GroupNorm(2, 6),
-            Block(6, input_dim, 10),
+            nn.GroupNorm(num_groups_for_input, sensor_channels),
+            Block(sensor_channels, input_dim, 10),
             Block(input_dim, input_dim, 5),
             Block(input_dim, input_dim, 5, pool_type="adaptive", embedding_size=32),
             nn.GroupNorm(4, input_dim),
@@ -66,7 +69,7 @@ class MW2StackRNNPooling(nn.Module):
 
 class Clip4ClipVisionModel(nn.Module):
     
-    def __init__(self, num_classes: int):
+    def __init__(self):
         super().__init__() 
 
         # 1. CLIP 비전 모델 로드 (기존과 동일)
@@ -108,26 +111,19 @@ class Clip4ClipVisionModel(nn.Module):
         # 이는 '시간 축 평균 연산을 수행하기 전'의 정보를 모두 유지하는 핵심적인 부분
         video_reshaped = video.view(batch_size * n_frames, c, h, w)
 
-        # ==========================================================================================
-        # 1단계: 특징 추출 (재료 준비)
-        # ==========================================================================================
-        visual_output = self.video_model(video_reshaped, output_hidden_states=True)
-        
-        # 중간 특징과 최종 특징 추출
-        hidden_states = visual_output.hidden_states
-        intermediate_features = hidden_states[6]
-        final_features = hidden_states[-1]
+        # 1. output_hidden_states=True 옵션 없이 모델 호출
+        visual_output = self.video_model(video_reshaped)
 
-        seq_len = intermediate_features.shape[1]
-        hidden_size = intermediate_features.shape[2]
+        # 2. .hidden_states 대신 .last_hidden_state를 직접 사용
+        final_features = visual_output.last_hidden_state
 
-        # 특징 맵의 형태를 (B, T, Seq_Len, Hidden_Size)로 복원        
-        # 각 프레임별 특징 맵 스택을 반환
-        intermediate_features = intermediate_features.view(batch_size, n_frames, seq_len, hidden_size)
+        # 최종 특징 텐서의 형태를 원래 비디오 차원에 맞게 복원
+        seq_len = final_features.shape[1]
+        hidden_size = final_features.shape[2]
         final_features = final_features.view(batch_size, n_frames, seq_len, hidden_size)
 
+        # 최종 특징만 반환하도록 수정
         return {
-            "intermediate_features": intermediate_features,
             "final_features": final_features
         }
 
@@ -142,7 +138,7 @@ class DinoVisionModel(nn.Module):
     def __init__(self): # num_classes는 특징 추출만 하므로 필요 없음
         super().__init__()
 
-        # 1. Hugging Face Hub에서 올바른 클래스로 DINO ViT 모델 로드
+        # DINO ViT 모델 로드
         self.video_model = AutoModel.from_pretrained("facebook/dinov2-small")
 
         # 2. ViTModel 아키텍처에 맞는 LoRA 설정
@@ -187,81 +183,6 @@ class DinoVisionModel(nn.Module):
         return {
             "final_features": final_features
         }
-
-
-#################################################################
-
-
-class CAMGenerator(nn.Module):
-    """
-    ViT 특징 맵으로부터 1x1 Conv를 사용하여 프레임별 CAM과 Logits를 생성합니다.
-    """
-    def __init__(self, input_hidden_size: int, num_classes: int):
-        super().__init__()
-        # 1x1 Convolution 레이어를 분류기로 사용합니다.
-        # in_channels: ViT의 hidden_size
-        # out_channels: 분류할 클래스의 수
-        self.classifier = nn.Conv2d(
-            in_channels=input_hidden_size,
-            out_channels=num_classes,
-            kernel_size=1
-        )
-
-        self.pooling = RankedTopKPooling(k1_ratio=0.05)
-
-    def forward(self, features: torch.Tensor):
-        # 입력 features shape: (B, T, Seq_Len, Hidden_Size)
-        # e.g., (8, 16, 50, 768) -> 50 = 49(패치) + 1(CLS)
-
-        batch_size, n_frames, seq_len, hidden_size = features.shape
-
-        # 배치와 프레임 차원을 합쳐서 처리 효율을 높입니다.
-        # (B, T, Seq_Len, Hidden_Size) -> (B * T, Seq_Len, Hidden_Size)
-        features = features.view(batch_size * n_frames, seq_len, hidden_size)
-
-        # --- 1. 패치 토큰 분리 ---
-        # CAM은 공간 정보를 담고 있으므로, CLS 토큰(인덱스 0)을 제외한 패치 토큰만 사용합니다.
-        # (B*T, Seq_Len, Hidden_Size) -> (B*T, Num_Patches, Hidden_Size)
-        patch_features = features[:, 1:, :]
-        num_patches = patch_features.shape[1] # e.g., 49
-
-        # --- 2. Conv2d 입력을 위한 형태 변환 ---
-        # 패치 그리드의 크기를 계산합니다 (정사각형이라고 가정).
-        patch_grid_size = int(num_patches ** 0.5) # e.g., 7
-
-        # (B*T, Num_Patches, Hidden_Size) -> (B*T, Hidden_Size, Num_Patches)
-        patch_features = patch_features.permute(0, 2, 1)
-
-        # (B*T, Hidden_Size, Num_Patches) -> (B*T, Hidden_Size, H_patch, W_patch)
-        patch_features_2d = patch_features.view(
-            batch_size * n_frames, hidden_size, patch_grid_size, patch_grid_size
-        )
-
-        # --- 3. 1x1 Conv를 이용한 CAM 생성 ---
-        # (B*T, Hidden_Size, H, W) -> (B*T, Num_Classes, H, W) -> [256, 10, 7, 7]
-        cam = self.classifier(patch_features_2d)
-
-        # --- 4. 프레임별 Logits 계산 ---
-        # logits의 shape은 (256, 10)
-        logits = self.pooling(cam)
-
-        # --- (수정) 시각화를 위한 ReLU 적용 ---
-        # Logits 계산이 끝난 후, 시각화 품질을 높이기 위해 CAM에 ReLU를 적용합니다.
-        # 이 단계는 예측 결과(logits)에 영향을 주지 않습니다.
-        cam_for_visualization = F.relu(cam)
-
-        # --- 5. 최종 출력 형태 복원 ---
-        # (B*T, Num_Classes) -> (B, T, Num_Classes)
-        logits = logits.view(batch_size, n_frames, -1)
-
-        # (B*T, Num_Classes, H, W) -> (B, T, Num_Classes, H, W)
-        # 최종적으로 반환되는 CAM은 ReLU가 적용된 시각화용 CAM입니다.
-        cam_for_visualization = cam_for_visualization.view(
-            batch_size, n_frames, -1, patch_grid_size, patch_grid_size
-        )
-
-        # 반환 값의 'cam' 키에 ReLU가 적용된 CAM을 할당합니다.
-        return {"logits": logits, "cam": cam_for_visualization}
 
 
 #################################################################
@@ -315,106 +236,301 @@ class LocalisationNetwork(nn.Module):
 class AttentionBridge(nn.Module):
     """
     LocalisationNetwork와 STN을 통합하여 어텐션 브릿지 역할을 수행.
+    (수정 버전: 시간 축으로 평균화된 대표 특징을 사용하여 클립 전체에 적용될 단일 변환 행렬을 계산)
     """
-    def __init__(self, input_hidden_size: int, patch_grid_size: int, target_size: tuple = (96, 96)):
+
+    def __init__(self, input_hidden_size: int, patch_grid_size: int, target_size: tuple = (112, 112)):
         super().__init__()
         self.localisation_net = LocalisationNetwork(input_hidden_size, patch_grid_size)
         self.target_size = target_size # V'의 목표 해상도 (H_t, W_t)
 
-    def forward(self, features: torch.Tensor, original_video: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
+        (2단계 수정 버전) 특징 맵(F_A)을 직접 변환하여 변환된 특징 맵(F'_A)을 생성합니다.
         Args:
-            features (torch.Tensor): (B, T, Seq_Len, Hidden_Size) 형태의 ViT 특징
-            original_video (torch.Tensor): (B, T, C, H, W) 형태의 원본 비디오
+            features (torch.Tensor): (B, T, Seq_Len, Hidden_Size) 형태의 ViT 특징 (F_A)
         Returns:
-            torch.Tensor: (B, T, C, H_t, W_t) 형태의 변환된 비디오 클립 V'
+            torch.Tensor: (B, T, Hidden_Size, H_t, W_t) 형태의 변환된 특징 맵 클립 (F'_A)
         """
         batch_size, n_frames, seq_len, hidden_size = features.shape
-        _, _, c, h, w = original_video.shape
 
-        # --- 1. LocalisationNetwork 입력 준비 (CAMGenerator와 유사) ---
-        # CLS 토큰을 제외하고, (B*T, C, H, W) 형태로 변환
-        patch_features = features[:, :, 1:, :].reshape(batch_size * n_frames, seq_len - 1, hidden_size)
-        patch_grid_h = patch_grid_w = int((seq_len - 1) ** 0.5)
+        # --- 1. 대표 특징 생성 (Temporal Average Pooling) ---
+        # 시간 축 평균을 통해 단일 변환 행렬 계산에 사용할 안정적인 특징을 만듭니다.
+        # (B, T, Seq_Len, Hidden_Size) -> (B, Seq_Len, Hidden_Size)
+        robust_features = torch.mean(features, dim=1)
+
+        # --- 2. LocalisationNetwork 입력 준비 ---
+        # CLS 토큰을 제외하고 2D 그리드 형태로 변환합니다.
+        patch_features = robust_features[:, 1:, :]
+        num_patches = patch_features.shape[1]
+        patch_grid_h = patch_grid_w = int(num_patches ** 0.5)
         patch_features_2d = patch_features.permute(0, 2, 1).view(
+            batch_size, hidden_size, patch_grid_h, patch_grid_w
+        )
+
+        # --- 3. LocalisationNetwork를 통해 단일 통합 theta 계산 ---
+        # (B, Hidden_Size, H_patch, W_patch) -> (B, 2, 3)
+        theta = self.localisation_net(patch_features_2d)
+
+        # --- 4. STN을 이용해 F'_A 생성 (Feature-level Cropping) ---
+        # 변환할 대상인 원본 특징맵(features)을 2D 그리드 형태로 준비합니다.
+        # CLS 토큰을 제외하고 (B*T, Hidden_Size, H_patch, W_patch) 형태로 변환합니다.
+        patch_features_all_frames = features[:, :, 1:, :].reshape(batch_size * n_frames, seq_len - 1, hidden_size)
+        features_to_transform = patch_features_all_frames.permute(0, 2, 1).view(
             batch_size * n_frames, hidden_size, patch_grid_h, patch_grid_w
         )
 
-        # --- 2. LocalisationNetwork를 통해 theta 계산 ---
-        theta = self.localisation_net(patch_features_2d) # (B*T, 2, 3)
+        # 단일 theta를 모든 프레임에 적용하기 위해 T 차원으로 반복합니다.
+        theta_repeated = repeat(theta, 'b c h -> (b t) c h', t=n_frames)
 
-        # --- 3. STN을 이용해 V' 생성 ---
-        video_reshaped = original_video.reshape(batch_size * n_frames, c, h, w)
+        # grid_sample에 사용할 목표 크기를 지정합니다.
+        grid_target_size = torch.Size([batch_size * n_frames, hidden_size, self.target_size[0], self.target_size[1]])
 
-        # grid_sample에 사용할 목표 크기를 포함한 전체 사이즈 지정
-        grid_target_size = torch.Size([batch_size * n_frames, c, self.target_size[0], self.target_size[1]])
+        # 반복된 theta를 이용해 샘플링 그리드를 생성합니다.
+        grid = F.affine_grid(theta_repeated, grid_target_size, align_corners=False)
 
-        # theta를 이용해 샘플링 그리드 생성
-        grid = F.affine_grid(theta, grid_target_size, align_corners=False)
+        # **원본 특징 맵**과 그리드를 이용해 변환된 특징 맵을 샘플링합니다.
+        transformed_features = F.grid_sample(features_to_transform, grid, align_corners=False, padding_mode="border")
 
-        # 원본 비디오와 그리드를 이용해 변환된 비디오 샘플링
-        transformed_video = F.grid_sample(video_reshaped, grid, align_corners=False, padding_mode="border")
+        # --- 5. 최종 출력 형태 복원 ---
+        # (B*T, D, H_t, W_t) -> (B, T, D, H_t, W_t)
+        transformed_features = transformed_features.view(batch_size, n_frames, hidden_size, self.target_size[0], self.target_size[1])
 
-        # --- 4. 최종 출력 형태 복원 ---
-        transformed_video = transformed_video.view(batch_size, n_frames, c, self.target_size[0], self.target_size[1])
-
-        return transformed_video
-
-
+        return transformed_features
+            
 
 #################################################################
 
 
-# class ViTWithCAM(nn.Module):
-#     def __init__(self, num_classes: int):
-#         super().__init__()
+class Conv2Plus1D(nn.Module):
+    def __init__(self, 
+                in_channels: int, 
+                out_channels: int, 
+                kernel_size: tuple, 
+                stride: tuple, 
+                padding: tuple,
+                mid_channels: int = None):
+        """
+        (2+1)D 컨볼루션 블록. 3D 컨볼루션을 2D 공간과 1D 시간 컨볼루션으로 분해합니다.
 
-#         # 1. 특징 추출기: LoRA가 적용된 Clip4ClipVisionModel을 그대로 사용합니다.
-#         self.feature_extractor = Clip4ClipVisionModel(num_classes=num_classes)
-
-#         # 2. CAM 생성기: ViT가 추출한 특징을 받아 CAM과 최종 logits를 생성합니다.
-#         hidden_size = self.feature_extractor.video_model.config.hidden_size # 768
-        
-#         self.cam_generator = CAMGenerator(input_hidden_size=hidden_size, num_classes=num_classes)
-
-#     def forward(self, video: torch.Tensor):
-        
-#         # 1. LoRA가 적용된 ViT를 통해 특징을 추출합니다.
-#         # 이 과정에서 그래디언트가 LoRA 파라미터로 흘러가도록 합니다.
-#         # features_dict --> {"intermediate_features": intermediate_features, "final_features": final_features}
-#         features_dict = self.feature_extractor(video)
-        
-#         # ViT의 레이어에서 나온 특징맵을 사용합니다.
-#         # Shape: (B, T, Seq_Len, Hidden_Size)
-#         final_features = features_dict["final_features"]
-#         intermediate_features = features_dict["intermediate_features"]
-        
-#         # 2. 추출된 특징맵을 CAM 생성기에 전달하여 최종 출력(logits, cam)을 얻습니다.
-#         # 이 모듈의 파라미터는 전체가 학습됩니다 (full-tuning).
-#         # output_dict --> {"logits": logits, "cam": activated_cam}
-#         output_dict = self.cam_generator(final_features)
-        
-#         output_dict["intermediate_features"] = intermediate_features
-#         output_dict["final_features"] = final_features
-        
-#         return output_dict
-        
-        
-#################################################################
-
-
-class MethodModel(nn.Module):
-    def __init__(self, num_classes: int, image_size: int, target_size: tuple = (96, 96)):
-        
+        Args:
+            in_channels (int): 입력 채널의 수.
+            out_channels (int): 출력 채널의 수.
+            kernel_size (tuple): (temporal, height, width) 형태의 커널 크기 튜플.
+            stride (tuple): (temporal, height, width) 형태의 스트라이드 튜플.
+            padding (tuple): (temporal, height, width) 형태의 패딩 튜플.
+            mid_channels (int, optional): 공간 컨볼루션과 시간 컨볼루션 사이의 중간 채널 수.
+            None이면 out_channels와 동일하게 설정됩니다.
+        """
         super().__init__()
-        
-        # --- 1단계 모듈 (Appearance & Localization Stream) ---
-        # self.feature_extractor = Clip4ClipVisionModel(num_classes=num_classes)
-        self.feature_extractor = DinoVisionModel()  # DINO ViT로 변경
-        hidden_size = self.feature_extractor.video_model.config.hidden_size
-        self.cam_generator = CAMGenerator(input_hidden_size=hidden_size,  num_classes=num_classes)
 
-        # --- 2단계 모듈 (Attention Bridge) ---
+        if mid_channels is None:
+            mid_channels = out_channels
+
+        # 공간 컨볼루션 (2D)
+        self.spatial_conv = nn.Conv3d(
+            in_channels,
+            mid_channels,
+            kernel_size=(1, kernel_size[1], kernel_size[2]),
+            stride=(1, stride[1], stride[2]),
+            padding=(0, padding[1], padding[2]),
+            bias=False
+        )
+        self.bn1 = nn.BatchNorm3d(mid_channels)
+
+        # 시간 컨볼루션 (1D)
+        self.temporal_conv = nn.Conv3d(
+            mid_channels,
+            out_channels,
+            kernel_size=(kernel_size[0], 1, 1),
+            stride=(stride[0], 1, 1),
+            padding=(padding[0], 0, 0),
+            bias=False
+        )
+        self.bn2 = nn.BatchNorm3d(out_channels)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): 입력 텐서. Shape: (B, C, T, H, W)
+        
+        Returns:
+            torch.Tensor: 출력 텐서.
+        """
+        x = self.spatial_conv(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.temporal_conv(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        return x
+
+
+#################################################################
+
+
+class AppearanceEncoder(nn.Module):
+    """
+    비디오 특징을 인코딩하여 외형 벡터(v_appearance)를 추출합니다.
+    (2+1)D 컨볼루션 스택과 시간 평균 풀링(temporal average pooling)을 사용합니다.
+    """
+    def __init__(self, in_channels: int, mid_channels: int, out_channels: int):
+        """
+        Args:
+            in_channels (int): 입력 채널의 수 (특징 추출기로부터).
+            mid_channels (int): 중간 레이어의 채널 수.
+            out_channels (int): 최종 외형 벡터의 크기.
+        """
+        super().__init__()
+
+        self.conv_blocks = nn.Sequential(
+            # [수정됨] kernel_size, stride, padding을 튜플로 전달
+            Conv2Plus1D(
+                in_channels=in_channels,
+                out_channels=mid_channels,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),  # 시간(T) stride=1, 공간(H,W) stride=2
+                padding=(1, 1, 1)
+            ),
+            Conv2Plus1D(
+                in_channels=mid_channels,
+                out_channels=out_channels,
+                kernel_size=(3, 3, 3),
+                stride=(1, 1, 1),  # 모든 차원에서 stride=1
+                padding=(1, 1, 1)
+            )
+        )
+
+        # 공간 차원을 풀링하여 채널당 하나의 특징만 남깁니다.
+        self.spatial_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): (B, T, C, H, W) 형태의 입력 텐서.
+
+        Returns:
+            torch.Tensor: (B, out_channels) 형태의 외형 벡터 v_appearance.
+        """
+
+        # (2+1)D 컨볼루션 블록을 통과시킵니다.
+        x = self.conv_blocks(x)
+
+        # 시간 평균 풀링 (Temporal Average Pooling)
+        # x shape: (B, C_out, T_out, H_out, W_out) -> (B, C_out, H_out, W_out)
+        x = x.mean(dim=2)
+
+        # 공간 풀링 및 flatten
+        # x shape: (B, C_out, H_out, W_out) -> (B, C_out, 1, 1)
+        x = self.spatial_pool(x)
+
+        # x shape: (B, C_out, 1, 1) -> (B, C_out)
+        v_appearance = torch.flatten(x, 1)
+
+        return v_appearance
+    
+    
+#################################################################
+
+
+class MotionEncoder(nn.Module):
+    """
+    비디오 특징을 인코딩하여 동작 벡터(v_motion)를 추출합니다.
+    (2+1)D 컨볼루션 스택과 GRU를 사용하여 시간적 역학을 포착합니다.
+    """
+    def __init__(self, in_channels: int, mid_channels: int, out_channels: int, rnn_hidden_size: int):
+        """
+        Args:
+            in_channels (int): 입력 채널의 수.
+            mid_channels (int): 중간 컨볼루션 레이어의 채널 수.
+            out_channels (int): 컨볼루션 블록의 출력 채널 수. 이는 RNN의 입력 크기가 됩니다.
+            rnn_hidden_size (int): GRU의 은닉 상태 크기. 최종 v_motion 벡터의 차원이 됩니다.
+        """
+        super().__init__()
+
+        self.conv_blocks = nn.Sequential(
+            # [수정됨] kernel_size, stride, padding을 튜플로 전달
+            Conv2Plus1D(
+                in_channels=in_channels,
+                out_channels=mid_channels,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1)
+            ),
+            Conv2Plus1D(
+                in_channels=mid_channels,
+                out_channels=out_channels,
+                kernel_size=(3, 3, 3),
+                stride=(1, 1, 1),
+                padding=(1, 1, 1)
+            )
+        )
+
+        self.spatial_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.rnn = nn.GRU(
+            input_size=out_channels,
+            hidden_size=rnn_hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): (B, T, C, H, W) 형태의 입력 텐서.
+        Returns:
+            torch.Tensor: (B, rnn_hidden_size) 형태의 동작 벡터 v_motion.
+        """
+        b, c, t, h, w = x.shape 
+
+        x = self.conv_blocks(x)
+        _, c_out, t_out, h_out, w_out = x.shape
+
+        # 공간 풀링을 위해 텐서 reshape
+        x = x.permute(0, 2, 1, 3, 4)      # -> (B, T_out, C_out, H_out, W_out)
+        x = x.reshape(b * t_out, c_out, h_out, w_out)
+        
+        # 공간 풀링 적용
+        x = self.spatial_pool(x)          # -> (B * T_out, C_out, 1, 1)
+        x = torch.flatten(x, 1)           # -> (B * T_out, C_out)
+        
+        # RNN 입력을 위해 시퀀스 형태로 복원
+        x = x.view(b, t_out, c_out)       # -> (B, T_out, C_out)
+        
+        # GRU 통과
+        _, h_n = self.rnn(x)              # h_n shape: (1, B, rnn_hidden_size)
+        
+        # 최종 v_motion 벡터 추출
+        v_motion = h_n.squeeze(0)         # -> (B, rnn_hidden_size)
+
+        return v_motion
+    
+
+#################################################################
+
+
+class VisionModel(nn.Module):
+    """
+    (수정 최종 버전) 특징 추출, Attention Bridge, 그리고 Appearance/Motion 인코딩을 모두 포함하는 통합 모델.
+    """
+    def __init__(self, image_size: int, target_size: tuple = (112, 112)):
+        """
+        Args:
+            image_size (int): 입력 이미지의 크기 (H 또는 W).
+            num_classes (int): 최종 분류할 클래스의 수.
+            target_size (tuple): Attention Bridge가 출력할 특징 맵의 크기.
+        """
+        super().__init__()
+
+        # --- 1단계: 특징 추출 및 ROI 지역화 ---
+        self.feature_extractor = Clip4ClipVisionModel()
+        hidden_size = self.feature_extractor.video_model.config.hidden_size  # e.g., 384
+
         patch_size = self.feature_extractor.video_model.config.patch_size
         patch_grid_size = image_size // patch_size
 
@@ -424,79 +540,57 @@ class MethodModel(nn.Module):
             target_size=target_size
         )
 
+        # --- 2단계: Appearance & Motion 인코딩 ---
+        # 인코더들의 채널 크기를 정의합니다.
+        encoder_mid_channels = 256
+        appearance_out_channels = 128
+        motion_out_channels = 128  # RNN의 입력 크기가 됩니다.
+        motion_rnn_hidden_size = 128
+
+        self.appearance_encoder = AppearanceEncoder(
+            in_channels=hidden_size,
+            mid_channels=encoder_mid_channels,
+            out_channels=appearance_out_channels
+        )
+
+        self.motion_encoder = MotionEncoder(
+            in_channels=hidden_size,
+            mid_channels=encoder_mid_channels,
+            out_channels=motion_out_channels,
+            rnn_hidden_size=motion_rnn_hidden_size
+        )
+
     def forward(self, video: torch.Tensor) -> dict:
         """
+        전체 모델의 순전파 파이프라인을 실행합니다.
         Args:
-            video (torch.Tensor): (B, T, C, H, W) 형태의 원본 비디오
+            video (torch.Tensor): (B, T, C, H, W) 형태의 원본 비디오.
         Returns:
-            dict: 모델의 모든 출력을 포함하는 딕셔너리
+            dict: 모델의 출력을 담은 딕셔너리.
+                    - "logits": 최종 분류 결과 (prediction).
+                    - "v_appearance": 추출된 외형 벡터.
+                    - "v_motion": 추출된 동작 벡터.
+                    - "transformed_features": Attention Bridge의 출력 특징 맵.
         """
-        # --- 1단계 실행 ---
-        # 특징 추출
         features_dict = self.feature_extractor(video)
+
+        # 1. 특징 추출 (F_A)
         final_features = features_dict["final_features"]
 
-        # 1단계의 로짓과 CAM 계산
-        output_dict_A = self.cam_generator(final_features)
+        # 2. Attention Bridge를 통해 변환된 특징 맵 (F'_A) 생성
+        # transformed_features shape: (B, T, D, H_t, W_t)
+        transformed_features = self.attention_bridge(final_features)
 
-        # --- 2단계 실행 ---
-        # 어텐션 브릿지를 통해 변환된 비디오(V') 생성
-        transformed_video = self.attention_bridge(final_features, video)
+        transformed_features = transformed_features.permute(0, 2, 1, 3, 4)  # -> (B, C, T, H, W)
+
+        # 3. Appearance 및 Motion 벡터 추출
+        v_appearance = self.appearance_encoder(transformed_features) # [B, 128]
+        v_motion = self.motion_encoder(transformed_features) # [B, 128]
 
         # --- 최종 출력 통합 ---
-        # 1단계 결과로 나온 딕셔너리를 기반으로 모든 결과물을 통합
-        final_output = output_dict_A
-        final_output["transformed_video"] = transformed_video
-        final_output["final_features"] = final_features
+        final_output = {
+            "v_appearance": v_appearance,
+            "v_motion": v_motion
+        }
 
         return final_output
-
-
-#################################################################
-
-
-class RankedTopKPooling(nn.Module):
-
-    def __init__(self, k1_ratio):
-        super().__init__()
-        self.k1_ratio = k1_ratio
-
-    def forward(self, features: torch.Tensor):
-        
-        # 입력 features shape: (256, 10, 7, 7)
-        bt, c, h, w = features.shape
-
-        # --- 1단계: 공간적 풀링 ---
-        # 공간 차원을 하나로 합침: (256, 10, 7, 7) --> (256, 10, 49)
-        # 각 프레임은 49개의 공간적 위치(패치)를 가짐
-        spatial_features = features.view(bt, c, h * w)
-
-        # k1 값 계산 
-        k1 = max(1, int((h * w) * self.k1_ratio))
-
-        # 공간 차원에서 top-k 값을 찾음
-        # 49개의 패치 중에서 활성화 값이 가장 높은 k1개의 패치들만 선택
-        # topk_spatial_values shape: (B, C, D, k1)
-        topk_spatial_values, _ = torch.topk(spatial_features, k=k1, dim=-1)
-
-        # k1개의 값들만 평균내어 공간 정보를 압축
-        # spatial_pooled shape: [256, 10]
-        spatial_pooled = torch.mean(topk_spatial_values, dim=-1)
-
-        return spatial_pooled
-    
-
-#################################################################
-
-
-
-
-
-
-
-
-
-
-
-
-

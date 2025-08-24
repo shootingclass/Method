@@ -8,73 +8,158 @@ from torch.utils.data import Dataset
 from PIL import Image
 from scipy.signal import butter, filtfilt
 import torch.nn.functional as F
+from torchvision import transforms as T
+from torchvision.transforms import functional as TF
+import random
 
 
 #####################################################################
 
 
 class SensorTransform:
-    def __init__(self, target_len, mean=None, std=None, filter_order=4, cutoff_freq=0.1):
+    def __init__(self, target_len, filter_btype='low', filter_order=4, cutoff_freq=0.1, 
+                interpolation_mode='linear', mean=None, std=None):
+        """
+        Args:
+            target_len (int): The target length of the sequence.
+            filter_btype (str): The type of filter ('low', 'high', 'band').
+            filter_order (int): The order of the filter.
+            cutoff_freq (float or list): The cutoff frequency for the filter.
+            interpolation_mode (str): The interpolation mode for resizing.
+            mean (np.array, optional): Pre-computed mean for normalization.
+            std (np.array, optional): Pre-computed std for normalization.
+        """
         self.target_len = target_len
+        self.interpolation_mode = interpolation_mode
         self.mean = mean
         self.std = std
-        self.filter_order = filter_order
-        self.cutoff_freq = cutoff_freq
         
         # Define Butterworth filter coefficients
-        self.b, self.a = butter(self.filter_order, self.cutoff_freq, btype='low', analog=False)
+        self.b, self.a = butter(filter_order, cutoff_freq, btype=filter_btype, analog=False)
+
+    def fit(self, data_list):
+        """
+        Calculates mean and std from a list of numpy arrays (training data).
+        Args:
+            data_list (list): A list of sensor data arrays, each with shape (C, T).
+        """
+        # Concatenate all data along the time axis
+        all_data = np.concatenate(data_list, axis=1)
+        # Calculate mean and std channel-wise
+        self.mean = np.mean(all_data, axis=1)
+        self.std = np.std(all_data, axis=1)
+        print("Mean and Std calculated and stored.")
 
     def _apply_filter(self, data):
-        # Apply filter along the time axis (axis=1) for each channel
-        # data shape: (C, T)
         return filtfilt(self.b, self.a, data, axis=1)
 
     def _apply_normalization(self, data):
-        # Apply channel-wise normalization
         if self.mean is not None and self.std is not None:
-            # Ensure mean and std are correctly shaped for broadcasting
             mean = self.mean[:, np.newaxis]
             std = self.std[:, np.newaxis]
-            return (data - mean) / (std + 1e-8) # Add epsilon for stability
+            return (data - mean) / (std + 1e-8)
         return data
 
-    # 보간을 위한 새로운 메서드 (NumPy 배열을 받아 Tensor를 반환)
-    def _apply_interpolation(self, data):
+    def _resize_to_target_len(self, data, device):
+        data_tensor = torch.from_numpy(data.copy()).float().to(device)
+        data_tensor = data_tensor.unsqueeze(0)
         
-        # F.interpolate를 위해 NumPy 배열을 Tensor로 변환
-        data_tensor = torch.from_numpy(data).float()
-        
-        # F.interpolate는 [N, C, L] 형태의 3D 텐서를 기대하므로 차원 추가
-        data_tensor = data_tensor.unsqueeze(0)  # [1, C, T]
-        
-        # 선형 보간 적용
         interpolated_tensor = F.interpolate(
             data_tensor, 
             size=self.target_len, 
-            mode='linear', 
-            align_corners=False
+            mode=self.interpolation_mode, 
+            align_corners=False if self.interpolation_mode != 'linear' else None # linear 모드는 align_corners 지원
         )
-        
-        # 추가했던 배치 차원 제거 후 반환
-        return interpolated_tensor.squeeze(0) # [C, target_len]
+        return interpolated_tensor.squeeze(0)
 
-    def __call__(self, sensor_data):
+    def __call__(self, sensor_data, device='cpu'):
         """
         Args:
             sensor_data (np.array): Input sensor data with shape (C, T).
+            device (str): The device to move the final tensor to ('cpu' or 'cuda').
         Returns:
-            np.array: Processed sensor data.
+            torch.Tensor: Processed sensor data.
         """
-        # 1. Apply filtering
-        # Use copy to avoid in-place modification issues and ensure data integrity
-        filtered_data = self._apply_filter(sensor_data.copy())
+        data_copy = sensor_data.copy()
         
-        # 2. Apply normalization
-        normalized_data = self._apply_normalization(filtered_data)
+        # 1. Apply normalization
+        normalized_data = self._apply_normalization(data_copy)
         
-        processed_data = self._apply_interpolation(normalized_data)
+        # 2. Apply filtering
+        filtered_data = self._apply_filter(normalized_data)
+        
+        # 3. Resize the signal
+        processed_data = self._resize_to_target_len(filtered_data, device)
         
         return processed_data
+
+
+#####################################################################
+
+
+class ClipConsistentTransforms:
+    def __init__(self, size, mean, std):
+        self.size = size
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, clip):
+        
+        # 1. 클립 전체에 대한 랜덤 파라미터 1회 생성
+        apply_flip = random.random() < 0.5
+
+        jitter_params = T.ColorJitter.get_params(
+            brightness=(0.6, 1.4), contrast=(0.6, 1.4),
+            saturation=(0.6, 1.4), hue=(-0.1, 0.1)
+        )
+
+        sigma = random.uniform(0.1, 2.0)
+
+        # 2. 모든 프레임에 동일한 파라미터로 변환 적용 (루프)
+        tensor_frames = []
+        for frame in clip:
+            frame = T.Resize(self.size, antialias=True)(frame)
+
+            if apply_flip:
+                frame = TF.hflip(frame)
+            
+            # --- 여기가 수정된 핵심 부분입니다 ---
+            # 파라미터를 명확하게 unpacking
+            fn_indices, brightness_factor, contrast_factor, saturation_factor, hue_factor = jitter_params
+
+            # 랜덤하게 결정된 함수 순서(fn_indices)대로 순회
+            for fn_id in fn_indices:
+                if fn_id == 0 and brightness_factor is not None:
+                    frame = TF.adjust_brightness(frame, brightness_factor)
+                elif fn_id == 1 and contrast_factor is not None:
+                    frame = TF.adjust_contrast(frame, contrast_factor)
+                elif fn_id == 2 and saturation_factor is not None:
+                    frame = TF.adjust_saturation(frame, saturation_factor)
+                elif fn_id == 3 and hue_factor is not None:
+                    frame = TF.adjust_hue(frame, hue_factor)
+            # --- 수정 끝 ---
+            
+            frame = TF.gaussian_blur(frame, kernel_size=[5, 5], sigma=sigma)
+
+            tensor_frames.append(T.ToTensor()(frame))
+
+        # 3. 텐서 기반 증강 및 정규화
+        # 비디오 데이터는 (C, T, H, W) 또는 (T, C, H, W) 형태가 일반적입니다.
+        # torch.stack의 dim 파라미터를 데이터 형태에 맞게 조정하세요.
+        # 예: (T, C, H, W)를 원할 경우 dim=0
+        clip_tensor = torch.stack(tensor_frames, dim=0)
+
+        if random.random() < 0.5:
+            erase_params = T.RandomErasing.get_params(
+                clip_tensor, scale=(0.1, 0.2), ratio=(0.3, 3.3), value=[0]
+            )
+            i, j, h, w, v = erase_params
+            clip_tensor = TF.erase(clip_tensor, i, j, h, w, v, inplace=False)
+
+        # Normalize
+        clip_tensor = TF.normalize(clip_tensor, mean=self.mean, std=self.std)
+
+        return clip_tensor
 
 
 #####################################################################
@@ -95,6 +180,7 @@ class VideoSensorDataset(Dataset):
             json_data = json.load(f)
         
         for item in json_data['data']:
+
             # JSON에 있는 상대 경로와 데이터 루트 경로를 조합하여 전체 경로 생성
             relative_path_video = item['frame_path']
             relative_path_sensor = item['imu_path']
@@ -154,23 +240,34 @@ class VideoSensorDataset(Dataset):
 
         cap.release()
 
-        # 3. 모든 프레임에 대해 한 번에 전처리 적용
+        # 3. 클립 전체에 대해 한 번에 전처리 적용
         if self.transform:
-            frames = [self.transform(frame) for frame in frames]
-        
-        # 4. 프레임 리스트를 하나의 텐서로 통합
-        frames_tensor = torch.stack(frames)
+            # transform이 이제 클립 전체를 받아 최종 텐서를 반환
+            frames_tensor = self.transform(frames)
+        else:
+            # transform이 없는 경우, 기본 ToTensor와 stack만 수행
+            frames_tensor = torch.stack([T.ToTensor()(frame) for frame in frames])
 
 
         ######### 센서 전처리 #########
+        
         # IMU CSV 로드
         df = pd.read_csv(sensor_path)
-        
-        selected_indices = np.r_[134:194, 207:231]
 
-        # .iloc를 사용하여 해당 위치의 컬럼들을 선택하고 .values로 NumPy 배열을 가져옵니다.
-        raw = df.iloc[:, selected_indices].values
-            
+        selected_indices = np.r_[134:231]
+
+        # .iloc를 사용하여 해당 위치의 컬럼들을 선택합니다.
+        selected_df = df.iloc[:, selected_indices].copy() # SettingWithCopyWarning 방지를 위해 .copy()
+
+        # 선택된 데이터프레임에 대해 결측치 처리 시작
+        for col in selected_df.columns:
+            if selected_df[col].isnull().sum() / len(selected_df) > 0.5:
+                selected_df[col].fillna(0, inplace=True)
+
+        selected_df.interpolate(method='linear', limit_direction='both', inplace=True)
+
+        raw = selected_df.values
+
         sensor_data = raw.T # (C, T)
 
         # 센서 데이터 전처리 적용
