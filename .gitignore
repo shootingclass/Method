@@ -1,0 +1,57 @@
+# 특정 디렉토리 제외
+/cam_visualizations_Door2_Augmentation_ver2/
+/lightning_logs/
+/wandb/
+/Shell/wandb/
+/Visualization/
+
+# 일반적인 Python 관련 파일 제외
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 가상 환경 관련
+venv/
+ENV/
+env/
+
+# IDE 관련 파일
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 로그 및 임시 파일
+*.log
+*.tmp
+.DS_Store
+
+# 모델 체크포인트 및 대용량 파일
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# 데이터셋 (필요시 주석 해제)
+# /data/
+# /datasets/
+
+# yaml 파일
+*.yaml

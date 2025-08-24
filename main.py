@@ -9,6 +9,7 @@ import wandb
 import numpy as np
 import random
 import itertools
+import argparse
 
 # 분산 학습 라이브러리
 import torch.distributed as dist
@@ -17,12 +18,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 # --- 사용자 정의 모듈 임포트 ---
 from dataset import VideoSensorDataset, SensorTransform, ClipConsistentTransforms
-from model import  SensorModel, VisionModel
+from model import  SensorModel, VisionModel, ClusteringModel
 from utils import (
     train_one_epoch, 
     calculate_sensor_stats, save_stats, load_stats
 )
-
 
 ####################################################################
 
@@ -41,6 +41,10 @@ def set_random_seed(seed):
 
 
 def main():
+    wandb.init(
+        project=args.project_name,
+        name=args.run_name,
+    )
 
     # --- 분산 학습 설정 ---
     dist.init_process_group("nccl")
@@ -67,14 +71,10 @@ def main():
     # 1. 하이퍼파라미터 및 설정 정의
     # ==================================================================
     DATA_ROOT = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-    JSON_TRAIN_PATH = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/noToggle/pretrain.json"
-    STATS_FILE_PATH = '/home/junho/Method/sensor_stats/sensor_stats.npy' # 센서 데이터 통계 파일 경로
-    NUM_FRAMES = 16
-    BATCH_SIZE = 4
-    EPOCHS = 10
-    LEARNING_RATE = 1e-4
+    # JSON_TRAIN_PATH = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject/custom_train.json"
+    JSON_TRAIN_PATH = "/home/jaemo/jaemo_Opportunity++/actionOnlyObject/custom_train.json"
+    STATS_FILE_PATH = '/home/jaemo/Method/sensor_stats/sensor_stats.npy' # 센서 데이터 통계 파일 경로
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    NUM_WORKERS = 4
 
     # 시각화 결과물을 저장할 폴더 이름
     output_dir = "Visualization/transformed_video"
@@ -116,7 +116,7 @@ def main():
         temp_train_dataset = VideoSensorDataset(
             json_path=JSON_TRAIN_PATH,
             data_root=DATA_ROOT,
-            num_frames=NUM_FRAMES,
+            num_frames=args.num_frames,
             transform=train_transform,
             sensor_transform=None # 센서 변환 없음
         )
@@ -134,18 +134,19 @@ def main():
     train_dataset = VideoSensorDataset(
         json_path=JSON_TRAIN_PATH,
         data_root=DATA_ROOT,
-        num_frames=NUM_FRAMES,
+        num_frames=args.num_frames,
         transform=train_transform,
-        sensor_transform=sensor_preprocessor # 센서 전처리 적용
+        sensor_transform=sensor_preprocessor, # 센서 전처리 적용
+        threshold_epoch=args.threshold_epoch
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=False,  # DistributedSampler가 셔플링을 담당합니다.
-        num_workers=NUM_WORKERS,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
         sampler=train_sampler
@@ -160,13 +161,22 @@ def main():
     # 5. 모델, 손실 함수, 옵티마이저 정의
     # ==================================================================
     video_model = VisionModel(image_size=224).to(DEVICE)
-    sensor_model = SensorModel(sensor_channels=97).to(DEVICE)
+    sensor_model = SensorModel(sensor_channels=97, size_embeddings=args.embedding_dim).to(DEVICE)
+    clustering_model = ClusteringModel(
+        encoder=sensor_model,
+        embedding_dim=args.embedding_dim,
+        num_sensors=args.num_sensors,
+        num_clusters=args.num_classes,
+        prototypes=None,
+        alpha_fixed=args.alpha_fixed
+    ).to(DEVICE)
 
     video_model = DDP(video_model, device_ids=[local_rank], find_unused_parameters=True)
     sensor_model = DDP(sensor_model, device_ids=[local_rank], find_unused_parameters=True)
+    # clustering_model = DDP(clustering_model, device_ids=[local_rank], find_unused_parameters=True)
 
     parameters = itertools.chain(video_model.parameters(), sensor_model.parameters())
-    optimizer = optim.AdamW(parameters, lr=LEARNING_RATE)
+    optimizer = optim.AdamW(parameters, lr=args.lr)
     # ==================================================================
 
 
@@ -201,16 +211,19 @@ def main():
     if rank == 0:
         print("\n--- Starting Training ---")
 
-    for epoch in range(EPOCHS):
+    for epoch in range(args.epochs):
         train_loader.sampler.set_epoch(epoch)  # 중요: 에포크마다 샘플러 상태를 업데이트합니다.
-
+        # threshold_epoch 측정을 위한 데이터셋 업데이트. 깔끔하게 하고 싶다면 데이터로더 캡슐화.
+        train_dataset.set_epoch(epoch) # 중요: 에포크마다 샘플러 상태를 업데이트합니다.
+        clustering_model.update_epoch(epoch)
+        
         if rank == 0:
-            print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+            print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
         # --- 1. 학습 단계 ---
         # train_one_epoch 함수에 device 변수를 전달합니다.
-        train_loss = train_one_epoch(video_model, sensor_model, train_loader, optimizer,device, epoch, output_dir, rank)
-
+        train_loss = train_one_epoch(video_model, sensor_model, clustering_model, train_loader, optimizer,device, epoch, output_dir, rank)
+        clustering_model.evaluate(train_loader, epoch, stage="train")
         # train_one_epoch 함수가 loss를 모든 프로세스에 브로드캐스팅하지 않는다면,
         # 아래 코드는 각 프로세스별 loss를 출력할 수 있습니다.
         # 모든 프로세스의 평균 loss를 보려면 추가적인 동기화 코드가 필요합니다.
@@ -226,4 +239,20 @@ def main():
     dist.destroy_process_group()
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Pure PyTorch version of SwAV for IMU Clustering")
+    
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_frames", type=int, default=16)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--embedding_dim", type=int, default=512)
+    parser.add_argument("--num_classes", type=int, default=7) # 더미데이터는 10개 클래스
+    parser.add_argument("--project_name", type=str, default="SwAV_IMU_Clustering_PyTorch")
+    parser.add_argument("--run_name", type=str, default="swav_hybrid_pytorch")
+    parser.add_argument("--alpha_fixed", type=bool, default=True) # --alpha_fixed 사용시 True
+    parser.add_argument("--num_sensors", type=int, default=97)
+    parser.add_argument("--threshold_epoch", type=int, default=9)
+    
+    args = parser.parse_args()
     main()

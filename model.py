@@ -5,7 +5,13 @@ from transformers import CLIPVisionModelWithProjection, AutoModel
 from peft import LoraConfig, get_peft_model
 import random
 from einops import rearrange, repeat
-
+# clustering model
+import wandb
+from sklearn.metrics import accuracy_score
+from scipy.optimize import linear_sum_assignment
+from visualization import visualize_tsne
+import numpy as np
+import matplotlib.pyplot as plt
 
 #################################################################
 
@@ -594,3 +600,230 @@ class VisionModel(nn.Module):
         }
 
         return final_output
+
+
+class ClusteringModel(nn.Module):
+    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, prototypes=None, alpha_fixed=False):
+        super().__init__()
+        self.encoder = encoder
+        self.gate = nn.Sequential(
+            nn.Linear(embedding_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(p=0.9),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+        self.projection_layer = nn.Linear(num_sensors, embedding_dim)
+        if prototypes is not None:
+            self.prototypes = nn.Parameter(prototypes)
+        else:
+            self.prototypes = nn.Parameter(torch.randn(num_clusters, embedding_dim))
+        self.alpha_fixed = alpha_fixed
+        self.current_epoch = 0
+        self.total_epochs = 20
+        self.temperature = 0.03
+        self.sk_iterations = 3
+        self.threshold_epoch = 9
+        self.top_k = 4
+        self.num_clusters = num_clusters
+
+    def forward(self, imu_batch, rule_based_feature, val=False):
+        deep_embedding = self.encoder(imu_batch)['emb']
+        if not self.alpha_fixed:
+            raw_gate_score = self.gate(deep_embedding)
+            alpha = raw_gate_score
+            # 2. 온도(temperature)를 적용하여 Sigmoid 통과
+            start_alpha = 0.5
+            end_alpha = 1.0
+            total_epochs = self.total_epochs
+
+            # 현재 에폭 진행률
+            progress = min(1.0, self.current_epoch / total_epochs) 
+            # if progress > 0.7:
+                # alpha_value=1.0
+            # else:
+                # alpha_value=0.5
+            # alpha_value = raw_gate_score
+            progress = 0.5 * (1 - torch.cos(torch.tensor(np.pi * self.current_epoch / total_epochs)))
+
+            # alpha 값 계산
+            alpha_value = start_alpha + (end_alpha - start_alpha) * progress
+            alpha_value = alpha_value  + raw_gate_score *0.0
+            if self.current_epoch > self.threshold_epoch:
+                alpha_value = 1.0
+            alpha = torch.tensor(alpha_value)
+        else:
+            alpha = torch.tensor(0.5, device=deep_embedding.device)
+
+        if val:
+            alpha = torch.tensor(1.0, device=deep_embedding.device)
+
+        projected_rule_feature = self.projection_layer(rule_based_feature)
+        final_feature = alpha * F.normalize(deep_embedding, dim=1) + (1 - alpha) * projected_rule_feature
+        
+        final_feature_norm = F.normalize(final_feature, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        scores = torch.matmul(final_feature_norm, prototypes_norm.t())
+        return scores, final_feature, alpha
+
+    def update_epoch(self, epoch):
+        self.current_epoch = epoch
+
+    def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=10):
+        max_values, _ = torch.max(imu_batch, dim=2)
+        min_values, _ = torch.min(imu_batch, dim=2)
+        ranges = max_values - min_values
+
+        min_range, _ = torch.min(ranges, dim=1, keepdim=True)
+        max_range, _ = torch.max(ranges, dim=1, keepdim=True)
+        weighted_features = (ranges - min_range) / (max_range - min_range + 1e-8)
+        
+        _, top_indices = torch.topk(weighted_features, k=self.top_k, dim=1)
+        mask = torch.zeros_like(weighted_features)
+        mask.scatter_(1, top_indices, 1)
+        
+        final_rule_feature = weighted_features * mask
+        return final_rule_feature
+
+    def compute_hungarian_matching(self, pred_labels, true_labels, num_clusters):
+        cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
+        for i in range(len(pred_labels)):
+            cost_matrix[pred_labels[i], true_labels[i]] += 1
+        row_ind, col_ind = linear_sum_assignment(-cost_matrix)
+        mapping = {i: j for i, j in zip(row_ind, col_ind)}
+        return accuracy_score(true_labels, np.array([mapping.get(x, -1) for x in pred_labels])), mapping
+
+
+    @torch.no_grad()
+    def sinkhorn_knopp(self, scores):
+        """Sinkhorn-Knopp 알고리즘 (순수 PyTorch 함수 버전)"""
+        Q = torch.exp(scores / self.temperature).t()
+        Q /= torch.sum(Q)
+        
+        K, B = Q.shape
+        r = torch.ones(K, device=self.prototypes.device) / K
+        c = torch.ones(B, device=self.prototypes.device) / B
+        
+        for _ in range(self.sk_iterations):
+            sum_Q_row = torch.sum(Q, dim=1, keepdim=True)  # 크기: (K, 1)
+            Q *= (r.view(-1, 1) / sum_Q_row)  # r을 (K, 1) 크기로 변환하여 나눗셈
+            
+            sum_Q_col = torch.sum(Q, dim=0, keepdim=True)
+            Q *= (c / sum_Q_col)
+            
+        return (Q / torch.sum(Q, dim=0, keepdim=True)).t()
+
+    def evaluate(self, dataloader, epoch, stage="val"):
+        """모델 평가 함수 (순수 PyTorch)"""
+        self.eval() # 평가 모드
+        all_embs_rule, all_embs_1, all_embs_base = [], [], []
+        all_labels, all_predicted_rule, all_predicted_1, all_predicted_base = [], [], [], []
+        all_item_id = []
+        num_sensors = 97
+
+        with torch.no_grad():
+            for i, (videos, imu_data, labels, item_id) in enumerate(dataloader):
+                if i > 30:
+                    break
+                imu_data, labels = imu_data.to(self.prototypes.device), labels.to(self.prototypes.device)
+                label_mapping = {0: 0, 1: 1, 2: 0, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3, 8: 4, 9: 4, 10: 5, 11: 5, 12: 6, 13: 6, 14: 7, 15: 8}
+                labels = torch.tensor([label_mapping[label.item()] for label in labels])
+                labels = labels.to(self.prototypes.device)
+
+                # 1. 규칙 기반 특징 + 딥러닝 모델
+                rule_based_feature = self.get_representative_sensor_feature(imu_data, labels, num_sensors)
+
+                # rule only 추측 모델
+                scores_rule, final_feature_rule, _ = self(imu_data, rule_based_feature)
+                scores_rule_sk = self.sinkhorn_knopp(scores_rule)
+                predicted_rule = torch.argmax(scores_rule_sk, dim=1)
+
+                # 2. 딥러닝 모델 Only (alpha=0.5, 훈련 중과 유사)
+                rule_based_feature_zero = torch.zeros_like(rule_based_feature)
+                scores_1, final_feature_1, alpha_1 = self(imu_data, rule_based_feature_zero)
+                scores_1_sk = self.sinkhorn_knopp(scores_1)
+                predicted_1 = torch.argmax(scores_1_sk, dim=1)
+
+                # 3. 딥러닝 모델 Only (alpha=1.0, 최종 성능)
+                scores_base, final_feature_base, alpha_base = self(imu_data, rule_based_feature_zero, val=True)
+                scores_base_sk = self.sinkhorn_knopp(scores_base)
+                predicted_base = torch.argmax(scores_base_sk, dim=1)
+
+                # 결과 저장
+                all_embs_rule.append(final_feature_rule.cpu().numpy())
+                all_embs_1.append(final_feature_1.cpu().numpy())
+                all_embs_base.append(final_feature_base.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
+                all_predicted_rule.append(predicted_rule.cpu().numpy())
+                all_predicted_1.append(predicted_1.cpu().numpy())
+                all_predicted_base.append(predicted_base.cpu().numpy())
+                all_item_id.append(item_id)
+        all_embs_rule = np.vstack(all_embs_rule)
+        all_embs_1 = np.vstack(all_embs_1)
+        all_embs_base = np.vstack(all_embs_base)
+        all_labels = np.concatenate(all_labels)
+        all_predicted_rule = np.concatenate(all_predicted_rule)
+        all_predicted_1 = np.concatenate(all_predicted_1)
+        all_predicted_base = np.concatenate(all_predicted_base)
+        all_item_id = np.concatenate(all_item_id)
+        # 헝가리안 매칭으로 정확도 계산
+        accuracy_rule, mapping_rule = self.compute_hungarian_matching(all_predicted_rule, all_labels, self.num_clusters)
+        accuracy_1, mapping_1 = self.compute_hungarian_matching(all_predicted_1, all_labels, self.num_clusters)
+        accuracy_base, mapping_base = self.compute_hungarian_matching(all_predicted_base, all_labels, self.num_clusters)
+        
+        print(f"[{stage.upper()} Epoch {epoch}] Acc (Rule): {accuracy_rule:.4f}, Acc 1(Alpha=0.5): {accuracy_1:.4f}, Acc Base(Alpha=1.0): {accuracy_base:.4f}")
+        
+        # wandb 로깅
+        wandb.log({
+            f'{stage}_acc_rule': accuracy_rule,
+            f'{stage}_acc_1': accuracy_1,
+            f'{stage}_acc_base': accuracy_base,
+            'epoch': epoch
+        })
+        if type(alpha_base) == torch.Tensor:
+            wandb.log({
+                f'{stage}_alpha': alpha_base.mean().item(),
+                'epoch': epoch
+            })
+        elif type(alpha_base) == float or type(alpha_base) == int:
+            wandb.log({
+                f'{stage}_alpha': alpha_base,
+                'epoch': epoch
+            })
+        if type(alpha_1) == torch.Tensor:
+            wandb.log({
+                f'train_alpha': alpha_1.mean().item(),
+                'epoch': epoch
+            })
+        elif type(alpha_1) == float or type(alpha_1) == int:
+            wandb.log({
+                f'train_alpha': alpha_1,
+                'epoch': epoch
+            })
+
+        # # t-SNE 시각화 (선택적으로 짝수 에포크에만 실행)
+        if epoch %2== 0:
+            title = f"t-SNE at Epoch {epoch}"
+            prototypes_np = self.prototypes.detach().cpu().numpy()
+            all_predicted_rule_mapped = [mapping_rule.get(label.item()) for label in all_predicted_rule]
+            fig_rule = visualize_tsne(all_embs_rule, all_labels, all_predicted_rule_mapped, title+"_rule", prototypes=prototypes_np, num_classes=self.num_clusters)
+            # 틀린 놈 찾기
+            for i in range(len(all_predicted_rule_mapped)):
+                if all_labels[i] != all_predicted_rule_mapped[i]:
+                    print(f"Epoch {epoch} Rule: {all_item_id[i]}")
+                    print(f"Epoch {epoch} Rule: {all_labels[i]} -> {all_predicted_rule_mapped[i]}")
+                    print("--------------------------------")
+            # fig_1 = visualize_tsne(all_embs_1, all_labels, all_predicted_1, title+"_1", prototypes=prototypes_np, num_classes=args.num_classes)
+            # fig_base = visualize_tsne(all_embs_base, all_labels, all_predicted_base, title+"_base", prototypes=prototypes_np, num_classes=args.num_classes)
+            wandb.log({
+                "t-SNE Visualization Rule": wandb.Image(fig_rule),
+                # "t-SNE Visualization 1": wandb.Image(fig_1),
+                # "t-SNE Visualization Base": wandb.Image(fig_base)
+            })
+            plt.close('all')
+
+        self.train() # 다시 학습 모드로 전환
+        return mapping_1 # 훈련 스텝에서 사용할 매핑 반환
+    
+    def update_epoch(self, epoch):
+        self.current_epoch = epoch

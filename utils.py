@@ -60,7 +60,7 @@ def load_stats(path):
 #################################################################
 
 
-def train_one_epoch(video_model, sensor_model, dataloader, optimizer, device, epoch, output_dir, rank):
+def train_one_epoch(video_model, sensor_model, clustering_model, dataloader, optimizer, device, epoch, output_dir, rank):
     video_model.train()
     sensor_model.train()
 
@@ -75,11 +75,43 @@ def train_one_epoch(video_model, sensor_model, dataloader, optimizer, device, ep
     else:
         iterable = dataloader
 
-    for batch_idx, (videos, sensors, _) in enumerate(iterable):
+    for batch_idx, (videos, sensors, labels, _) in enumerate(iterable):
+        
         videos = videos.to(device)
         sensors = sensors.to(device)
 
         optimizer.zero_grad()
+        
+        # 0. 클러스터링 모델 순전파 및 손실 계산 (비지도 학습)
+        num_sensors = sensors.shape[1]
+        rule_based_feature = clustering_model.get_representative_sensor_feature(sensors, labels, num_sensors)
+        scores_cluster, final_feature_cluster, alpha = clustering_model(sensors, rule_based_feature)
+        scores_sk = clustering_model.sinkhorn_knopp(scores_cluster)
+        # wandb.log({"train_alpha": alpha})
+    
+        with torch.no_grad():
+            pseudo_labels = torch.argmax(scores_sk, dim=1)
+            
+        mse_loss = F.mse_loss(final_feature_cluster, clustering_model.prototypes[pseudo_labels])
+        
+        prototypes = clustering_model.prototypes
+        p1 = prototypes.unsqueeze(1)
+        p2 = prototypes.unsqueeze(0)
+        mse_matrix = F.mse_loss(p1, p2, reduction='none').mean(dim=2)
+        n_proto = clustering_model.num_clusters
+        diversity_loss = - (mse_matrix.sum()) / (n_proto * (n_proto - 1))
+        
+        loss_cluster = mse_loss + diversity_loss
+
+        if epoch < clustering_model.threshold_epoch:
+            # 9-epoch까지는 클러스터링 모델만 학습
+            loss_cluster.backward()
+            optimizer.step()
+            total_loss += loss_cluster.item()
+            continue
+        # 일단 rule-based feature 사용 (almost 0.7 accuracy)
+        labels = pseudo_labels
+        prototypes = clustering_model.prototypes
 
         # 1. 각 모델에서 임베딩 추출
         # DDP로 래핑된 모델은 내부적으로 .module을 호출하므로 직접적인 접근은 필요 없습니다.

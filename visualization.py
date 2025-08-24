@@ -9,10 +9,29 @@ from typing import List
 import torchvision.transforms.functional as TF
 from sklearn.manifold import TSNE
 import os
-
+# clustering model
+import wandb
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 #################################################################
+# clustering model
 
+START_INDEX = 134
+END_INDEX = 231
+
+ACTION_MERGE_LABELS = {
+        0: 'Door 1',
+        1: 'Door 2',
+        2: 'Fridge',
+        3: 'Dishwasher',
+        4: 'Drawer 1',
+        5: 'Drawer 2',
+        6: 'Drawer 3',
+        7: 'Clean Table',
+        8: 'Drink from Cup',
+        9: 'Toggle Switch'
+    }
 
 def _superimpose_heatmap_on_image(
     frame_tensor: torch.Tensor,
@@ -222,3 +241,210 @@ def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = No
     print(f"Transformed video visualization saved to {output_path}")
 
 
+def visualize_tsne_3D(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization", mapping=False):
+    """
+    t-SNE 결과를 3D로 시각화하고 Matplotlib Figure 객체를 반환합니다.
+    """
+    n_samples = prototypes.shape[0]
+    label_names = [f"Class_{i}" for i in range(n_samples)]
+    
+    if n_samples <= 1:
+        print(f"Warning: Cannot run t-SNE with {n_samples} samples.")
+        return plt.figure()
+
+    perplexity_value = min(30.0, float(n_samples - 1))
+    if perplexity_value <= 0: perplexity_value = 1.0
+
+    print(f"Running 3D t-SNE with {n_samples} samples and perplexity={perplexity_value:.1f}")
+    
+    # --- ✨ 핵심 수정: n_components=3 으로 변경 ---
+    tsne = TSNE(n_components=3, perplexity=perplexity_value, random_state=42, metric="cosine")
+    
+    if prototypes is not None:
+        combined_data = np.vstack([embeddings, prototypes])
+        reduced_data = tsne.fit_transform(combined_data)
+        reduced_embeddings = reduced_data[:-len(prototypes)]
+        reduced_prototypes = reduced_data[-len(prototypes):]
+    else:
+        reduced_embeddings = tsne.fit_transform(embeddings)
+        reduced_prototypes = None
+
+    fig = plt.figure(figsize=(24, 10))
+    fig.suptitle(title, fontsize=16)
+
+    # --- ✨ 핵심 수정: subplot을 3D로 설정 ---
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+
+    # 실제 레이블 기준 시각화
+    scatter1 = ax1.scatter(
+        reduced_embeddings[:, 0], reduced_embeddings[:, 1], reduced_embeddings[:, 2],
+        c=true_labels, cmap="tab10", alpha=0.7
+    )
+    ax1.set_title("True Labels")
+    legend1_handles, _ = scatter1.legend_elements(num=n_samples)
+    ax1.legend(legend1_handles, label_names)
+
+    # 예측된 클러스터 기준 시각화
+    scatter2 = ax2.scatter(
+        reduced_embeddings[:, 0], reduced_embeddings[:, 1], reduced_embeddings[:, 2],
+        c=pred_labels, cmap="tab10", alpha=0.7
+    )
+    if mapping:
+        ax2.set_title("Predicted Clusters (Mapped)")
+    else:
+        ax2.set_title("Predicted Clusters")
+    
+    if reduced_prototypes is not None:
+        proto_labels = np.arange(len(prototypes))
+        # 두 subplot에 모두 프로토타입을 표시
+        ax1.scatter(
+            reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
+            c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5
+        )
+        ax2.scatter(
+            reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
+            c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5
+        )
+        
+        # 프로토타입에 번호 추가
+        for i in range(len(prototypes)):
+            ax1.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], f'P{i}', fontsize=12, weight='bold')
+            ax2.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], f'P{i}', fontsize=12, weight='bold')
+    
+    legend2_handles, _ = scatter2.legend_elements(num=n_samples)
+    ax2.legend(legend2_handles, label_names)
+        
+    return fig
+# LinearProbingEvaluator 클래스를 아래 코드로 교체하세요.
+def visualize_tsne(embeddings, true_labels, pred_labels, title, prototypes=None, num_classes=7, mapping=False):
+        """t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환. 프로토타입도 함께 시각화 가능."""
+        fig = visualize_tsne_3D(embeddings, true_labels, pred_labels, prototypes=prototypes, mapping=mapping)
+        wandb.log({"t-SNE Visualization_3d": wandb.Image(fig, caption=title)})
+
+        label_names = [f"Class_{i}" for i in range(num_classes)]
+        assert num_classes == len(prototypes), f"num_classes must be equal to the number of prototypes, now num_classes: {num_classes}, len(prototypes): {len(prototypes)}"
+        # --- ✨ 핵심 수정: t-SNE를 실행하기에 샘플 수가 충분한지 확인 ---
+        if len(embeddings) <= 1:
+            print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples. Skipping visualization.")
+            return plt.figure() # 빈 Figure 객체 반환
+
+        # --- ✨ 프로토타입과 임베딩을 함께 변환하기 위해 결합 ---
+        if prototypes is not None:
+            combined_data = np.vstack([embeddings, prototypes])
+        else:
+            combined_data = embeddings
+
+        # Perplexity는 샘플 수보다 작아야 함
+        perplexity_value = min(30, len(combined_data) - 1)
+        if perplexity_value <= 0: # 이중 안전장치
+            perplexity_value = 1.0
+        tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=42, n_iter=300, metric="cosine")
+        reduced_all = tsne.fit_transform(combined_data)
+        
+        reduced_embeddings = reduced_all[:len(embeddings)]
+        if prototypes is not None:
+            reduced_prototypes = reduced_all[len(embeddings):]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 10))
+        fig.suptitle(title, fontsize=16)
+        
+        # 실제 레이블 기준 시각화
+        scatter1 = ax1.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=true_labels, cmap="tab10", alpha=0.7)
+        ax1.set_title("True Labels")
+
+        # 예측된 클러스터 기준 시각화
+        scatter2 = ax2.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=pred_labels, cmap="tab10", alpha=0.7)
+        if mapping:
+            ax2.set_title("Predicted Clusters (Mapped)")
+        else:
+            ax2.set_title("Predicted Clusters")
+        
+        # --- ✨ 프로토타입 시각화 추가 ---
+        if prototypes is not None:
+            proto_labels = np.arange(len(prototypes))
+            # 두 subplot에 모두 프로토타입을 표시
+            ax1.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
+            ax2.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
+            
+            # 프로토타입에 번호 추가
+            for i in range(len(prototypes)):
+                ax1.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
+                ax2.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
+            
+            # 범례 업데이트
+            handles1 = scatter1.legend_elements(num=num_classes)[0]
+            proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
+            handles1.append(proto_handle)
+            ax1.legend(handles=handles1, labels=label_names + ['Prototypes'])
+
+            print("\n--- Legend Debugging Info ---")
+            # 실제로 pred_labels에 어떤 값들이 들어있는지 확인
+            unique_preds = np.unique(pred_labels)
+            print(f"Unique predicted labels in data: {unique_preds}")
+            print(f"Number of unique predicted labels: {len(unique_preds)}")
+
+            # legend_elements가 생성하는 핸들의 실제 개수 확인
+            handles_check = scatter2.legend_elements(num=num_classes)[0]
+            print(f"Number of handles generated by legend_elements: {len(handles_check)}")
+            print(f"Number of labels provided: {len(label_names) + 1}")
+            print("---------------------------\n")
+            handles2 = scatter2.legend_elements(num=num_classes)[0]
+            handles2.append(proto_handle)
+            print('handles2: ', handles2)
+            print('label_names: ', label_names)
+            ax2.legend(handles=handles2, labels=label_names + ['Prototypes'])
+        else:
+            assert False, "prototypes is not None"
+            ax1.legend(handles=scatter1.legend_elements(num=num_classes)[0], labels=label_names)
+            ax2.legend(handles=scatter2.legend_elements(num=num_classes)[0], labels=label_names)
+        
+        return fig
+   
+
+
+
+def get_sensor_name(sensor_index):
+    """
+    sensor_index에 해당하는 센서 이름을 반환합니다.
+    
+    Args:
+        sensor_index: 센서 인덱스 (1-based index)
+    
+    Returns:
+        str: 센서 이름 문자열, 해당 인덱스가 없으면 "Unknown Sensor"
+    """
+    # 파일 경로 설정
+    column_names_path = "/mnt/hdd4tb/junho/Opportunity++/data/column_names.txt"
+    
+    try:
+        # 파일이 존재하는지 확인
+        if not os.path.exists(column_names_path):
+            return f"Unknown Sensor (Index: {sensor_index})"
+        
+        # 파일 읽기
+        with open(column_names_path, 'r') as f:
+            lines = f.readlines()
+        
+        # 지정된 인덱스 찾기
+        for line in lines:
+            # Column: {index} {description} 형식 찾기
+            if line.strip().startswith(f"Column: {sensor_index} "):
+                # 센서 설명 추출
+                sensor_description = line.strip()[len(f"Column: {sensor_index} "):]
+                
+                # 센서 이름과 타입 파싱 (예: "Accelerometer RKN^ accX")
+                parts = sensor_description.split(';')[0].strip().split()
+                if len(parts) >= 2:
+                    sensor_type = parts[0]  # "Accelerometer"
+                    sensor_location = parts[1]  # "RKN^"
+                    sensor_axis = " ".join(parts[2:])  # "accX"
+                    return f"{sensor_type} {sensor_location} {sensor_axis}"
+                else:
+                    return sensor_description
+                
+        # 인덱스가 없으면
+        return f"Unknown Sensor (Index: {sensor_index})"
+    
+    except Exception as e:
+        return f"Error reading sensor name: {str(e)}"
