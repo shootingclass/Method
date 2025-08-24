@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 /home/junho/Method/main.py
