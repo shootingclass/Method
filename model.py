@@ -602,9 +602,13 @@ class VisionModel(nn.Module):
         return final_output
 
 
+#################################################################
+
+
 class ClusteringModel(nn.Module):
     def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, prototypes=None, alpha_fixed=False):
         super().__init__()
+        
         self.encoder = encoder
         self.gate = nn.Sequential(
             nn.Linear(embedding_dim, 16),
@@ -627,12 +631,13 @@ class ClusteringModel(nn.Module):
         self.top_k = 4
         self.num_clusters = num_clusters
 
+
     def forward(self, imu_batch, rule_based_feature, val=False):
         deep_embedding = self.encoder(imu_batch)['emb']
+        
         if not self.alpha_fixed:
             raw_gate_score = self.gate(deep_embedding)
             alpha = raw_gate_score
-            # 2. 온도(temperature)를 적용하여 Sigmoid 통과
             start_alpha = 0.5
             end_alpha = 1.0
             total_epochs = self.total_epochs
@@ -652,6 +657,7 @@ class ClusteringModel(nn.Module):
             if self.current_epoch > self.threshold_epoch:
                 alpha_value = 1.0
             alpha = torch.tensor(alpha_value)
+
         else:
             alpha = torch.tensor(0.5, device=deep_embedding.device)
 
@@ -666,8 +672,10 @@ class ClusteringModel(nn.Module):
         scores = torch.matmul(final_feature_norm, prototypes_norm.t())
         return scores, final_feature, alpha
 
+
     def update_epoch(self, epoch):
         self.current_epoch = epoch
+
 
     def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=10):
         max_values, _ = torch.max(imu_batch, dim=2)
@@ -684,6 +692,7 @@ class ClusteringModel(nn.Module):
         
         final_rule_feature = weighted_features * mask
         return final_rule_feature
+
 
     def compute_hungarian_matching(self, pred_labels, true_labels, num_clusters):
         cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
@@ -712,6 +721,7 @@ class ClusteringModel(nn.Module):
             Q *= (c / sum_Q_col)
             
         return (Q / torch.sum(Q, dim=0, keepdim=True)).t()
+
 
     def evaluate(self, dataloader, epoch, stage="val"):
         """모델 평가 함수 (순수 PyTorch)"""
@@ -758,6 +768,7 @@ class ClusteringModel(nn.Module):
                 all_predicted_1.append(predicted_1.cpu().numpy())
                 all_predicted_base.append(predicted_base.cpu().numpy())
                 all_item_id.append(item_id)
+
         all_embs_rule = np.vstack(all_embs_rule)
         all_embs_1 = np.vstack(all_embs_1)
         all_embs_base = np.vstack(all_embs_base)
@@ -766,6 +777,7 @@ class ClusteringModel(nn.Module):
         all_predicted_1 = np.concatenate(all_predicted_1)
         all_predicted_base = np.concatenate(all_predicted_base)
         all_item_id = np.concatenate(all_item_id)
+
         # 헝가리안 매칭으로 정확도 계산
         accuracy_rule, mapping_rule = self.compute_hungarian_matching(all_predicted_rule, all_labels, self.num_clusters)
         accuracy_1, mapping_1 = self.compute_hungarian_matching(all_predicted_1, all_labels, self.num_clusters)
@@ -802,7 +814,7 @@ class ClusteringModel(nn.Module):
             })
 
         # # t-SNE 시각화 (선택적으로 짝수 에포크에만 실행)
-        if epoch %2== 0:
+        if epoch % 2== 0:
             title = f"t-SNE at Epoch {epoch}"
             prototypes_np = self.prototypes.detach().cpu().numpy()
             all_predicted_rule_mapped = [mapping_rule.get(label.item()) for label in all_predicted_rule]
@@ -824,6 +836,7 @@ class ClusteringModel(nn.Module):
 
         self.train() # 다시 학습 모드로 전환
         return mapping_1 # 훈련 스텝에서 사용할 매핑 반환
+    
     
     def update_epoch(self, epoch):
         self.current_epoch = epoch
