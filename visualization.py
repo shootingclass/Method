@@ -400,7 +400,7 @@ def visualize_tsne(embeddings, true_labels, pred_labels, title, prototypes=None,
             ax2.legend(handles=scatter2.legend_elements(num=num_classes)[0], labels=label_names)
         
         return fig
-   
+
 
 
 

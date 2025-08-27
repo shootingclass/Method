@@ -1,17 +1,19 @@
+import random
+import wandb
+import numpy as np
+from sklearn.metrics import accuracy_score
+from scipy.optimize import linear_sum_assignment
+import matplotlib.pyplot as plt
+from transformers import CLIPVisionModelWithProjection, AutoModel
+from peft import LoraConfig, get_peft_model
+from einops import rearrange, repeat
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPVisionModelWithProjection, AutoModel
-from peft import LoraConfig, get_peft_model
-import random
-from einops import rearrange, repeat
-# clustering model
-import wandb
-from sklearn.metrics import accuracy_score
-from scipy.optimize import linear_sum_assignment
+
 from visualization import visualize_tsne
-import numpy as np
-import matplotlib.pyplot as plt
+
 
 #################################################################
 
@@ -548,10 +550,10 @@ class VisionModel(nn.Module):
 
         # --- 2단계: Appearance & Motion 인코딩 ---
         # 인코더들의 채널 크기를 정의합니다.
-        encoder_mid_channels = 256
-        appearance_out_channels = 128
-        motion_out_channels = 128  # RNN의 입력 크기가 됩니다.
-        motion_rnn_hidden_size = 128
+        encoder_mid_channels = 512
+        appearance_out_channels = 256
+        motion_out_channels = 256  # RNN의 입력 크기가 됩니다.
+        motion_rnn_hidden_size = 256
 
         self.appearance_encoder = AppearanceEncoder(
             in_channels=hidden_size,
@@ -590,8 +592,8 @@ class VisionModel(nn.Module):
         transformed_features = transformed_features.permute(0, 2, 1, 3, 4)  # -> (B, C, T, H, W)
 
         # 3. Appearance 및 Motion 벡터 추출
-        v_appearance = self.appearance_encoder(transformed_features) # [B, 128]
-        v_motion = self.motion_encoder(transformed_features) # [B, 128]
+        v_appearance = self.appearance_encoder(transformed_features) # [B, 256]
+        v_motion = self.motion_encoder(transformed_features) # [B, 256]
 
         # --- 최종 출력 통합 ---
         final_output = {

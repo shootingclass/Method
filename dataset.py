@@ -170,6 +170,7 @@ class ClipConsistentTransforms:
 class VideoSensorDataset(Dataset):
     def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch):
         super().__init__()
+        
         self.data_root = data_root
         self.num_frames = num_frames
         self.transform = transform
@@ -204,12 +205,14 @@ class VideoSensorDataset(Dataset):
         
         ######### 비디오 전처리 #########       
         if self.current_epoch < self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
+            
             # 1. self.num_frames 개수만큼의 가짜 이미지 '리스트'를 생성합니다.
             dummy_clip = [Image.new('RGB', (224, 224)) for _ in range(self.num_frames)]
 
             # 2. 이미지 리스트(클립)를 transform에 전달합니다.
             # self.transform은 내부적으로 이 리스트를 올바른 모양의 텐서로 변환해 줄 것입니다.
             frames_tensor = self.transform(dummy_clip)
+
         ######### 비디오 전처리 #########       
         # 1. OpenCV를 사용하여 비디오 캡처 객체 생성
         else:

@@ -1,28 +1,21 @@
 import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from tqdm import tqdm 
-import wandb
 import numpy as np
 import random
 import itertools
 import argparse
 
-# 분산 학습 라이브러리
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 
 # --- 사용자 정의 모듈 임포트 ---
-from dataset import VideoSensorDataset, SensorTransform, ClipConsistentTransforms
-from model import  SensorModel, VisionModel, ClusteringModel
-from utils import (
-    train_one_epoch, 
-    calculate_sensor_stats, save_stats, load_stats
-)
+from datamodule import MethodDataModule
+from lightning_module import MethodLightningModule
+
 
 ####################################################################
 
@@ -40,170 +33,48 @@ def set_random_seed(seed):
 ####################################################################
 
 
+# 데이터 모듈의 train_dataloader에서 데이터셋을 가져와 set_epoch 호출
+class DatasetEpochCallback(pl.Callback):
+    def on_train_epoch_start(self, trainer, pl_module):
+        if hasattr(trainer.datamodule.train_dataset, 'set_epoch'):
+            trainer.datamodule.train_dataset.set_epoch(trainer.current_epoch)
+
+
+####################################################################
+
+
 def main(args):
-
-    # ==================================================================
-    # 1. 하이퍼파라미터 및 설정 정의
-    # ==================================================================
-
-    # --- 분산 학습 설정 ---
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    local_rank = int(os.environ['LOCAL_RANK'])
-    world_size = dist.get_world_size()
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    
     set_random_seed(42)
 
-    # 시각화 결과를 저장할 폴더가 없으면 생성
-    os.makedirs(args.visualize_output_dir, exist_ok=True)
+    # 1. 데이터 모듈 초기화
+    datamodule = MethodDataModule(args)
 
-    if rank == 0:
-        print(f"Using {world_size} GPUs for distributed training.")
+    # 2. 라이트닝 모듈 초기화
+    model = MethodLightningModule(args)
 
-        wandb.init(
-            project="Method_Test",
-            name=f"Test1",
-        )
+    # 3. 로거 설정
+    wandb_logger = WandbLogger(project="Method_Test_Lightning", name="Test1")
 
-    # ==================================================================
-
-
-    # ==================================================================
-    # 2. 프레임 전처리(Transform) 정의
-    # ==================================================================
-    clip_mean = [0.48145466, 0.4578275, 0.40821073]
-    clip_std = [0.26862954, 0.26130258, 0.27577711]    
-    
-    # 학습(Training)용 변환
-    train_transform = ClipConsistentTransforms(
-        size=(224, 224),
-        mean=clip_mean,
-        std=clip_std
+    # 4. 트레이너 설정 및 학습 시작
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator='gpu',
+        devices=[1, 2, 3],
+        strategy='ddp_find_unused_parameters_true',
+        logger=wandb_logger,
+        callbacks=[DatasetEpochCallback()]
     )
 
-    # ==================================================================
+    print("--- Starting Training with PyTorch Lightning ---")
+    trainer.fit(model, datamodule)
+    print("--- Training Complete ---")
 
 
-    # ==================================================================
-    # 3. 센서 데이터 전처리 준비
-    # ==================================================================
-    if os.path.exists(args.stats_file_path):
-        stats = load_stats(args.stats_file_path)
-
-    else:
-        print(f"Statistics file not found. Calculating for the first time...")
-        
-        # 통계 계산용 임시 데이터셋 생성 (전처리 없음)
-        temp_train_dataset = VideoSensorDataset(
-            json_path=args.json_train_path,
-            data_root=args.data_root,
-            num_frames=args.num_frames,
-            transform=train_transform,
-            sensor_transform=None # 센서 변환 없음
-        )
-        stats = calculate_sensor_stats(temp_train_dataset)
-        save_stats(stats, args.stats_file_path)
-
-    # 불러오거나 계산된 통계치를 사용하여 SensorTransform 객체 생성
-    sensor_preprocessor = SensorTransform(target_len=128, mean=stats['mean'], std=stats['std'])
-    # ==================================================================
-
-
-    # ==================================================================
-    # 4. 데이터셋(Dataset) 및 데이터로더(DataLoader) 생성
-    # ==================================================================
-    train_dataset = VideoSensorDataset(
-        json_path=args.json_train_path,
-        data_root=args.data_root,
-        num_frames=args.num_frames,
-        transform=train_transform,
-        sensor_transform=sensor_preprocessor, # 센서 전처리 적용
-        threshold_epoch=args.threshold_epoch
-    )
-
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,  # DistributedSampler가 셔플링을 담당합니다.
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler
-    )
-
-    if rank == 0:
-        print(f"Train dataset size: {len(train_dataset)}")
-
-    # ==================================================================
-
-
-    # ==================================================================
-    # 5. 모델, 손실 함수, 옵티마이저 정의
-    # ==================================================================
-    video_model = VisionModel(image_size=224).to(device)
-    sensor_model = SensorModel(sensor_channels=97, size_embeddings=args.embedding_dim).to(device)
-    clustering_model = ClusteringModel(
-        encoder=sensor_model,
-        embedding_dim=args.embedding_dim,
-        num_sensors=args.num_sensors,
-        num_clusters=args.num_classes,
-        prototypes=None,
-        alpha_fixed=args.alpha_fixed
-    ).to(device)
-
-    video_model = DDP(video_model, device_ids=[local_rank], find_unused_parameters=True)
-    sensor_model = DDP(sensor_model, device_ids=[local_rank], find_unused_parameters=True)
-    clustering_model = DDP(clustering_model, device_ids=[local_rank], find_unused_parameters=True)
-
-    parameters = itertools.chain(video_model.parameters(), clustering_model.parameters())
-    optimizer = optim.AdamW(parameters, lr=args.lr)
-    # ==================================================================
-
-
-    # ==================================================================
-    # 6. 학습 및 검증 루프 (Training & Validation Loop)
-    # ==================================================================
-
-    if rank == 0:
-        print("\n--- Starting Training ---")
-
-    for epoch in range(args.epochs):
-        train_loader.sampler.set_epoch(epoch)  # 중요: 에포크마다 샘플러 상태를 업데이트합니다.
-        # threshold_epoch 측정을 위한 데이터셋 업데이트. 깔끔하게 하고 싶다면 데이터로더 캡슐화.
-        train_dataset.set_epoch(epoch) # 중요: 에포크마다 샘플러 상태를 업데이트합니다.
-        clustering_model.module.update_epoch(epoch)
-        
-        if rank == 0:
-            print(f"\nEpoch {epoch + 1}/{args.epochs}")
-
-        # --- 1. 학습 단계 ---
-        train_loss = train_one_epoch(video_model, sensor_model, clustering_model, train_loader, optimizer,device, epoch, args.visualize_output_dir, rank)
-        clustering_model.evaluate(train_loader, epoch, stage="train")
-
-        # train_one_epoch 함수가 loss를 모든 프로세스에 브로드캐스팅하지 않는다면,
-        # 아래 코드는 각 프로세스별 loss를 출력할 수 있습니다.
-        # 모든 프로세스의 평균 loss를 보려면 추가적인 동기화 코드가 필요합니다.
-        if rank == 0:
-            print(f"[Train] Loss: {train_loss:.4f}")
-
-    if rank == 0:
-        print("\n--- Training Complete ---")
-
-    # ==================================================================
-
-    # 분산 처리 관련 리소스 정리
-    dist.destroy_process_group()
-
-
-
+####################################################################
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Method Test")
+    parser = argparse.ArgumentParser(description="Method Test with PyTorch Lightning")
 
     # 경로 인자
     parser.add_argument("--data_root", type=str, default="/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/", help="Root directory of the dataset")
@@ -217,9 +88,9 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--embedding_dim", type=int, default=512)
+    parser.add_argument("--embedding_dim", type=int, default=256)
     parser.add_argument("--num_classes", type=int, default=7)
-    parser.add_argument("--alpha_fixed", type=bool, default=True) # --alpha_fixed 사용시 True
+    parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--num_sensors", type=int, default=97)
     parser.add_argument("--threshold_epoch", type=int, default=9)
     
