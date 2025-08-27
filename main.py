@@ -50,7 +50,7 @@ def main(args):
     datamodule = MethodDataModule(args)
 
     # 2. 라이트닝 모듈 초기화
-    model = MethodLightningModule(args)
+    model = MethodLightningModule(args, datamodule.train_dataloader)
 
     # 3. 로거 설정
     wandb_logger = WandbLogger(project="Method_Test_Lightning", name="Test1")

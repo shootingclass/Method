@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
+import numpy as np
 
 # --- 사용자 정의 모듈 임포트 ---
 from model import SensorModel, VisionModel, ClusteringModel
@@ -14,7 +15,7 @@ from model import SensorModel, VisionModel, ClusteringModel
 
 
 class MethodLightningModule(pl.LightningModule):
-    def __init__(self, args):
+    def __init__(self, args, train_dataloader):
         super().__init__()
         
         self.args = args
@@ -27,10 +28,8 @@ class MethodLightningModule(pl.LightningModule):
             embedding_dim=self.hparams.embedding_dim,
             num_sensors=self.hparams.num_sensors,
             num_clusters=self.hparams.num_classes,
-            prototypes=None,
-            alpha_fixed=self.hparams.alpha_fixed
         )
-
+        self.train_dataloader = None
     # 에포크 시작 시 clustering_model 상태 업데이트
     def on_train_epoch_start(self):
         self.clustering_model.update_epoch(self.current_epoch)
@@ -38,41 +37,80 @@ class MethodLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
 
         # 0. 데이터 준비 (Lightning이 자동으로 device로 옮겨줍니다)
-        videos, sensors, labels, _ = batch
+        videos, sensors, labels, sample_ids = batch
 
         # 실제 배치 크기를 텐서에서 직접 가져옵니다.
         current_batch_size = videos.size(0)
 
         # --- 1. 클러스터링 단계 ---
         # .module 접미사 없이 모델을 직접 호출합니다.
-        rule_based_feature = self.clustering_model.get_representative_sensor_feature(sensors, labels, self.hparams.num_sensors)
-        scores_cluster, final_feature_cluster, alpha = self.clustering_model(sensors, rule_based_feature)
-        scores_sk = self.clustering_model.sinkhorn_knopp(scores_cluster)
+        # 모델 초기화
+        
+        # # 첫 에폭이거나 정해진 주기마다 또는 지연된 메모리 뱅크 업데이트가 있는 경우
+        # if self.clustering_model.epoch == 0 or self.clustering_model.epoch % self.hparams.memory_bank_update_interval == 0 or self.clustering_model.pending_memory_update:
+        #     # 지연된 업데이트의 경우, 재분배 후 백본이 한 에폭 학습한 후임을 명시
+        #     if self.clustering_model.pending_memory_update:
+        #         print(f"Performing delayed memory bank update after cluster redistribution at epoch {epoch+1}...")
+        #         self.clustering_model.pending_memory_update = False
+        #     else:
+        #         print(f"Updating memory bank at epoch {self.clustering_model.epoch+1}...")
+                
+        #     # self.clustering_model.init_prototypes_with_data(dataloader, device)
 
+        # 훈련 루프
+
+        
+        # 데이터 증강 적용 (선택적)
+        if self.clustering_model.epoch > 1:  # 첫 에폭은 원본 데이터로 클러스터링
+            imu_data_aug = self.clustering_model.augment_imu_data(sensors)
+        else:
+            imu_data_aug = sensors
+        
+        # 모델 순전파
+        scores, features = self.clustering_model(imu_data_aug, return_features=True)
+        
+        # 메모리 뱅크에서 저장된 pseudo label 가져오기
+        stored_pseudo_labels = self.clustering_model.get_pseudo_labels(sample_ids)
+        
+        # 클러스터 할당 (argmax) - ODC 논문과 유사하게 메모리 뱅크 활용
         with torch.no_grad():
-            pseudo_labels = torch.argmax(scores_sk, dim=1)
+            current_cluster_ids = torch.argmax(scores, dim=1)
+            
+            # 메모리 뱅크에 없는 샘플(-1로 표시)은 현재 계산한 값으로 업데이트
+            mask = (stored_pseudo_labels == -1)
+            if mask.any():
+                self.clustering_model.update_memory_bank([sid for i, sid in enumerate(sample_ids) if mask[i]], 
+                                    current_cluster_ids[mask],
+                                    features[mask] if features is not None else None)
+                stored_pseudo_labels[mask] = current_cluster_ids[mask]
+            
+            # 메모리 뱅크에 있는 샘플도 일정 확률로 업데이트 (ODC 논문 방식)
+            # 점진적 클러스터 업데이트를 위한 것
+            update_prob = 0.3  # 30% 확률로 업데이트
+            device = stored_pseudo_labels.device  # mask와 동일한 장치 사용
+            update_mask = (torch.rand(len(stored_pseudo_labels), device=device) < update_prob)
+            update_mask = update_mask & ~mask  # 이미 업데이트된 샘플은 제외
+            
+            if update_mask.any():
+                self.clustering_model.update_memory_bank([sid for i, sid in enumerate(sample_ids) if update_mask[i]], 
+                                    current_cluster_ids[update_mask],
+                                    features[update_mask] if features is not None else None)
+                stored_pseudo_labels[update_mask] = current_cluster_ids[update_mask]
+        
+        # # 클래스 가중치 계산
+        class_weights = self.clustering_model.clustering_manager.compute_class_weights()
+        
+        # # ODC 손실 계산 (cross-entropy) - 저장된 pseudo label과 클래스 가중치 사용
+        scores = F.normalize(scores, dim=1)
+        loss_cluster = F.cross_entropy(scores, stored_pseudo_labels, weight=class_weights.to(device))
+        
+        # 배치 처리 후 중심점 업데이트 - 현재 특징과 저장된 pseudo label 사용
+        with torch.no_grad():
+            self.clustering_model.update_centroids(features, stored_pseudo_labels)
 
-        # self.all_gather를 사용하여 모든 GPU의 텐서를 수집합니다.
-        # 출력이 (world_size, batch_size, ...) 형태이므로 view/reshape로 합쳐줍니다.
-        final_feature_cluster_all = self.all_gather(final_feature_cluster).view(-1, final_feature_cluster.shape[-1])
-        pseudo_labels_all = self.all_gather(pseudo_labels).view(-1)
-
-        # 글로벌 배치 기준으로 MSE Loss를 계산합니다.
-        mse_loss = F.mse_loss(final_feature_cluster_all, self.clustering_model.prototypes[pseudo_labels_all])
-
-        # Diversity Loss를 계산합니다.
-        prototypes = self.clustering_model.prototypes
-        n_proto = prototypes.shape[0]
-
-        # p1/p2를 명시적으로 확장하여 브로드캐스팅 경고를 피합니다.
-        p1 = prototypes.unsqueeze(1).expand(n_proto, n_proto, -1)
-        p2 = prototypes.unsqueeze(0).expand(n_proto, n_proto, -1)
-        mse_matrix = F.mse_loss(p1, p2, reduction='none').mean(dim=2)
-        diversity_loss = - (mse_matrix.sum()) / (n_proto * (n_proto - 1))
-
-        loss_cluster = mse_loss + diversity_loss
-        self.log('train/cluster_loss', loss_cluster, batch_size=current_batch_size, on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-
+        pseudo_labels_all = self.all_gather(stored_pseudo_labels).view(-1)
+        
+        # 통계 수집
         # # --- 2. 에포크(Epoch) 기반의 조건부 로직 ---
         # # self.current_epoch을 사용하여 현재 에포크를 확인합니다.
         # if self.current_epoch < self.hparams.threshold_epoch:
@@ -107,7 +145,7 @@ class MethodLightningModule(pl.LightningModule):
         ortho_loss = (cosine_similarity ** 2).mean()
 
         # Triplet Loss with Hard Negative Mining
-        dist_matrix = torch.cdist(v_motion_all, self.clustering_model.prototypes, p=2)
+        dist_matrix = torch.cdist(v_motion_all, self.clustering_model.clustering_manager.centroids, p=2)
         positive_distances = dist_matrix.gather(1, pseudo_labels_all.unsqueeze(1)).squeeze()
         masked_dist_matrix = dist_matrix.clone()
         masked_dist_matrix.scatter_(1, pseudo_labels_all.unsqueeze(1), float('inf'))
@@ -133,6 +171,10 @@ class MethodLightningModule(pl.LightningModule):
 
         return final_loss
     
+    def on_train_end(self):
+        print("Training end")
+        if self.clustering_model.epoch % 2 == 0:
+            self.clustering_model.evaluate_odc(self.train_dataloader, self.device)
     # Trainer가 학습을 시작할 때 자동으로 호출됨
     def configure_optimizers(self):
         parameters = itertools.chain(self.video_model.parameters(), self.clustering_model.parameters())

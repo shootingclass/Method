@@ -11,8 +11,9 @@ from einops import rearrange, repeat
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from visualization import visualize_tsne
+from sklearn.cluster import KMeans
+import numpy as np
+from visualization import visualize_tsne, compute_hungarian_matching
 
 
 #################################################################
@@ -42,33 +43,84 @@ class Block(nn.Module):
         return self.net(batch)
     
 
+# class SensorModel(nn.Module):
+#     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
+#         super().__init__()
+
+#         num_groups_for_input = 1
+
+#         self.backbone = nn.Sequential(
+#             nn.GroupNorm(num_groups_for_input, sensor_channels),
+#             Block(sensor_channels, input_dim, 10),
+#             Block(input_dim, input_dim, 5),
+#             Block(input_dim, input_dim, 5, pool_type="adaptive", embedding_size=32),
+#             nn.GroupNorm(4, input_dim),
+#             nn.GRU(
+#                 batch_first=True, input_size=input_dim, hidden_size=size_embeddings
+#             ),
+#         )
+
+#     def forward(self, batch):
+#         # GRU는 (output, h_n) 형태의 튜플을 반환합니다.
+#         # h_n (마지막 타임스텝의 은닉 상태)을 사용합니다.
+#         # h_n의 shape: (num_layers, batch_size, hidden_size)
+#         _, last_hidden_state = self.backbone(batch)
+        
+#         # GRU 레이어가 하나이므로 첫 번째 요소를 선택하고, batch 차원을 유지하기 위해 squeeze(0) 대신 [0]을 사용합니다.
+#         emb = last_hidden_state[0] # Shape: (batch_size, hidden_size)        
+        
+#         out = {"emb": emb}
+#         return out
+
 class SensorModel(nn.Module):
+    """각 센서 채널을 독립적으로 처리한 후, 그 특징들을 GRU로 융합하는 모델"""
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
         super().__init__()
+        self.in_channels = sensor_channels
+        self.per_channel_dim = input_dim
 
-        num_groups_for_input = 1
-
-        self.backbone = nn.Sequential(
-            nn.GroupNorm(num_groups_for_input, sensor_channels),
-            Block(sensor_channels, input_dim, 10),
-            Block(input_dim, input_dim, 5),
-            Block(input_dim, input_dim, 5, pool_type="adaptive", embedding_size=32),
-            nn.GroupNorm(4, input_dim),
-            nn.GRU(
-                batch_first=True, input_size=input_dim, hidden_size=size_embeddings
-            ),
+        # 1. 각 채널에 독립적으로 적용될 작은 1D CNN
+        # 모든 채널이 이 동일한 CNN을 공유함
+        self.channel_encoder = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(8, input_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1) # 각 채널의 시계열을 하나의 벡터로
+        )
+        
+        # 2. 채널별 특징들을 융합(fusion)하기 위한 GRU
+        self.fusion_gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=size_embeddings,
+            batch_first=True
         )
 
-    def forward(self, batch):
-        # GRU는 (output, h_n) 형태의 튜플을 반환합니다.
-        # h_n (마지막 타임스텝의 은닉 상태)을 사용합니다.
-        # h_n의 shape: (num_layers, batch_size, hidden_size)
-        _, last_hidden_state = self.backbone(batch)
+    def forward(self, x):
+        # x shape: (Batch, Channels, SequenceLength)
+        B, C, L = x.shape
         
-        # GRU 레이어가 하나이므로 첫 번째 요소를 선택하고, batch 차원을 유지하기 위해 squeeze(0) 대신 [0]을 사용합니다.
-        emb = last_hidden_state[0] # Shape: (batch_size, hidden_size)        
+        # 1. 각 채널을 독립적으로 처리하기 위해 차원 변경
+        # (B, C, L) -> (B * C, 1, L)
+        x_reshaped = x.view(-1, 1, L)
         
-        out = {"emb": emb}
+        # 2. 채널별 인코딩
+        channel_features = self.channel_encoder(x_reshaped) # -> (B * C, per_channel_dim, 1)
+        channel_features = channel_features.squeeze(-1) # -> (B * C, per_channel_dim)
+        
+        # 3. 다시 배치 형태로 복원
+        # (B * C, per_channel_dim) -> (B, C, per_channel_dim)
+        channel_features_batched = channel_features.view(B, C, self.per_channel_dim)
+        
+        # (여기서 top_k 센서 선택 로직을 적용할 수 있습니다)
+        # 예를 들어, 특정 규칙으로 k개의 채널 인덱스를 선택하여
+        # selected_features = channel_features_batched[:, top_k_indices, :]
+        # 와 같이 처리한 후 fusion_gru에 넣을 수 있습니다.
+        
+        # 4. GRU로 채널 간의 관계를 학습하여 최종 특징 추출
+        _, hidden = self.fusion_gru(channel_features_batched)
+        
+        out = {"emb": hidden[-1]} # -> (B, feature_dim)
         return out
     
 
@@ -606,239 +658,527 @@ class VisionModel(nn.Module):
 
 #################################################################
 
-
-class ClusteringModel(nn.Module):
-    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, prototypes=None, alpha_fixed=False):
+# --- 3. ODC 메모리 뱅크 관리자 ---
+class ClusteringManager(nn.Module):
+    def __init__(self, num_clusters, feature_dim, momentum=0.99, temperature=0.1, device='cuda'):
         super().__init__()
-        
-        self.encoder = encoder
-        self.gate = nn.Sequential(
-            nn.Linear(embedding_dim, 16),
-            nn.ReLU(),
-            nn.Dropout(p=0.9),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
-        )
-        self.projection_layer = nn.Linear(num_sensors, embedding_dim)
-        if prototypes is not None:
-            self.prototypes = nn.Parameter(prototypes)
-        else:
-            self.prototypes = nn.Parameter(torch.randn(num_clusters, embedding_dim))
-        self.alpha_fixed = alpha_fixed
-        self.current_epoch = 0
-        self.total_epochs = 20
-        self.temperature = 0.03
-        self.sk_iterations = 3
-        self.threshold_epoch = 9
-        self.top_k = 4
         self.num_clusters = num_clusters
-
-
-    def forward(self, imu_batch, rule_based_feature, val=False):
-        deep_embedding = self.encoder(imu_batch)['emb']
+        self.feature_dim = feature_dim
+        self.momentum = momentum
+        self.temperature = temperature
+        self.device = device
         
-        if not self.alpha_fixed:
-            raw_gate_score = self.gate(deep_embedding)
-            alpha = raw_gate_score
-            start_alpha = 0.5
-            end_alpha = 1.0
-            total_epochs = self.total_epochs
+        # 클러스터 중심점(centroids) 초기화 - 더 넓게 분포되도록 초기화
+        # 각 차원마다 균등 분포를 사용하여 더 잘 분산되도록 함
+        centroids = torch.rand(num_clusters, feature_dim, device=device) * 2.0 - 1.0  # [-1, 1] 범위의 균등 분포
+        
+        # 정규화를 통해 모든 중심점이 단위 구에 있도록 함
+        # self.centroids = F.normalize(self.centroids, dim=1)
+        
+        # 직교성을 높이기 위한 추가 처리
+        # QR 분해를 통해 직교 벡터 얻기
+        if num_clusters <= feature_dim:  # 클러스터 수가 차원보다 작거나 같을 때만 가능
+            q, r = torch.linalg.qr(centroids.t())  # 직교 행렬 Q 얻기
+            centroids = q[:, :num_clusters].t()  # 직교 벡터로 중심점 설정
+        self.register_buffer('centroids', centroids)
+        # 클러스터 할당 히스토리
+        self.cluster_size = torch.zeros(num_clusters, device=device)
+        
+        # Pseudo label 메모리 뱅크 (ODC 논문과 유사하게 중앙화된 방식으로 관리)
+        self.memory_bank = {}
+        # 각 샘플을 고유하게 식별할 수 있는 ID를 저장하기 위한 딕셔너리
+        # key: sample_id, value: pseudo_label
+        
+        # 전체 데이터셋에 대한 특징 메모리 뱅크 (샘플 ID -> 특징 벡터)
+        self.feature_bank = {}
+        
+        # 메모리 뱅크 초기화 여부를 추적
+        self.memory_initialized = False
+        
+        # 클러스터 재분배 후 메모리 뱅크 업데이트 지연을 위한 플래그
+        self.pending_memory_update = False
+        
+        # 빈 클러스터 감지와 재할당을 위한 임계값
+        self.min_cluster_size = 10  # 이 값보다 작으면 비어있다고 간주
+        
+        # 가중치 계산을 위한 상수
+        self.class_weight_power = 1.0  # 클러스터 크기에 적용할 거듭제곱
+        
+    @torch.no_grad()
+    def update_centroids_with_momentum(self, features, cluster_ids):
+        """모멘텀 방식으로 중심점만 업데이트합니다.
+        클러스터 크기는 update_memory_bank에서 전체 데이터셋을 기준으로 계산됩니다."""
+        for k in range(self.num_clusters):
+            # 현재 클러스터에 할당된 특징들 선택
+            mask = (cluster_ids == k)
+            cluster_samples = mask.sum()
+            
+            if cluster_samples > 0:
+                # 현재 클러스터에 할당된 특징들의 평균
+                new_centroid = features[mask].mean(dim=0)
+                # new_centroid, _ = torch.median(features[mask], dim=0)
+                # 중심점만 모멘텀으로 업데이트
+                self.centroids[k] = self.momentum * self.centroids[k] + (1 - self.momentum) * new_centroid
+                # 정규화는 한 번만 수행 (중요: 정규화는 특징 차원을 따라 dim=0이 아니라 dim=-1 사용)
+                # self.centroids[k] = F.normalize(self.centroids[k], dim=-1)
+                
+        # 참고: 클러스터 크기(self.cluster_size)는 update_memory_bank에서 전체 데이터셋을 기준으로 계산됨
 
-            # 현재 에폭 진행률
-            progress = min(1.0, self.current_epoch / total_epochs) 
-            # if progress > 0.7:
-                # alpha_value=1.0
-            # else:
-                # alpha_value=0.5
-            # alpha_value = raw_gate_score
-            progress = 0.5 * (1 - torch.cos(torch.tensor(np.pi * self.current_epoch / total_epochs)))
-
-            # alpha 값 계산
-            alpha_value = start_alpha + (end_alpha - start_alpha) * progress
-            alpha_value = alpha_value  + raw_gate_score *0.0
-            if self.current_epoch > self.threshold_epoch:
-                alpha_value = 1.0
-            alpha = torch.tensor(alpha_value)
-
+    def compute_similarity_scores(self, features):
+        """특징과 중심점 간의 유사도 점수를 계산합니다."""
+        # 코사인 유사도 계산 (L2 정규화 후 내적)
+        features_norm = F.normalize(features, dim=1)
+        centroids_norm = F.normalize(self.centroids, dim=1)
+        similarity = torch.mm(features_norm, centroids_norm.t())
+        
+        # 온도 파라미터 적용
+        return similarity / self.temperature
+        
+    def compute_class_weights(self):
+        """클러스터 크기에 근거한 클래스 가중치를 계산합니다."""
+        # 클러스터 크기가 0인 경우를 방지하기 위한 정규화
+        normalized_sizes = self.cluster_size + 1e-8
+        
+        # 클러스터 크기의 그대로의 역수를 가중치로 사용
+        # 더 강한 가중치를 적용하기 위해 거듭제곱을 높임
+        weights = 1.0 / torch.pow(normalized_sizes, self.class_weight_power)
+        
+        # 최소 가중치와 최대 가중치 간의 차이가 너무 크지 않도록 조정
+        # 작은 클러스터에 더 높은 가중치를 주되, 그 차이가 너무 크지 않도록 함
+        max_weight = weights.max()
+        min_weight = weights.min()
+        if max_weight > min_weight * 10:
+            # 최대 가중치가 최소의 10배를 넘지 않도록 조절
+            weights = torch.clamp(weights, min=max_weight/10)
+        
+        # 가중치 정규화 (0~1 범위 밖으로 팬는 것 방지)
+        weights = weights / weights.sum() * self.num_clusters
+        
+        return weights
+        
+    def get_largest_cluster(self):
+        """가장 큰 클러스터와 그 크기를 반환합니다.
+        최소 샘플 개수를 보장하여 실질적으로 분할 가능한 클러스터를 반환합니다."""
+        # 최소 샘플 수 기준 (최소 10개 이상은 있어야 분할 의미가 있음)
+        min_samples_for_split = 10
+        valid_clusters = torch.where(self.cluster_size >= min_samples_for_split)[0]
+        
+        if len(valid_clusters) == 0:
+            # 모든 클러스터가 작으면 그나마 가장 큰 것 반환
+            largest_idx = torch.argmax(self.cluster_size)
         else:
-            alpha = torch.tensor(0.5, device=deep_embedding.device)
-
-        if val:
-            alpha = torch.tensor(1.0, device=deep_embedding.device)
-
-        projected_rule_feature = self.projection_layer(rule_based_feature)
-        final_feature = alpha * F.normalize(deep_embedding, dim=1) + (1 - alpha) * projected_rule_feature
+            # 충분히 큰 클러스터 중에서 가장 큰 것 선택
+            largest_idx = valid_clusters[torch.argmax(self.cluster_size[valid_clusters])]
+            
+        return largest_idx, self.cluster_size[largest_idx]
         
-        final_feature_norm = F.normalize(final_feature, dim=1)
-        prototypes_norm = F.normalize(self.prototypes, dim=1)
-        scores = torch.matmul(final_feature_norm, prototypes_norm.t())
-        return scores, final_feature, alpha
+    def get_empty_clusters(self):
+        """빈 클러스터(임계값 미만)를 반환합니다."""
+        # 클러스터 크기가 임계값보다 작거나, 상대적으로 너무 작은 클러스터 찾기
+        avg_size = self.cluster_size.mean().item()
+        relative_threshold = avg_size * 0.2  # 평균의 20% 미만인 클러스터도 빈 것으로 간주
+        threshold = min(self.min_cluster_size, relative_threshold)
+        return torch.where(self.cluster_size < threshold)[0]
+        
+    def redistribute_cluster(self, empty_idx, largest_idx, features, labels):
+        """크기가 큰 클러스터를 분할하여 빈 클러스터를 재활용합니다."""
+        # 가장 큰 클러스터에 속한 샘플들을 찾기
+        largest_cluster_samples = (labels == largest_idx)
+        largest_cluster_features = features[largest_cluster_samples]
+        
+        # 실제 샘플 수 확인
+        sample_count = len(largest_cluster_features)
+        
+        # 최소 4개 이상의 샘플이 있어야 의미 있는 분할이 가능함
+        if sample_count < 4:
+            print(f"Warning: Largest cluster {largest_idx} has only {sample_count} samples. Cannot redistribute.")
+            return False
+            
+        # 클러스터 내에서 2개의 서브클러스터로 분할
+        # 최대한 다양한 분할을 위해 n_init 값을 높이고, random_state를 다르게 설정
+        try:
+            kmeans = KMeans(n_clusters=2, n_init=10, random_state=np.random.randint(0, 1000)).fit(largest_cluster_features.cpu().numpy())
+            sub_labels = torch.tensor(kmeans.labels_, device=self.device)
+            
+            # 재분배 결과 확인 (최소한 1개 이상의 샘플이 각 서브클러스터에 할당되었는지)
+            sub_counts = [(sub_labels == i).sum().item() for i in range(2)]
+            if min(sub_counts) < 1:
+                print(f"Warning: Subcluster division resulted in imbalanced clusters: {sub_counts}. Cannot redistribute.")
+                return False
+        except Exception as e:
+            print(f"Error during KMeans clustering: {e}. Cannot redistribute.")
+            return False
+        
+        # 서브클러스터 중심점 계산
+        sub_centroids = []
+        for i in range(2):
+            sub_centroid = largest_cluster_features[sub_labels == i].mean(dim=0)
+            # 정규화 시 dim=-1 사용
+            sub_centroids.append(F.normalize(sub_centroid, dim=-1))
+        
+        # 하나는 기존 클러스터로, 하나는 빈 클러스터로 할당
+        self.centroids[largest_idx] = sub_centroids[0]
+        self.centroids[empty_idx] = sub_centroids[1]
+        
+        # 클러스터 크기 업데이트 (위에서 이미 계산한 sub_counts 사용)
+        self.cluster_size[largest_idx] = sub_counts[0]
+        self.cluster_size[empty_idx] = sub_counts[1]
+        
+        print(f"Redistributed cluster: Split cluster {largest_idx} ({sub_counts[0]} samples) "
+              f"and reassigned {sub_counts[1]} samples to empty cluster {empty_idx}")
+              
+        # 만약 재분배 후에도 여전히 작은 클러스터가 있다면 로그로 알리기
+        if min(sub_counts) < self.min_cluster_size:
+            print(f"Warning: After redistribution, one of the clusters still has fewer than {self.min_cluster_size} samples ({min(sub_counts)}).")
+              
+        # 메모리 뱅크 업데이트 필요 (외부에서 처리)
+        
+        return True
 
+# --- 4. ODC 모델 ---
+class ClusteringModel(nn.Module):
+    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters):
+        super().__init__()
+        # 딥러닝 백본 선택
+        self.encoder = encoder
+            
+        # ODC 관리자
+        self.clustering_manager = ClusteringManager(num_clusters=num_clusters, feature_dim=embedding_dim)
+        self.projection_layer = nn.Linear(num_sensors, embedding_dim)
+        self.epoch = 0
+        
+    def forward(self, x, sample_ids=None, return_features=False, labels=None, step="train"):
+        # x는 (B, C, T) 형태의 텐서
+        
+        # 특징 추출
+        features = self.encoder(x)["emb"]
+        if step == "train":
+            rule_feature = self.get_representative_sensor_feature(x, labels, num_total_sensors=97, top_k=4, id=sample_ids)
+            rule_feature = self.projection_layer(rule_feature)
+        # 클러스터 유사도 점수 계산
+            features += rule_feature * 1.0/(self.epoch+1)
+        else:
+            self.epoch += 1
+        similarity_scores = self.clustering_manager.compute_similarity_scores(features)
 
-    def update_epoch(self, epoch):
-        self.current_epoch = epoch
-
-
-    def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=10):
-        max_values, _ = torch.max(imu_batch, dim=2)
-        min_values, _ = torch.min(imu_batch, dim=2)
-        ranges = max_values - min_values
-
+        
+        if return_features:
+            return similarity_scores, features
+        return similarity_scores
+    # 전체 데이터셋의 pseudo label을 계산하고 메모리 뱅크에 저장하는 함수
+    @torch.no_grad()
+    def init_memory_bank(self, dataloader, device):
+        """전체 데이터셋에 대한 pseudo label과 특징을 계산하고 메모리 뱅크에 저장합니다.
+        ODC 논문과 유사하게 전체 데이터셋에 대한 중앙화된 메모리 뱅크를 관리합니다."""
+        self.eval()
+        
+        # 메모리 뱅크 업데이트 진행바
+        
+        # 전체 샘플 수와 업데이트된 샘플 수 추적
+        total_samples = 0
+        updated_samples = 0
+        
+        # 클러스터 할당 카운터 (전체 데이터셋에 대한 클러스터 크기 계산용)
+        cluster_counts = torch.zeros(self.clustering_manager.num_clusters, device=device)
+        
+        for batch in dataloader:
+            imu_data = batch['imu'].to(device)
+            sample_ids = batch['video_id'] if 'video_id' in batch else [f"sample_{i+total_samples}" for i in range(len(imu_data))]
+            total_samples += len(imu_data)
+            
+            # 모델 순전파 (특징 벡터도 얻기)
+            scores, features = self(imu_data, return_features=True)
+            
+            # 클러스터 할당 (argmax)
+            current_cluster_ids = torch.argmax(scores, dim=1)
+            
+            # 클러스터 할당 카운트 (히스토그램)
+            for cluster_id in range(self.clustering_manager.num_clusters):
+                cluster_counts[cluster_id] += (current_cluster_ids == cluster_id).sum()
+            
+            # 메모리 뱅크에 pseudo label과 특징 벡터 저장
+            self.update_memory_bank(sample_ids, current_cluster_ids, features)
+            updated_samples += len(sample_ids)
+            
+        # 전체 데이터셋에 대한 클러스터 크기 업데이트 (ODC 논문 방식)
+        self.clustering_manager.cluster_size = cluster_counts
+        
+        # 클러스터 크기 정보 출력
+        print(f"Cluster size distribution after memory bank update:")
+        for i, count in enumerate(cluster_counts.cpu().numpy()):
+            print(f"  Cluster {i}: {count:.0f} samples")
+        
+        # 메모리 뱅크 초기화 완료 표시
+        self.clustering_manager.memory_initialized = True
+        print(f"Memory bank initialized with {updated_samples} samples.")
+        
+        self.train()
+    
+    @torch.no_grad()
+    def update_centroids(self, features, cluster_ids):
+        """ODC Manager의 중심점을 업데이트합니다."""
+        self.clustering_manager.update_centroids_with_momentum(features, cluster_ids)
+    
+    @torch.no_grad()
+    def update_memory_bank(self, sample_ids, pseudo_labels, features=None):
+        """샘플별 pseudo label과 특징을 메모리 뱅크에 저장합니다.
+        ODC 논문에서처럼 전체 데이터셋에 대한 메모리를 유지합니다."""
+        for idx, sample_id in enumerate(sample_ids):
+            self.clustering_manager.memory_bank[sample_id] = pseudo_labels[idx].item()
+            
+            # 특징 벡터도 저장 (제공된 경우)
+            if features is not None:
+                self.clustering_manager.feature_bank[sample_id] = features[idx].detach()
+    
+    def get_pseudo_labels(self, sample_ids):
+        """메모리 뱅크에서 샘플에 대한 pseudo label을 조회합니다."""
+        device = next(self.parameters()).device
+        pseudo_labels = []
+        
+        # 각 샘플 ID에 대해 저장된 pseudo label 조회
+        for sample_id in sample_ids:
+            if sample_id in self.clustering_manager.memory_bank:
+                pseudo_labels.append(self.clustering_manager.memory_bank[sample_id])
+            else:
+                # 메모리 뱅크에 없는 경우 -1 (무시할 값) 반환
+                pseudo_labels.append(-1)
+        
+        return torch.tensor(pseudo_labels, device=device)
+    
+        # --- 1. 규칙 기반 특징 추출기 ---
+    def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=97, top_k=1, id=None):
+        """
+        각 샘플에서 신호 변화가 가장 큰 센서를 찾아 원-핫 벡터로 만듭니다.
+        imu_batch: (B, C, L) 형태의 텐서
+        """
+        
+        # 각 채널(센서)의 분산 계산 (max - min)
+        ranges = torch.var(imu_batch, dim=2)
+        # 가장 분산이 큰 센서의 인덱스 찾기 (분산이 0인것 제외)
+    
         min_range, _ = torch.min(ranges, dim=1, keepdim=True)
         max_range, _ = torch.max(ranges, dim=1, keepdim=True)
         weighted_features = (ranges - min_range) / (max_range - min_range + 1e-8)
-        
-        _, top_indices = torch.topk(weighted_features, k=self.top_k, dim=1)
+        # 정규화 x
+        # weighted_features = ranges
+        # 3. Top-K에 해당하지 않는 값들을 0으로 마스킹
+        # 가장 큰 Top-K 값만 남기고 나머지는 0으로 만들기 위한 마스크 생성
+        _, top_indices = torch.topk(weighted_features, k=top_k, dim=1)
         mask = torch.zeros_like(weighted_features)
         mask.scatter_(1, top_indices, 1)
-        
+
+        # 4. 마스크를 적용하여 최종 특징 생성
         final_rule_feature = weighted_features * mask
         return final_rule_feature
 
-
-    def compute_hungarian_matching(self, pred_labels, true_labels, num_clusters):
-        cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
-        for i in range(len(pred_labels)):
-            cost_matrix[pred_labels[i], true_labels[i]] += 1
-        row_ind, col_ind = linear_sum_assignment(-cost_matrix)
-        mapping = {i: j for i, j in zip(row_ind, col_ind)}
-        return accuracy_score(true_labels, np.array([mapping.get(x, -1) for x in pred_labels])), mapping
-
-
-    @torch.no_grad()
-    def sinkhorn_knopp(self, scores):
-        """Sinkhorn-Knopp 알고리즘 (순수 PyTorch 함수 버전)"""
-        Q = torch.exp(scores / self.temperature).t()
-        Q /= torch.sum(Q)
+    # --- 1. 센서 데이터 증강 (Data Augmentation) ---
+    def time_warp(self, x, sigma=0.2, num_knots=4):
         
-        K, B = Q.shape
-        r = torch.ones(K, device=self.prototypes.device) / K
-        c = torch.ones(B, device=self.prototypes.device) / B
+        # """시계열 데이터에 Time Warping 증강 적용 (간소화된 버전)"""
+        B, C, T = x.shape
+        device = x.device
         
-        for _ in range(self.sk_iterations):
-            sum_Q_row = torch.sum(Q, dim=1, keepdim=True)  # 크기: (K, 1)
-            Q *= (r.view(-1, 1) / sum_Q_row)  # r을 (K, 1) 크기로 변환하여 나눗셈
+        # 각 배치 아이템마다 다른 warping 적용
+        warped_x = torch.zeros_like(x)
+        for i in range(B):
+            # 각 시간 포인트에 대한 랜덤 오프셋 생성
+            time_indices = torch.arange(T, device=device, dtype=torch.float32)
+            # 시간 왜곡 함수: sin 파형으로 자연스럽게 왜곡
+            perturb = sigma * T * torch.sin(torch.linspace(0, 4*3.14, T, device=device))
+            perturb = perturb * torch.rand(1, device=device)  # 배치마다 다른 강도
             
-            sum_Q_col = torch.sum(Q, dim=0, keepdim=True)
-            Q *= (c / sum_Q_col)
+            # 왜곡된 인덱스 생성
+            warped_indices = time_indices + perturb
+            warped_indices = torch.clamp(warped_indices, 0, T-1)
             
-        return (Q / torch.sum(Q, dim=0, keepdim=True)).t()
-
-
-    def evaluate(self, dataloader, epoch, stage="val"):
-        """모델 평가 함수 (순수 PyTorch)"""
-        self.eval() # 평가 모드
-        all_embs_rule, all_embs_1, all_embs_base = [], [], []
-        all_labels, all_predicted_rule, all_predicted_1, all_predicted_base = [], [], [], []
-        all_item_id = []
-        num_sensors = 97
-
-        with torch.no_grad():
-            for i, (videos, imu_data, labels, item_id) in enumerate(dataloader):
-                if i > 30:
-                    break
-                imu_data, labels = imu_data.to(self.prototypes.device), labels.to(self.prototypes.device)
-                label_mapping = {0: 0, 1: 1, 2: 0, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3, 8: 4, 9: 4, 10: 5, 11: 5, 12: 6, 13: 6, 14: 7, 15: 8}
-                labels = torch.tensor([label_mapping[label.item()] for label in labels])
-                labels = labels.to(self.prototypes.device)
-
-                # 1. 규칙 기반 특징 + 딥러닝 모델
-                rule_based_feature = self.get_representative_sensor_feature(imu_data, labels, num_sensors)
-
-                # rule only 추측 모델
-                scores_rule, final_feature_rule, _ = self(imu_data, rule_based_feature)
-                scores_rule_sk = self.sinkhorn_knopp(scores_rule)
-                predicted_rule = torch.argmax(scores_rule_sk, dim=1)
-
-                # 2. 딥러닝 모델 Only (alpha=0.5, 훈련 중과 유사)
-                rule_based_feature_zero = torch.zeros_like(rule_based_feature)
-                scores_1, final_feature_1, alpha_1 = self(imu_data, rule_based_feature_zero)
-                scores_1_sk = self.sinkhorn_knopp(scores_1)
-                predicted_1 = torch.argmax(scores_1_sk, dim=1)
-
-                # 3. 딥러닝 모델 Only (alpha=1.0, 최종 성능)
-                scores_base, final_feature_base, alpha_base = self(imu_data, rule_based_feature_zero, val=True)
-                scores_base_sk = self.sinkhorn_knopp(scores_base)
-                predicted_base = torch.argmax(scores_base_sk, dim=1)
-
-                # 결과 저장
-                all_embs_rule.append(final_feature_rule.cpu().numpy())
-                all_embs_1.append(final_feature_1.cpu().numpy())
-                all_embs_base.append(final_feature_base.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
-                all_predicted_rule.append(predicted_rule.cpu().numpy())
-                all_predicted_1.append(predicted_1.cpu().numpy())
-                all_predicted_base.append(predicted_base.cpu().numpy())
-                all_item_id.append(item_id)
-
-        all_embs_rule = np.vstack(all_embs_rule)
-        all_embs_1 = np.vstack(all_embs_1)
-        all_embs_base = np.vstack(all_embs_base)
-        all_labels = np.concatenate(all_labels)
-        all_predicted_rule = np.concatenate(all_predicted_rule)
-        all_predicted_1 = np.concatenate(all_predicted_1)
-        all_predicted_base = np.concatenate(all_predicted_base)
-        all_item_id = np.concatenate(all_item_id)
-
-        # 헝가리안 매칭으로 정확도 계산
-        accuracy_rule, mapping_rule = self.compute_hungarian_matching(all_predicted_rule, all_labels, self.num_clusters)
-        accuracy_1, mapping_1 = self.compute_hungarian_matching(all_predicted_1, all_labels, self.num_clusters)
-        accuracy_base, mapping_base = self.compute_hungarian_matching(all_predicted_base, all_labels, self.num_clusters)
+            # 선형 보간으로 왜곡 적용
+            warped_indices_low = warped_indices.floor().long()
+            warped_indices_high = warped_indices.ceil().long()
+            warped_indices_high = torch.clamp(warped_indices_high, 0, T-1)
+            
+            # 보간 가중치
+            weight_high = warped_indices - warped_indices_low.float()
+            weight_low = 1.0 - weight_high
+            
+            # 선형 보간으로 왜곡된 시계열 생성
+            x_batch = x[i]  # (C, T)
+            warped_x_batch = torch.zeros_like(x_batch)
+            
+            for t in range(T):
+                low_idx = warped_indices_low[t]
+                high_idx = warped_indices_high[t]
+                warped_x_batch[:, t] = weight_low[t] * x_batch[:, low_idx] + weight_high[t] * x_batch[:, high_idx]
+            
+            warped_x[i] = warped_x_batch
         
-        print(f"[{stage.upper()} Epoch {epoch}] Acc (Rule): {accuracy_rule:.4f}, Acc 1(Alpha=0.5): {accuracy_1:.4f}, Acc Base(Alpha=1.0): {accuracy_base:.4f}")
-        
-        # wandb 로깅
-        wandb.log({
-            f'{stage}_acc_rule': accuracy_rule,
-            f'{stage}_acc_1': accuracy_1,
-            f'{stage}_acc_base': accuracy_base,
-            'epoch': epoch
-        })
-        if type(alpha_base) == torch.Tensor:
-            wandb.log({
-                f'{stage}_alpha': alpha_base.mean().item(),
-                'epoch': epoch
-            })
-        elif type(alpha_base) == float or type(alpha_base) == int:
-            wandb.log({
-                f'{stage}_alpha': alpha_base,
-                'epoch': epoch
-            })
-        if type(alpha_1) == torch.Tensor:
-            wandb.log({
-                f'train_alpha': alpha_1.mean().item(),
-                'epoch': epoch
-            })
-        elif type(alpha_1) == float or type(alpha_1) == int:
-            wandb.log({
-                f'train_alpha': alpha_1,
-                'epoch': epoch
-            })
-
-        # # t-SNE 시각화 (선택적으로 짝수 에포크에만 실행)
-        if epoch % 2== 0:
-            title = f"t-SNE at Epoch {epoch}"
-            prototypes_np = self.prototypes.detach().cpu().numpy()
-            all_predicted_rule_mapped = [mapping_rule.get(label.item()) for label in all_predicted_rule]
-            fig_rule = visualize_tsne(all_embs_rule, all_labels, all_predicted_rule_mapped, title+"_rule", prototypes=prototypes_np, num_classes=self.num_clusters)
-            # 틀린 놈 찾기
-            for i in range(len(all_predicted_rule_mapped)):
-                if all_labels[i] != all_predicted_rule_mapped[i]:
-                    print(f"Epoch {epoch} Rule: {all_item_id[i]}")
-                    print(f"Epoch {epoch} Rule: {all_labels[i]} -> {all_predicted_rule_mapped[i]}")
-                    print("--------------------------------")
-            # fig_1 = visualize_tsne(all_embs_1, all_labels, all_predicted_1, title+"_1", prototypes=prototypes_np, num_classes=args.num_classes)
-            # fig_base = visualize_tsne(all_embs_base, all_labels, all_predicted_base, title+"_base", prototypes=prototypes_np, num_classes=args.num_classes)
-            wandb.log({
-                "t-SNE Visualization Rule": wandb.Image(fig_rule),
-                # "t-SNE Visualization 1": wandb.Image(fig_1),
-                # "t-SNE Visualization Base": wandb.Image(fig_base)
-            })
-            plt.close('all')
-
-        self.train() # 다시 학습 모드로 전환
-        return mapping_1 # 훈련 스텝에서 사용할 매핑 반환
+        return warped_x
     
+    def augment_imu_data(self, imu_data):
+        return self.time_warp(imu_data)
     
     def update_epoch(self, epoch):
-        self.current_epoch = epoch
+        self.epoch = epoch
+        
+    def evaluate_odc(self, dataloader, device, cluster_mapping=None, epoch=0, use_wandb=False):
+        """ODC 모델을 평가합니다."""
+        self.eval()
+        all_features = []
+        all_labels = []
+        all_cluster_ids = []
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                imu_data = batch['imu'].to(device)
+                labels = batch['labels'].to(device) if 'labels' in batch else None
+                
+                # 모델 순전파
+                scores, features = self(imu_data, return_features=True, labels=labels, step="val")
+                
+                # 클러스터 할당
+                cluster_ids = torch.argmax(scores, dim=1)
+                
+                if labels is not None:
+                    all_features.append(features.detach().cpu().numpy())
+                    all_labels.append(labels.detach().cpu().numpy())
+                    all_cluster_ids.append(cluster_ids.detach().cpu().numpy())
+        
+        # 정확도 계산
+        if all_labels:
+            all_features = np.vstack(all_features)
+            all_labels = np.concatenate(all_labels)
+            all_cluster_ids = np.concatenate(all_cluster_ids)
+            
+            # 매핑 없이 정확도 계산
+            raw_accuracy, new_mapping = compute_hungarian_matching(all_cluster_ids, all_labels, self.clustering_manager.num_clusters)
+            
+            # 기존 매핑 적용 시 정확도
+            if cluster_mapping is not None:
+                mapped_cluster_ids = np.array([cluster_mapping.get(c, c) for c in all_cluster_ids])
+                mapped_accuracy = np.mean(mapped_cluster_ids == all_labels)
+                print(f"Val Accuracy with Existing Mapping: {mapped_accuracy:.4f}")
+                
+                if use_wandb:
+                    wandb.log({
+                        "epoch": epoch,
+                        "val_accuracy_raw": raw_accuracy,
+                        "val_accuracy_mapped": mapped_accuracy
+                    })
+            else:
+                if use_wandb:
+                    wandb.log({
+                        "epoch": epoch,
+                        "val_accuracy": raw_accuracy
+                    })
+            
+            # 시각화 (선택적)
+            if epoch % 5 == 0:
+                # 프로토타입 가져오기
+                prototypes = self.odc_manager.centroids.detach().cpu().numpy()
+                
+                # 메모리 뱅크에서 pseudo label 가져오기
+                memory_bank_labels = []
+                sample_ids = []
+                
+                # 다시 데이터를 반복하면서 샘플 ID 수집
+                for batch in dataloader:
+                    if 'video_id' in batch:
+                        sample_ids.extend(batch['video_id'])
+                    else:
+                        # 샘플 ID가 없는 경우 임의로 생성
+                        sample_ids.extend([f"val_sample_{i+len(sample_ids)}" for i in range(len(batch['imu']))])
+                
+                # ODC 논문과 유사하게 메모리 뱅크에서 직접 특징과 라벨을 추출
+                if self.odc_manager.memory_initialized:
+                    # 메모리 뱅크에서 특징과 라벨 추출
+                    memory_features = []
+                    memory_labels = []
+                    
+                    # 메모리 뱅크에서 샘플 ID 가져오기
+                    all_sample_ids = list(self.odc_manager.memory_bank.keys())
+                    
+                    # 검증 데이터만 필터링 (샘플 ID 접두사로 구분)
+                    val_sample_ids = [sid for sid in all_sample_ids if sid.startswith("val_")]
+                    
+                    if len(val_sample_ids) > 0:
+                        # 메모리 뱅크에서 라벨과 특징 추출
+                        for sid in val_sample_ids:
+                            memory_labels.append(self.odc_manager.memory_bank[sid])
+                            if sid in self.odc_manager.feature_bank:
+                                memory_features.append(self.odc_manager.feature_bank[sid].cpu().numpy())
+                        
+                        if len(memory_features) > 0:
+                            # 특징과 라벨을 numpy 배열로 변환
+                            memory_features = np.array(memory_features)
+                            memory_labels = np.array(memory_labels)
+                            
+                            # 매핑 적용
+                            if cluster_mapping is not None:
+                                mapped_memory_labels = np.array([cluster_mapping.get(c, c) for c in memory_labels])
+                            else:
+                                mapped_memory_labels = np.array([new_mapping.get(c, c) for c in memory_labels])
+                            
+                            # 실제 라벨 (있는 경우)
+                            if len(all_labels) > 0:
+                                # 메모리 뱅크는 전체 데이터셋을 포함하므로 all_labels와 길이가 다를 수 있음
+                                vis_labels = np.zeros(len(memory_features), dtype=np.int64)
+                                vis_labels[:min(len(all_labels), len(vis_labels))] = all_labels[:min(len(all_labels), len(vis_labels))]
+                            else:
+                                vis_labels = np.zeros(len(memory_features), dtype=np.int64)
+                            
+                            # t-SNE 시각화 (2D와 3D 모두)
+                            fig_2d, fig_3d = visualize_tsne(
+                                memory_features, vis_labels, mapped_memory_labels,
+                                prototypes=prototypes,
+                                title=f"ODC Validation at Epoch {epoch+1} (Memory Bank)",
+                                num_classes=self.odc_manager.num_clusters
+                            )
+                        else:
+                            # 메모리 뱅크에 특징이 없는 경우 기존 방식 사용
+                            if cluster_mapping is not None:
+                                mapped_ids = np.array([cluster_mapping.get(c, c) for c in all_cluster_ids])
+                            else:
+                                mapped_ids = np.array([new_mapping.get(c, c) for c in all_cluster_ids])
+                            
+                            fig_2d, fig_3d = visualize_tsne(
+                                all_features, all_labels, mapped_ids,
+                                prototypes=prototypes,
+                                title=f"ODC Validation at Epoch {epoch+1} (No Memory Features)",
+                                num_classes=self.odc_manager.num_clusters
+                            )
+                    else:
+                        # 검증 샘플이 메모리 뱅크에 없는 경우 기존 방식 사용
+                        if cluster_mapping is not None:
+                            mapped_ids = np.array([cluster_mapping.get(c, c) for c in all_cluster_ids])
+                        else:
+                            mapped_ids = np.array([new_mapping.get(c, c) for c in all_cluster_ids])
+                        
+                        fig_2d, fig_3d = visualize_tsne(
+                            all_features, all_labels, mapped_ids,
+                            prototypes=prototypes,
+                            title=f"ODC Validation at Epoch {epoch+1} (No Val Samples in Memory)",
+                            num_classes=self.odc_manager.num_clusters
+                        )
+                else:
+                    # 메모리 뱅크가 초기화되지 않은 경우 기존 방식 사용
+                    if cluster_mapping is not None:
+                        mapped_ids = np.array([cluster_mapping.get(c, c) for c in all_cluster_ids])
+                    else:
+                        mapped_ids = np.array([new_mapping.get(c, c) for c in all_cluster_ids])
+                    
+                    fig_2d, fig_3d = visualize_tsne(
+                        all_features, all_labels, mapped_ids,
+                        prototypes=prototypes,
+                        title=f"ODC Validation at Epoch {epoch+1}",
+                        num_classes=self.odc_manager.num_clusters
+                    )
+                
+                if use_wandb:
+                    # 일관된 wandb 키 사용
+                    wandb.log({
+                        "val_tsne_2d": wandb.Image(fig_2d),
+                        "val_tsne_3d": wandb.Image(fig_3d)
+                    })
+                plt.close(fig_2d)
+                plt.close(fig_3d)
+        
+        return all_features, all_labels, all_cluster_ids

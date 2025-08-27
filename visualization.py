@@ -12,11 +12,8 @@ import os
 # clustering model
 import wandb
 import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 
 #################################################################
-# clustering model
-
 START_INDEX = 134
 END_INDEX = 231
 
@@ -241,63 +238,194 @@ def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = No
     print(f"Transformed video visualization saved to {output_path}")
 
 
-def visualize_tsne_3D(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization", mapping=False):
-    """
-    t-SNE 결과를 3D로 시각화하고 Matplotlib Figure 객체를 반환합니다.
-    """
-    n_samples = prototypes.shape[0]
-    label_names = [f"Class_{i}" for i in range(n_samples)]
-    
-    if n_samples <= 1:
-        print(f"Warning: Cannot run t-SNE with {n_samples} samples.")
-        return plt.figure()
+# --- 5. 헝가리안 매칭을 통한 클러스터-라벨 매핑 ---
+def compute_hungarian_matching(pred_labels, true_labels, num_clusters):
+    """클러스터 ID와 실제 레이블 간의 최적 매핑을 찾아 정확도를 계산"""
+    cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
+    for i in range(len(pred_labels)):
+        cost_matrix[pred_labels[i], true_labels[i]] += 1
+    row_ind, col_ind = linear_sum_assignment(-cost_matrix)
+    mapped_preds = np.zeros_like(pred_labels)
+    mapping = {i: j for i, j in zip(row_ind, col_ind)}
+    for i, j in mapping.items():
+        mapped_preds[pred_labels == i] = j
+    accuracy = np.mean(mapped_preds == true_labels)
+    print("Accuracy: ", accuracy, "Mapping: ", mapping)
+    return accuracy, mapping
 
-    perplexity_value = min(30.0, float(n_samples - 1))
-    if perplexity_value <= 0: perplexity_value = 1.0
+# --- 6. t-SNE 시각화 함수 ---
+def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 2D", num_classes=10):
+    """2D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
+    label_names = [ACTION_MERGE_LABELS.get(i, f"Class_{i}") for i in range(num_classes)]
+    
+    # t-SNE를 실행하기에 샘플 수가 충분한지 확인
+    if len(embeddings) <= 1:
+        print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples. Skipping visualization.")
+        return plt.figure()  # 빈 Figure 객체 반환
 
-    print(f"Running 3D t-SNE with {n_samples} samples and perplexity={perplexity_value:.1f}")
-    
-    # --- ✨ 핵심 수정: n_components=3 으로 변경 ---
-    tsne = TSNE(n_components=3, perplexity=perplexity_value, random_state=42, metric="cosine")
-    
+    # 프로토타입과 임베딩을 함께 변환
     if prototypes is not None:
         combined_data = np.vstack([embeddings, prototypes])
-        reduced_data = tsne.fit_transform(combined_data)
-        reduced_embeddings = reduced_data[:-len(prototypes)]
-        reduced_prototypes = reduced_data[-len(prototypes):]
     else:
-        reduced_embeddings = tsne.fit_transform(embeddings)
-        reduced_prototypes = None
+        combined_data = embeddings
+    nan_count = np.isnan(combined_data).sum()
+    print(f"Total number of NaN values: {nan_count}")
 
-    fig = plt.figure(figsize=(24, 10))
+    # NaN 값이 있는 행(샘플) 확인
+    rows_with_nan = np.any(np.isnan(combined_data), axis=1)
+    print(f"Rows containing NaN: \n{np.where(rows_with_nan)[0]}")
+    # t-SNE 시각화 (2D와 3D 모두)
+ 
+    perplexity_value = min(30, len(combined_data) - 1)
+    if perplexity_value <= 0:
+        perplexity_value = 1.0
+        
+    tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=42, metric="cosine")
+    reduced_all = tsne.fit_transform(combined_data)
+    
+    reduced_embeddings = reduced_all[:len(embeddings)]
+    if prototypes is not None:
+        reduced_prototypes = reduced_all[len(embeddings):]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 10))
     fig.suptitle(title, fontsize=16)
-
-    # --- ✨ 핵심 수정: subplot을 3D로 설정 ---
-    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
-    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
-
+    
+    # 일관된 색상 매핑을 위한 색상 정의
+    colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    
     # 실제 레이블 기준 시각화
-    scatter1 = ax1.scatter(
-        reduced_embeddings[:, 0], reduced_embeddings[:, 1], reduced_embeddings[:, 2],
-        c=true_labels, cmap="tab10", alpha=0.7
-    )
+    scatter1 = None
+    for i in range(num_classes):
+        mask = (true_labels == i)
+        if mask.any():
+            sc = ax1.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], 
+                       color=colors[i], label=label_names[i], alpha=0.7)
+            if scatter1 is None:
+                scatter1 = sc
+    
     ax1.set_title("True Labels")
-    legend1_handles, _ = scatter1.legend_elements(num=n_samples)
-    ax1.legend(legend1_handles, label_names)
 
     # 예측된 클러스터 기준 시각화
-    scatter2 = ax2.scatter(
-        reduced_embeddings[:, 0], reduced_embeddings[:, 1], reduced_embeddings[:, 2],
-        c=pred_labels, cmap="tab10", alpha=0.7
-    )
-    if mapping:
-        ax2.set_title("Predicted Clusters (Mapped)")
-    else:
-        ax2.set_title("Predicted Clusters")
+    scatter2 = None
+    for i in range(num_classes):
+        mask = (pred_labels == i)
+        if mask.any():
+            sc = ax2.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], 
+                       color=colors[i], label=label_names[i], alpha=0.7)
+            if scatter2 is None:
+                scatter2 = sc
     
-    if reduced_prototypes is not None:
+    # 프로토타입 시각화
+    if prototypes is not None:
         proto_labels = np.arange(len(prototypes))
-        # 두 subplot에 모두 프로토타입을 표시
+        ax1.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
+        ax2.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
+        
+        # 프로토타입에 번호 추가
+        for i in range(len(prototypes)):
+            ax1.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
+            ax2.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
+        
+        # 범례 수동 생성
+        handles1 = []
+        for i in range(num_classes):
+            # 각 클래스마다 색상을 일관되게 설정
+            handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
+            handles1.append(handle)
+        
+        proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
+        handles1.append(proto_handle)
+        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1])
+        
+        # 두 번째 그래프도 동일한 방식으로 범례 생성
+        handles2 = []
+        for i in range(num_classes):
+            handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
+            handles2.append(handle)
+        
+        handles2.append(proto_handle)
+        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2])
+    else:
+        # 범례 수동 생성 (프로토타입 없음)
+        handles1 = []
+        handles2 = []
+        for i in range(num_classes):
+            handle1 = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
+            handle2 = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
+            handles1.append(handle1)
+            handles2.append(handle2)
+        
+        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1])
+        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2])
+    
+    return fig
+
+def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 3D", num_classes=10):
+    """3D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
+    label_names = [ACTION_MERGE_LABELS.get(i, f"Class_{i}") for i in range(num_classes)]
+    
+    # t-SNE를 실행하기에 샘플 수가 충분한지 확인
+    if len(embeddings) <= 1:
+        print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples. Skipping visualization.")
+        return plt.figure()  # 빈 Figure 객체 반환
+
+    # 프로토타입과 임베딩을 함께 변환
+    if prototypes is not None:
+        combined_data = np.vstack([embeddings, prototypes])
+    else:
+        combined_data = embeddings
+
+    perplexity_value = min(30, len(combined_data) - 1)
+    if perplexity_value <= 0:
+        perplexity_value = 1.0
+        
+    # 3차원 t-SNE 실행
+    tsne = TSNE(n_components=3, perplexity=perplexity_value, random_state=42, metric="cosine")
+    reduced_all = tsne.fit_transform(combined_data)
+    
+    reduced_embeddings = reduced_all[:len(embeddings)]
+    if prototypes is not None:
+        reduced_prototypes = reduced_all[len(embeddings):]
+
+    fig = plt.figure(figsize=(22, 10))
+    fig.suptitle(title, fontsize=16)
+    
+    # 3D 서브플롯 생성
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax2 = fig.add_subplot(122, projection='3d')
+    
+    # 일관된 색상 매핑을 위한 색상 정의
+    colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    
+    # 실제 레이블 기준 시각화
+    scatter1 = None
+    for i in range(num_classes):
+        mask = (true_labels == i)
+        if mask.any():
+            sc = ax1.scatter(
+                reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
+                color=colors[i], label=label_names[i], alpha=0.7, s=50
+            )
+            if scatter1 is None:
+                scatter1 = sc
+    ax1.set_title("True Labels")
+    
+    # 예측된 클러스터 기준 시각화
+    scatter2 = None
+    for i in range(num_classes):
+        mask = (pred_labels == i)
+        if mask.any():
+            sc = ax2.scatter(
+                reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
+                color=colors[i], label=label_names[i], alpha=0.7, s=50
+            )
+            if scatter2 is None:
+                scatter2 = sc
+    ax2.set_title("Predicted Clusters")
+    
+    # 프로토타입 시각화
+    if prototypes is not None:
+        proto_labels = np.arange(len(prototypes))
         ax1.scatter(
             reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
             c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5
@@ -309,100 +437,61 @@ def visualize_tsne_3D(embeddings, true_labels, pred_labels, prototypes=None, tit
         
         # 프로토타입에 번호 추가
         for i in range(len(prototypes)):
-            ax1.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], f'P{i}', fontsize=12, weight='bold')
-            ax2.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], f'P{i}', fontsize=12, weight='bold')
+            ax1.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], 
+                     f'P{i}', fontsize=12, weight='bold')
+            ax2.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], 
+                     f'P{i}', fontsize=12, weight='bold')
     
-    legend2_handles, _ = scatter2.legend_elements(num=n_samples)
-    ax2.legend(legend2_handles, label_names)
-        
+    # 범례 수동 생성
+    handles1 = []
+    for i in range(num_classes):
+        # 각 클래스마다 색상을 일관되게 설정
+        handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
+        handles1.append(handle)
+    
+    if prototypes is not None:
+        proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
+        handles1.append(proto_handle)
+        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1], loc='upper left')
+    else:
+        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1], loc='upper left')
+    
+    # 두 번째 그래프도 동일한 방식으로 범례 생성
+    handles2 = []
+    for i in range(num_classes):
+        handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
+        handles2.append(handle)
+    
+    if prototypes is not None:
+        proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
+        handles2.append(proto_handle)
+        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2], loc='upper left')
+    else:
+        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2], loc='upper left')
+    
+    # 축 라벨 설정
+    ax1.set_xlabel('Component 1')
+    ax1.set_ylabel('Component 2')
+    ax1.set_zlabel('Component 3')
+    ax2.set_xlabel('Component 1')
+    ax2.set_ylabel('Component 2')
+    ax2.set_zlabel('Component 3')
+    
+    # 그래프 조절
+    plt.tight_layout()
+    
     return fig
-# LinearProbingEvaluator 클래스를 아래 코드로 교체하세요.
-def visualize_tsne(embeddings, true_labels, pred_labels, title, prototypes=None, num_classes=7, mapping=False):
-        """t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환. 프로토타입도 함께 시각화 가능."""
-        fig = visualize_tsne_3D(embeddings, true_labels, pred_labels, prototypes=prototypes, mapping=mapping)
-        wandb.log({"t-SNE Visualization_3d": wandb.Image(fig, caption=title)})
 
-        label_names = [f"Class_{i}" for i in range(num_classes)]
-        assert num_classes == len(prototypes), f"num_classes must be equal to the number of prototypes, now num_classes: {num_classes}, len(prototypes): {len(prototypes)}"
-        # --- ✨ 핵심 수정: t-SNE를 실행하기에 샘플 수가 충분한지 확인 ---
-        if len(embeddings) <= 1:
-            print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples. Skipping visualization.")
-            return plt.figure() # 빈 Figure 객체 반환
-
-        # --- ✨ 프로토타입과 임베딩을 함께 변환하기 위해 결합 ---
-        if prototypes is not None:
-            combined_data = np.vstack([embeddings, prototypes])
-        else:
-            combined_data = embeddings
-
-        # Perplexity는 샘플 수보다 작아야 함
-        perplexity_value = min(30, len(combined_data) - 1)
-        if perplexity_value <= 0: # 이중 안전장치
-            perplexity_value = 1.0
-        tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=42, n_iter=300, metric="cosine")
-        reduced_all = tsne.fit_transform(combined_data)
-        
-        reduced_embeddings = reduced_all[:len(embeddings)]
-        if prototypes is not None:
-            reduced_prototypes = reduced_all[len(embeddings):]
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 10))
-        fig.suptitle(title, fontsize=16)
-        
-        # 실제 레이블 기준 시각화
-        scatter1 = ax1.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=true_labels, cmap="tab10", alpha=0.7)
-        ax1.set_title("True Labels")
-
-        # 예측된 클러스터 기준 시각화
-        scatter2 = ax2.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=pred_labels, cmap="tab10", alpha=0.7)
-        if mapping:
-            ax2.set_title("Predicted Clusters (Mapped)")
-        else:
-            ax2.set_title("Predicted Clusters")
-        
-        # --- ✨ 프로토타입 시각화 추가 ---
-        if prototypes is not None:
-            proto_labels = np.arange(len(prototypes))
-            # 두 subplot에 모두 프로토타입을 표시
-            ax1.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
-            ax2.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
-            
-            # 프로토타입에 번호 추가
-            for i in range(len(prototypes)):
-                ax1.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
-                ax2.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
-            
-            # 범례 업데이트
-            handles1 = scatter1.legend_elements(num=num_classes)[0]
-            proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
-            handles1.append(proto_handle)
-            ax1.legend(handles=handles1, labels=label_names + ['Prototypes'])
-
-            print("\n--- Legend Debugging Info ---")
-            # 실제로 pred_labels에 어떤 값들이 들어있는지 확인
-            unique_preds = np.unique(pred_labels)
-            print(f"Unique predicted labels in data: {unique_preds}")
-            print(f"Number of unique predicted labels: {len(unique_preds)}")
-
-            # legend_elements가 생성하는 핸들의 실제 개수 확인
-            handles_check = scatter2.legend_elements(num=num_classes)[0]
-            print(f"Number of handles generated by legend_elements: {len(handles_check)}")
-            print(f"Number of labels provided: {len(label_names) + 1}")
-            print("---------------------------\n")
-            handles2 = scatter2.legend_elements(num=num_classes)[0]
-            handles2.append(proto_handle)
-            print('handles2: ', handles2)
-            print('label_names: ', label_names)
-            ax2.legend(handles=handles2, labels=label_names + ['Prototypes'])
-        else:
-            assert False, "prototypes is not None"
-            ax1.legend(handles=scatter1.legend_elements(num=num_classes)[0], labels=label_names)
-            ax2.legend(handles=scatter2.legend_elements(num=num_classes)[0], labels=label_names)
-        
-        return fig
-
-
-
+def visualize_tsne(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization", num_classes=10):
+    """2D와 3D t-SNE 시각화를 모두 수행하고 2D 결과를 반환"""
+    # 2D 시각화
+    fig_2d = visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes, title + " (2D)", num_classes)
+    
+    # 3D 시각화
+    fig_3d = visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes, title + " (3D)", num_classes)
+    
+    # 기존 호환성을 위해 2D 그림 반환
+    return fig_2d, fig_3d
 
 def get_sensor_name(sensor_index):
     """
