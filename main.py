@@ -43,6 +43,9 @@ class DatasetEpochCallback(pl.Callback):
 ####################################################################
 
 
+torch.backends.cuda.preferred_linalg_library("magma") 
+
+
 def main(args):
     set_random_seed(42)
 

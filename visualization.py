@@ -1,19 +1,18 @@
+import os
 import torch
 import torchvision
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
+from PIL import Image
 from typing import List
-import torchvision.transforms.functional as TF
 from sklearn.manifold import TSNE
-import os
-# clustering model
-import wandb
-import matplotlib.pyplot as plt
+
 
 #################################################################
+
+
 START_INDEX = 134
 END_INDEX = 231
 
@@ -29,6 +28,10 @@ ACTION_MERGE_LABELS = {
         8: 'Drink from Cup',
         9: 'Toggle Switch'
     }
+
+
+#################################################################
+
 
 def _superimpose_heatmap_on_image(
     frame_tensor: torch.Tensor,
@@ -119,84 +122,6 @@ def _create_image_grid(
 #################################################################
 
 
-def visualize_cam_on_video_grid(
-    video_tensor: torch.Tensor,
-    cam_tensor: torch.Tensor,
-    predicted_class_indices: torch.Tensor,
-    max_frames: int = 16,
-    grid_cols: int = 4,
-    heatmap_alpha: float = 0.5
-) -> 'Image.Image':
-    """
-    비디오 텐서와 CAM 텐서를 받아, 각 프레임별 예측에 해당하는 CAM을 원본 프레임에
-    오버레이한 그리드 이미지를 생성합니다.
-    배치(batch) 데이터가 들어올 경우, 첫 번째 샘플만 사용합니다.
-
-    Args:
-        video_tensor (torch.Tensor): 원본 비디오 프레임 텐서.
-            - Shape: (B, T, C, H, W) 또는 (T, C, H, W)
-        cam_tensor (torch.Tensor): 모델이 생성한 전체 클래스에 대한 CAM 텐서.
-            - Shape: (B, Num_Classes, T, 7, 7) 또는 (Num_Classes, T, 7, 7)
-        predicted_class_indices (torch.Tensor): 각 프레임에 대해 예측된 클래스
-    인덱스.
-            - Shape: (B, T) 또는 (T,)
-        max_frames (int): 시각화할 최대 프레임 수.
-        grid_cols (int): 그리드 이미지의 열(column) 수.
-        heatmap_alpha (float): 원본 이미지 위에 겹칠 히트맵의 투명도.
-
-    Returns:
-        PIL.Image.Image: 모든 시각화 결과가 포함된 하나의 그리드 이미지.
-    """
-    # 1. 입력 텐서 차원 처리 (배치 유무 확인 및 첫 번째 샘플 선택)
-    if video_tensor.dim() == 5:  # 배치가 있는 경우 (B, T, C, H, W)
-        video_clip = video_tensor[0]
-        cam_clip = cam_tensor[0]  # Shape: (Num_Classes, T, 7, 7)
-        preds_for_clip = predicted_class_indices[0]  # Shape: (T,)
-    else:  # 단일 데이터인 경우 (T, C, H, W)
-        video_clip = video_tensor
-        cam_clip = cam_tensor
-        preds_for_clip = predicted_class_indices
-
-    # 2. 시각화할 프레임 인덱스 결정
-    num_frames = video_clip.shape[0]
-    if num_frames > max_frames:
-        # 전체 프레임에서 max_frames 개수만큼 균일하게 샘플링
-        indices = np.linspace(0, num_frames - 1, max_frames, dtype=int)
-    else:
-        indices = np.arange(num_frames)
-
-    video_frames_to_viz = video_clip[indices]
-
-    # 3. 각 프레임에 대해 오버레이 이미지 생성 (수정된 핵심 로직)
-    overlayed_images = []
-    for i, frame_idx in enumerate(indices):
-        # 현재 프레임(시각화 대상)
-        frame_tensor = video_frames_to_viz[i]
-
-        # 현재 프레임에 해당하는 예측 클래스 인덱스
-        frame_pred_idx = preds_for_clip[frame_idx].item()
-
-        # 현재 프레임의 예측 클래스에 해당하는 CAM 선택
-        # cam_clip: (Num_Classes, T, 7, 7) -> cam_map: (7, 7)
-        cam_map_for_frame = cam_clip[frame_idx, frame_pred_idx]
-
-        # 히트맵 오버레이
-        overlay = _superimpose_heatmap_on_image(
-            frame_tensor=frame_tensor,
-            heatmap_tensor=cam_map_for_frame,
-            alpha=heatmap_alpha
-        )
-        overlayed_images.append(overlay)
-
-    # 4. 이미지 그리드 생성
-    grid = _create_image_grid(overlayed_images, grid_cols)
-
-    return grid
-
-
-#################################################################
-
-
 def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = None):
     """
     비디오 텐서로부터 프레임 그리드 이미지를 저장합니다.
@@ -238,20 +163,8 @@ def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = No
     print(f"Transformed video visualization saved to {output_path}")
 
 
-# --- 5. 헝가리안 매칭을 통한 클러스터-라벨 매핑 ---
-def compute_hungarian_matching(pred_labels, true_labels, num_clusters):
-    """클러스터 ID와 실제 레이블 간의 최적 매핑을 찾아 정확도를 계산"""
-    cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
-    for i in range(len(pred_labels)):
-        cost_matrix[pred_labels[i], true_labels[i]] += 1
-    row_ind, col_ind = linear_sum_assignment(-cost_matrix)
-    mapped_preds = np.zeros_like(pred_labels)
-    mapping = {i: j for i, j in zip(row_ind, col_ind)}
-    for i, j in mapping.items():
-        mapped_preds[pred_labels == i] = j
-    accuracy = np.mean(mapped_preds == true_labels)
-    print("Accuracy: ", accuracy, "Mapping: ", mapping)
-    return accuracy, mapping
+#################################################################
+
 
 # --- 6. t-SNE 시각화 함수 ---
 def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 2D", num_classes=10):
@@ -275,7 +188,7 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
     rows_with_nan = np.any(np.isnan(combined_data), axis=1)
     print(f"Rows containing NaN: \n{np.where(rows_with_nan)[0]}")
     # t-SNE 시각화 (2D와 3D 모두)
- 
+
     perplexity_value = min(30, len(combined_data) - 1)
     if perplexity_value <= 0:
         perplexity_value = 1.0
@@ -299,7 +212,7 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
         mask = (true_labels == i)
         if mask.any():
             sc = ax1.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], 
-                       color=colors[i], label=label_names[i], alpha=0.7)
+                    color=colors[i], label=label_names[i], alpha=0.7)
             if scatter1 is None:
                 scatter1 = sc
     
@@ -311,7 +224,7 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
         mask = (pred_labels == i)
         if mask.any():
             sc = ax2.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], 
-                       color=colors[i], label=label_names[i], alpha=0.7)
+                    color=colors[i], label=label_names[i], alpha=0.7)
             if scatter2 is None:
                 scatter2 = sc
     
@@ -359,6 +272,10 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
         ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2])
     
     return fig
+
+
+#################################################################
+
 
 def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 3D", num_classes=10):
     """3D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
@@ -438,9 +355,9 @@ def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, tit
         # 프로토타입에 번호 추가
         for i in range(len(prototypes)):
             ax1.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], 
-                     f'P{i}', fontsize=12, weight='bold')
+                    f'P{i}', fontsize=12, weight='bold')
             ax2.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], 
-                     f'P{i}', fontsize=12, weight='bold')
+                    f'P{i}', fontsize=12, weight='bold')
     
     # 범례 수동 생성
     handles1 = []
@@ -482,6 +399,10 @@ def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, tit
     
     return fig
 
+
+#################################################################
+
+
 def visualize_tsne(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization", num_classes=10):
     """2D와 3D t-SNE 시각화를 모두 수행하고 2D 결과를 반환"""
     # 2D 시각화
@@ -492,6 +413,10 @@ def visualize_tsne(embeddings, true_labels, pred_labels, prototypes=None, title=
     
     # 기존 호환성을 위해 2D 그림 반환
     return fig_2d, fig_3d
+
+
+#################################################################
+
 
 def get_sensor_name(sensor_index):
     """

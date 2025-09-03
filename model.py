@@ -1,19 +1,16 @@
-import random
-import wandb
 import numpy as np
-from sklearn.metrics import accuracy_score
-from scipy.optimize import linear_sum_assignment
-import matplotlib.pyplot as plt
-from transformers import CLIPVisionModelWithProjection, AutoModel
-from peft import LoraConfig, get_peft_model
-from einops import rearrange, repeat
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
-import numpy as np
-from visualization import visualize_tsne, compute_hungarian_matching
+import wandb
+import matplotlib.pyplot as plt
+from transformers import CLIPVisionModelWithProjection, AutoModel
+from peft import LoraConfig, get_peft_model
+from einops import repeat
+
+from visualization import visualize_tsne
+from utils import compute_hungarian_matching
 
 
 #################################################################
@@ -72,6 +69,7 @@ class Block(nn.Module):
 #         out = {"emb": emb}
 #         return out
 
+
 class SensorModel(nn.Module):
     """각 센서 채널을 독립적으로 처리한 후, 그 특징들을 GRU로 융합하는 모델"""
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
@@ -114,8 +112,7 @@ class SensorModel(nn.Module):
         
         # (여기서 top_k 센서 선택 로직을 적용할 수 있습니다)
         # 예를 들어, 특정 규칙으로 k개의 채널 인덱스를 선택하여
-        # selected_features = channel_features_batched[:, top_k_indices, :]
-        # 와 같이 처리한 후 fusion_gru에 넣을 수 있습니다.
+        # selected_features = channel_features_batched[:, top_k_indices, :] 와 같이 처리한 후 fusion_gru에 넣을 수 있습니다.
         
         # 4. GRU로 채널 간의 관계를 학습하여 최종 특징 추출
         _, hidden = self.fusion_gru(channel_features_batched)
@@ -579,12 +576,6 @@ class VisionModel(nn.Module):
     (수정 최종 버전) 특징 추출, Attention Bridge, 그리고 Appearance/Motion 인코딩을 모두 포함하는 통합 모델.
     """
     def __init__(self, image_size: int, target_size: tuple = (112, 112)):
-        """
-        Args:
-            image_size (int): 입력 이미지의 크기 (H 또는 W).
-            num_classes (int): 최종 분류할 클래스의 수.
-            target_size (tuple): Attention Bridge가 출력할 특징 맵의 크기.
-        """
         super().__init__()
 
         # --- 1단계: 특징 추출 및 ROI 지역화 ---
@@ -621,17 +612,6 @@ class VisionModel(nn.Module):
         )
 
     def forward(self, video: torch.Tensor) -> dict:
-        """
-        전체 모델의 순전파 파이프라인을 실행합니다.
-        Args:
-            video (torch.Tensor): (B, T, C, H, W) 형태의 원본 비디오.
-        Returns:
-            dict: 모델의 출력을 담은 딕셔너리.
-                    - "logits": 최종 분류 결과 (prediction).
-                    - "v_appearance": 추출된 외형 벡터.
-                    - "v_motion": 추출된 동작 벡터.
-                    - "transformed_features": Attention Bridge의 출력 특징 맵.
-        """
         features_dict = self.feature_extractor(video)
 
         # 1. 특징 추출 (F_A)
@@ -658,10 +638,12 @@ class VisionModel(nn.Module):
 
 #################################################################
 
-# --- 3. ODC 메모리 뱅크 관리자 ---
+
+# --- ODC 메모리 뱅크 관리자 ---
 class ClusteringManager(nn.Module):
     def __init__(self, num_clusters, feature_dim, momentum=0.99, temperature=0.1, device='cuda'):
         super().__init__()
+
         self.num_clusters = num_clusters
         self.feature_dim = feature_dim
         self.momentum = momentum
@@ -671,23 +653,20 @@ class ClusteringManager(nn.Module):
         # 클러스터 중심점(centroids) 초기화 - 더 넓게 분포되도록 초기화
         # 각 차원마다 균등 분포를 사용하여 더 잘 분산되도록 함
         centroids = torch.rand(num_clusters, feature_dim, device=device) * 2.0 - 1.0  # [-1, 1] 범위의 균등 분포
-        
-        # 정규화를 통해 모든 중심점이 단위 구에 있도록 함
-        # self.centroids = F.normalize(self.centroids, dim=1)
-        
+                
         # 직교성을 높이기 위한 추가 처리
         # QR 분해를 통해 직교 벡터 얻기
         if num_clusters <= feature_dim:  # 클러스터 수가 차원보다 작거나 같을 때만 가능
             q, r = torch.linalg.qr(centroids.t())  # 직교 행렬 Q 얻기
             centroids = q[:, :num_clusters].t()  # 직교 벡터로 중심점 설정
         self.register_buffer('centroids', centroids)
-        # 클러스터 할당 히스토리
+        
         self.cluster_size = torch.zeros(num_clusters, device=device)
         
         # Pseudo label 메모리 뱅크 (ODC 논문과 유사하게 중앙화된 방식으로 관리)
-        self.memory_bank = {}
         # 각 샘플을 고유하게 식별할 수 있는 ID를 저장하기 위한 딕셔너리
         # key: sample_id, value: pseudo_label
+        self.memory_bank = {}
         
         # 전체 데이터셋에 대한 특징 메모리 뱅크 (샘플 ID -> 특징 벡터)
         self.feature_bank = {}
@@ -704,10 +683,12 @@ class ClusteringManager(nn.Module):
         # 가중치 계산을 위한 상수
         self.class_weight_power = 1.0  # 클러스터 크기에 적용할 거듭제곱
         
+        
     @torch.no_grad()
     def update_centroids_with_momentum(self, features, cluster_ids):
         """모멘텀 방식으로 중심점만 업데이트합니다.
         클러스터 크기는 update_memory_bank에서 전체 데이터셋을 기준으로 계산됩니다."""
+
         for k in range(self.num_clusters):
             # 현재 클러스터에 할당된 특징들 선택
             mask = (cluster_ids == k)
@@ -724,8 +705,10 @@ class ClusteringManager(nn.Module):
                 
         # 참고: 클러스터 크기(self.cluster_size)는 update_memory_bank에서 전체 데이터셋을 기준으로 계산됨
 
+
     def compute_similarity_scores(self, features):
         """특징과 중심점 간의 유사도 점수를 계산합니다."""
+
         # 코사인 유사도 계산 (L2 정규화 후 내적)
         features_norm = F.normalize(features, dim=1)
         centroids_norm = F.normalize(self.centroids, dim=1)
@@ -733,9 +716,11 @@ class ClusteringManager(nn.Module):
         
         # 온도 파라미터 적용
         return similarity / self.temperature
-        
+
+
     def compute_class_weights(self):
         """클러스터 크기에 근거한 클래스 가중치를 계산합니다."""
+
         # 클러스터 크기가 0인 경우를 방지하기 위한 정규화
         normalized_sizes = self.cluster_size + 1e-8
         
@@ -748,6 +733,7 @@ class ClusteringManager(nn.Module):
         max_weight = weights.max()
         min_weight = weights.min()
         if max_weight > min_weight * 10:
+
             # 최대 가중치가 최소의 10배를 넘지 않도록 조절
             weights = torch.clamp(weights, min=max_weight/10)
         
@@ -755,6 +741,7 @@ class ClusteringManager(nn.Module):
         weights = weights / weights.sum() * self.num_clusters
         
         return weights
+
         
     def get_largest_cluster(self):
         """가장 큰 클러스터와 그 크기를 반환합니다.
@@ -771,6 +758,7 @@ class ClusteringManager(nn.Module):
             largest_idx = valid_clusters[torch.argmax(self.cluster_size[valid_clusters])]
             
         return largest_idx, self.cluster_size[largest_idx]
+
         
     def get_empty_clusters(self):
         """빈 클러스터(임계값 미만)를 반환합니다."""
@@ -779,6 +767,7 @@ class ClusteringManager(nn.Module):
         relative_threshold = avg_size * 0.2  # 평균의 20% 미만인 클러스터도 빈 것으로 간주
         threshold = min(self.min_cluster_size, relative_threshold)
         return torch.where(self.cluster_size < threshold)[0]
+
         
     def redistribute_cluster(self, empty_idx, largest_idx, features, labels):
         """크기가 큰 클러스터를 분할하여 빈 클러스터를 재활용합니다."""
@@ -825,54 +814,57 @@ class ClusteringManager(nn.Module):
         self.cluster_size[empty_idx] = sub_counts[1]
         
         print(f"Redistributed cluster: Split cluster {largest_idx} ({sub_counts[0]} samples) "
-              f"and reassigned {sub_counts[1]} samples to empty cluster {empty_idx}")
-              
+            f"and reassigned {sub_counts[1]} samples to empty cluster {empty_idx}")
+            
         # 만약 재분배 후에도 여전히 작은 클러스터가 있다면 로그로 알리기
         if min(sub_counts) < self.min_cluster_size:
             print(f"Warning: After redistribution, one of the clusters still has fewer than {self.min_cluster_size} samples ({min(sub_counts)}).")
-              
+            
         # 메모리 뱅크 업데이트 필요 (외부에서 처리)
         
         return True
 
-# --- 4. ODC 모델 ---
+
+#################################################################
+
+
+# --- ODC 모델 ---
 class ClusteringModel(nn.Module):
     def __init__(self, encoder, embedding_dim, num_sensors, num_clusters):
         super().__init__()
-        # 딥러닝 백본 선택
+
         self.encoder = encoder
-            
+    
         # ODC 관리자
         self.clustering_manager = ClusteringManager(num_clusters=num_clusters, feature_dim=embedding_dim)
         self.projection_layer = nn.Linear(num_sensors, embedding_dim)
         self.epoch = 0
         
-    def forward(self, x, sample_ids=None, return_features=False, labels=None, step="train"):
-        # x는 (B, C, T) 형태의 텐서
-        
-        # 특징 추출
+    def forward(self, x, sample_ids=None, return_features=False, labels=None, step="train"):        
         features = self.encoder(x)["emb"]
+        
         if step == "train":
             rule_feature = self.get_representative_sensor_feature(x, labels, num_total_sensors=97, top_k=4, id=sample_ids)
-            rule_feature = self.projection_layer(rule_feature)
-        # 클러스터 유사도 점수 계산
+            rule_feature = self.projection_layer(rule_feature)    
             features += rule_feature * 1.0/(self.epoch+1)
+
         else:
             self.epoch += 1
-        similarity_scores = self.clustering_manager.compute_similarity_scores(features)
 
+        similarity_scores = self.clustering_manager.compute_similarity_scores(features)
         
         if return_features:
             return similarity_scores, features
+
         return similarity_scores
+
+
     # 전체 데이터셋의 pseudo label을 계산하고 메모리 뱅크에 저장하는 함수
     @torch.no_grad()
     def init_memory_bank(self, dataloader, device):
         """전체 데이터셋에 대한 pseudo label과 특징을 계산하고 메모리 뱅크에 저장합니다.
         ODC 논문과 유사하게 전체 데이터셋에 대한 중앙화된 메모리 뱅크를 관리합니다."""
         self.eval()
-        
-        # 메모리 뱅크 업데이트 진행바
         
         # 전체 샘플 수와 업데이트된 샘플 수 추적
         total_samples = 0
@@ -913,11 +905,13 @@ class ClusteringModel(nn.Module):
         print(f"Memory bank initialized with {updated_samples} samples.")
         
         self.train()
+
     
     @torch.no_grad()
     def update_centroids(self, features, cluster_ids):
         """ODC Manager의 중심점을 업데이트합니다."""
         self.clustering_manager.update_centroids_with_momentum(features, cluster_ids)
+
     
     @torch.no_grad()
     def update_memory_bank(self, sample_ids, pseudo_labels, features=None):
@@ -929,7 +923,8 @@ class ClusteringModel(nn.Module):
             # 특징 벡터도 저장 (제공된 경우)
             if features is not None:
                 self.clustering_manager.feature_bank[sample_id] = features[idx].detach()
-    
+
+
     def get_pseudo_labels(self, sample_ids):
         """메모리 뱅크에서 샘플에 대한 pseudo label을 조회합니다."""
         device = next(self.parameters()).device
@@ -944,8 +939,9 @@ class ClusteringModel(nn.Module):
                 pseudo_labels.append(-1)
         
         return torch.tensor(pseudo_labels, device=device)
-    
-        # --- 1. 규칙 기반 특징 추출기 ---
+
+
+    # Top-K 센서 처리    
     def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=97, top_k=1, id=None):
         """
         각 샘플에서 신호 변화가 가장 큰 센서를 찾아 원-핫 벡터로 만듭니다.
@@ -954,22 +950,22 @@ class ClusteringModel(nn.Module):
         
         # 각 채널(센서)의 분산 계산 (max - min)
         ranges = torch.var(imu_batch, dim=2)
-        # 가장 분산이 큰 센서의 인덱스 찾기 (분산이 0인것 제외)
-    
+
+        # 가장 분산이 큰 센서의 인덱스 찾기 (분산이 0인것 제외)    
         min_range, _ = torch.min(ranges, dim=1, keepdim=True)
         max_range, _ = torch.max(ranges, dim=1, keepdim=True)
         weighted_features = (ranges - min_range) / (max_range - min_range + 1e-8)
-        # 정규화 x
-        # weighted_features = ranges
-        # 3. Top-K에 해당하지 않는 값들을 0으로 마스킹
+
+        # Top-K에 해당하지 않는 값들을 0으로 마스킹
         # 가장 큰 Top-K 값만 남기고 나머지는 0으로 만들기 위한 마스크 생성
         _, top_indices = torch.topk(weighted_features, k=top_k, dim=1)
         mask = torch.zeros_like(weighted_features)
         mask.scatter_(1, top_indices, 1)
 
-        # 4. 마스크를 적용하여 최종 특징 생성
+        # 마스크를 적용하여 최종 특징 생성
         final_rule_feature = weighted_features * mask
         return final_rule_feature
+
 
     # --- 1. 센서 데이터 증강 (Data Augmentation) ---
     def time_warp(self, x, sigma=0.2, num_knots=4):
@@ -1012,14 +1008,17 @@ class ClusteringModel(nn.Module):
             warped_x[i] = warped_x_batch
         
         return warped_x
-    
+
+
     def augment_imu_data(self, imu_data):
         return self.time_warp(imu_data)
-    
+
+
     def update_epoch(self, epoch):
         self.epoch = epoch
-        
-    def evaluate_odc(self, dataloader, device, cluster_mapping=None, epoch=0, use_wandb=False):
+
+
+    def evaluate_odc(self, dataloader, device, cluster_mapping=None, epoch=0, use_wandb=True):
         """ODC 모델을 평가합니다."""
         self.eval()
         all_features = []
@@ -1071,7 +1070,7 @@ class ClusteringModel(nn.Module):
                     })
             
             # 시각화 (선택적)
-            if epoch % 5 == 0:
+            if epoch % 2 == 0:
                 # 프로토타입 가져오기
                 prototypes = self.odc_manager.centroids.detach().cpu().numpy()
                 
