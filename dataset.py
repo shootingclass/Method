@@ -270,7 +270,7 @@ class VideoSensorDataset(Dataset):
         # IMU CSV 로드
         df = pd.read_csv(sensor_path)
 
-        selected_indices = np.r_[134:231]
+        selected_indices = np.r_[194:231]
 
         # .iloc를 사용하여 해당 위치의 컬럼들을 선택합니다.
         selected_df = df.iloc[:, selected_indices].copy() # SettingWithCopyWarning 방지를 위해 .copy()

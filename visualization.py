@@ -13,7 +13,7 @@ from sklearn.manifold import TSNE
 #################################################################
 
 
-START_INDEX = 134
+START_INDEX = 134+60
 END_INDEX = 231
 
 ACTION_MERGE_LABELS = {
@@ -462,3 +462,15 @@ def get_sensor_name(sensor_index):
     
     except Exception as e:
         return f"Error reading sensor name: {str(e)}"
+
+def visualize_sensor_name(top_indices, labels, id):
+    for i in range(top_indices.shape[0]): # 배치 크기만큼 반복
+        label = labels[i]
+        # Top-K 인덱스들을 순회
+        if id is not None:
+            print(f"batch {i} id: {id[i]}")
+            print(f"batch {i} label: {ACTION_MERGE_LABELS[label.item()]}")
+            for index_tensor in top_indices[i]:
+                index_val = index_tensor.item()
+                sensor_name = get_sensor_name(index_val + START_INDEX + 1)
+                print(f"  - Index: {index_val}, Name: {sensor_name}, {ACTION_MERGE_LABELS[label.item()]}")

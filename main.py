@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
+import wandb
 
 # --- 사용자 정의 모듈 임포트 ---
 from datamodule import MethodDataModule
@@ -55,8 +56,9 @@ def main(args):
     # 2. 라이트닝 모듈 초기화
     model = MethodLightningModule(args, datamodule.train_dataloader)
 
-    # 3. 로거 설정
+    # 3. 로거 및 wandb 설정
     wandb_logger = WandbLogger(project="Method_Test_Lightning", name="Test1")
+    wandb.init(project="Method_Test_Lightning", name="Test1")
 
     # 4. 트레이너 설정 및 학습 시작
     trainer = pl.Trainer(
@@ -82,7 +84,7 @@ if __name__ == '__main__':
     # 경로 인자
     parser.add_argument("--data_root", type=str, default="/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/", help="Root directory of the dataset")
     parser.add_argument("--json_train_path", type=str, default="/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject/pretrain.json", help="Path to the training JSON file")
-    parser.add_argument("--stats_file_path", type=str, default='/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats.npy', help="Path to the sensor stats file")
+    parser.add_argument("--stats_file_path", type=str, default='/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy', help="Path to the sensor stats file")
     parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
     
     # 학습 인자    
@@ -94,7 +96,7 @@ if __name__ == '__main__':
     parser.add_argument("--embedding_dim", type=int, default=256)
     parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--alpha_fixed", type=bool, default=True)
-    parser.add_argument("--num_sensors", type=int, default=97)
+    parser.add_argument("--num_sensors", type=int, default=37)
     parser.add_argument("--threshold_epoch", type=int, default=9)
     
     args = parser.parse_args()
