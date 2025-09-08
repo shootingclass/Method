@@ -252,6 +252,7 @@ class LocalisationNetwork(nn.Module):
     """
     def __init__(self, input_channels: int, patch_grid_size: int):
         super().__init__()
+        
         # F_A를 처리하기 위한 CNN 구조
         self.cnn = nn.Sequential(
             nn.Conv2d(input_channels, 128, kernel_size=3, padding=1),
@@ -271,7 +272,6 @@ class LocalisationNetwork(nn.Module):
         self.regressor = nn.Linear(flattened_size, 6)
 
         # 학습 안정성을 위해 항등 변환(identity transform)으로 초기화
-        self.regressor.weight.data.zero_()
         self.regressor.bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
 
     def forward(self, features_2d: torch.Tensor) -> torch.Tensor:
@@ -297,7 +297,7 @@ class AttentionBridge(nn.Module):
     (수정 버전: 시간 축으로 평균화된 대표 특징을 사용하여 클립 전체에 적용될 단일 변환 행렬을 계산)
     """
 
-    def __init__(self, input_hidden_size: int, patch_grid_size: int, target_size: tuple = (112, 112)):
+    def __init__(self, input_hidden_size: int, patch_grid_size: int, target_size: tuple = (96, 96)):
         super().__init__()
         self.localisation_net = LocalisationNetwork(input_hidden_size, patch_grid_size)
         self.target_size = target_size # V'의 목표 해상도 (H_t, W_t)
@@ -573,14 +573,11 @@ class MotionEncoder(nn.Module):
 
 
 class VisionModel(nn.Module):
-    """
-    (수정 최종 버전) 특징 추출, Attention Bridge, 그리고 Appearance/Motion 인코딩을 모두 포함하는 통합 모델.
-    """
-    def __init__(self, image_size: int, target_size: tuple = (112, 112)):
+    def __init__(self, image_size: int, target_size: tuple = (96, 96)):
         super().__init__()
 
         # --- 1단계: 특징 추출 및 ROI 지역화 ---
-        self.feature_extractor = Clip4ClipVisionModel()
+        self.feature_extractor = Clip4ClipVisionModel() 
         hidden_size = self.feature_extractor.video_model.config.hidden_size  # e.g., 384
 
         patch_size = self.feature_extractor.video_model.config.patch_size
@@ -596,7 +593,7 @@ class VisionModel(nn.Module):
         # 인코더들의 채널 크기를 정의합니다.
         encoder_mid_channels = 512
         appearance_out_channels = 256
-        motion_out_channels = 256  # RNN의 입력 크기가 됩니다.
+        motion_out_channels = 256 # RNN의 입력 크기가 됩니다.
         motion_rnn_hidden_size = 256
 
         self.appearance_encoder = AppearanceEncoder(
@@ -631,12 +628,16 @@ class VisionModel(nn.Module):
         # --- 최종 출력 통합 ---
         final_output = {
             "v_appearance": v_appearance,
-            "v_motion": v_motion
+            "v_motion": v_motion,
+            "transformed_features": transformed_features,
+            "final_features": final_features
         }
 
         return final_output
 
+
 #################################################################
+
 
 # --- 3. ODC 메모리 뱅크 관리자 ---
 class ClusteringManager(nn.Module):
@@ -809,20 +810,25 @@ class ClusteringManager(nn.Module):
         self.cluster_size[empty_idx] = sub_counts[1]
         
         print(f"Redistributed cluster: Split cluster {largest_idx} ({sub_counts[0]} samples) "
-              f"and reassigned {sub_counts[1]} samples to empty cluster {empty_idx}")
-              
+            f"and reassigned {sub_counts[1]} samples to empty cluster {empty_idx}")
+            
         # 만약 재분배 후에도 여전히 작은 클러스터가 있다면 로그로 알리기
         if min(sub_counts) < self.min_cluster_size:
             print(f"Warning: After redistribution, one of the clusters still has fewer than {self.min_cluster_size} samples ({min(sub_counts)}).")
-              
+            
         # 메모리 뱅크 업데이트 필요 (외부에서 처리)
         
         return True
+
+
+#################################################################
+
 
 # --- 4. ODC 모델 ---
 class ClusteringModel(nn.Module):
     def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, train_dataloader):
         super().__init__()
+        
         # 딥러닝 백본 선택
         self.encoder = encoder
             

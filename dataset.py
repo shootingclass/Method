@@ -108,7 +108,7 @@ class ClipConsistentTransforms:
     def __call__(self, clip):
         
         # 1. 클립 전체에 대한 랜덤 파라미터 1회 생성
-        apply_flip = random.random() < 0.5
+        # apply_flip = random.random() < 0.5
 
         jitter_params = T.ColorJitter.get_params(
             brightness=(0.6, 1.4), contrast=(0.6, 1.4),
@@ -122,8 +122,8 @@ class ClipConsistentTransforms:
         for frame in clip:
             frame = T.Resize(self.size, antialias=True)(frame)
 
-            if apply_flip:
-                frame = TF.hflip(frame)
+            # if apply_flip:
+            #     frame = TF.hflip(frame)
             
             # --- 여기가 수정된 핵심 부분입니다 ---
             # 파라미터를 명확하게 unpacking
@@ -150,13 +150,6 @@ class ClipConsistentTransforms:
         # torch.stack의 dim 파라미터를 데이터 형태에 맞게 조정하세요.
         # 예: (T, C, H, W)를 원할 경우 dim=0
         clip_tensor = torch.stack(tensor_frames, dim=0)
-
-        if random.random() < 0.5:
-            erase_params = T.RandomErasing.get_params(
-                clip_tensor, scale=(0.1, 0.2), ratio=(0.3, 3.3), value=[0]
-            )
-            i, j, h, w, v = erase_params
-            clip_tensor = TF.erase(clip_tensor, i, j, h, w, v, inplace=False)
 
         # Normalize
         clip_tensor = TF.normalize(clip_tensor, mean=self.mean, std=self.std)

@@ -44,9 +44,6 @@ class DatasetEpochCallback(pl.Callback):
 ####################################################################
 
 
-torch.backends.cuda.preferred_linalg_library("magma") 
-
-
 def main(args):
     set_random_seed(42)
 
@@ -56,17 +53,19 @@ def main(args):
     # 2. 라이트닝 모듈 초기화
     model = MethodLightningModule(args, datamodule.train_dataloader)
 
-    # 3. 로거 및 wandb 설정
-    wandb_logger = WandbLogger(project="Method_Test_Lightning", name="Test1")
-    wandb.init(project="Method_Test_Lightning", name="Test1")
+    # 3. 로거 설정 (마스터 프로세스에서만!)
+    # LOCAL_RANK 환경 변수를 확인하여 rank 0 프로세스에서만 로거를 생성합니다.
+    # rank 0이 아닌 다른 프로세스에서는 logger를 False로 설정하여 로깅을 비활성화합니다.
+    is_master_process = os.environ.get("LOCAL_RANK", "0") == "0"
+    logger = WandbLogger(project="Method_Test_Lightning", name="Test1") if is_master_process else False
 
     # 4. 트레이너 설정 및 학습 시작
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator='gpu',
-        devices=[1, 2, 3],
+        devices=4,
         strategy='ddp_find_unused_parameters_true',
-        logger=wandb_logger,
+        logger=logger,  # 여기에 설정된 로거를 전달합니다.
         callbacks=[DatasetEpochCallback()]
     )
 
@@ -97,7 +96,7 @@ if __name__ == '__main__':
     parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--num_sensors", type=int, default=37)
-    parser.add_argument("--threshold_epoch", type=int, default=9)
+    parser.add_argument("--threshold_epoch", type=int, default=-1)
     
     args = parser.parse_args()
 
