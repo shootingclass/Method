@@ -58,12 +58,13 @@ def main(args):
     # rank 0이 아닌 다른 프로세스에서는 logger를 False로 설정하여 로깅을 비활성화합니다.
     is_master_process = os.environ.get("LOCAL_RANK", "0") == "0"
     logger = WandbLogger(project="Method_Test_Lightning", name="Test1") if is_master_process else False
+    wandb.init(project="Method_Test_Lightning", name="Test1") if is_master_process else None
 
     # 4. 트레이너 설정 및 학습 시작
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator='gpu',
-        devices=4,
+        # devices=4,
         strategy='ddp_find_unused_parameters_true',
         logger=logger,  # 여기에 설정된 로거를 전달합니다.
         callbacks=[DatasetEpochCallback()]
@@ -79,11 +80,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Method Test with PyTorch Lightning")
-
     # 경로 인자
-    parser.add_argument("--data_root", type=str, default="/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/", help="Root directory of the dataset")
-    parser.add_argument("--json_train_path", type=str, default="/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject/pretrain.json", help="Path to the training JSON file")
-    parser.add_argument("--stats_file_path", type=str, default='/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy', help="Path to the sensor stats file")
+    parser.add_argument("--dataset_name", type=str, default="Opportunity++", help="Dataset name")
     parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
     
     # 학습 인자    
@@ -93,10 +91,8 @@ if __name__ == '__main__':
     parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--embedding_dim", type=int, default=256)
-    parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--alpha_fixed", type=bool, default=True)
-    parser.add_argument("--num_sensors", type=int, default=37)
-    parser.add_argument("--threshold_epoch", type=int, default=-1)
+    parser.add_argument("--threshold_epoch", type=int, default=9)
     
     args = parser.parse_args()
 

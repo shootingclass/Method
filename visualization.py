@@ -15,21 +15,34 @@ from sklearn.manifold import TSNE
 
 START_INDEX = 134+60
 END_INDEX = 231
+# START_INDEX = 1
+# END_INDEX = 11
+
+# ACTION_MERGE_LABELS = {
+#         0: 'Door 1',
+#         1: 'Door 2',
+#         2: 'Fridge',
+#         3: 'Dishwasher',
+#         4: 'Drawer 1',
+#         5: 'Drawer 2',
+#         6: 'Drawer 3',
+#         7: 'Clean Table',
+#         8: 'Drink from Cup',
+#         9: 'Toggle Switch'
+#     }
+
 
 ACTION_MERGE_LABELS = {
-        0: 'Door 1',
-        1: 'Door 2',
-        2: 'Fridge',
-        3: 'Dishwasher',
-        4: 'Drawer 1',
-        5: 'Drawer 2',
-        6: 'Drawer 3',
-        7: 'Clean Table',
-        8: 'Drink from Cup',
-        9: 'Toggle Switch'
-    }
-
-
+    0: "Ktch_Motion_1",
+    1: "None Behavior",
+    2: "Ktch_T1_Cupboard",
+    3: "Ktch_B4_Cupboard",
+    4: "Ktch_T3_Cupboard",
+    5: "Ktch_T2_Cupboard",
+    6: "TP_L_Power",
+    7: "Ktch_Motion_2",
+    8: "Ktch_B1_Draw", 
+}
 #################################################################
 
 
@@ -430,6 +443,7 @@ def get_sensor_name(sensor_index):
     """
     # 파일 경로 설정
     column_names_path = "/mnt/hdd4tb/junho/Opportunity++/data/column_names.txt"
+    # column_names_path = "/home/jaemo/dataset_hwu_usp/extracted/hwu_usp_dataset/HWU-USP_v2/column_names.txt"
     
     try:
         # 파일이 존재하는지 확인

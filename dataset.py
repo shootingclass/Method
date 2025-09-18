@@ -161,7 +161,7 @@ class ClipConsistentTransforms:
 
 
 class VideoSensorDataset(Dataset):
-    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch):
+    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index):
         super().__init__()
         
         self.data_root = data_root
@@ -170,6 +170,8 @@ class VideoSensorDataset(Dataset):
         self.sensor_transform = sensor_transform
         self.current_epoch = 0
         self.threshold_epoch = threshold_epoch
+        self.start_index = start_index
+        self.end_index = end_index
         self.samples = []
 
         # 1. JSON 파일을 읽어 (비디오 전체 경로, 레이블) 리스트 생성
@@ -180,7 +182,7 @@ class VideoSensorDataset(Dataset):
 
             # JSON에 있는 상대 경로와 데이터 루트 경로를 조합하여 전체 경로 생성
             relative_path_video = item['frame_path']
-            relative_path_sensor = item['imu_path']
+            relative_path_sensor = item['sensor_path']
             
             video_path = os.path.join(self.data_root, relative_path_video)
             sensor_path = os.path.join(self.data_root, relative_path_sensor)
@@ -194,7 +196,8 @@ class VideoSensorDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        video_path, sensor_path, label, item_id = self.samples[idx]
+        video_path, sensor_path, label, _ = self.samples[idx]
+        item_id = idx
         
         ######### 비디오 전처리 #########       
         if self.current_epoch < self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
@@ -263,7 +266,7 @@ class VideoSensorDataset(Dataset):
         # IMU CSV 로드
         df = pd.read_csv(sensor_path)
 
-        selected_indices = np.r_[194:231]
+        selected_indices = np.r_[self.start_index:self.end_index+1]
 
         # .iloc를 사용하여 해당 위치의 컬럼들을 선택합니다.
         selected_df = df.iloc[:, selected_indices].copy() # SettingWithCopyWarning 방지를 위해 .copy()

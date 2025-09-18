@@ -16,9 +16,9 @@ from utils import (
 class MethodDataModule(pl.LightningDataModule):
     def __init__(self, args):
         super().__init__()
-        
-        self.args = args
-        self.save_hyperparameters(args)
+
+        self.args = self.set_dataset_params(args)
+        self.save_hyperparameters(self.args)
         
         # 프레임 전처리(Transform) 정의
         clip_mean = [0.48145466, 0.4578275, 0.40821073]
@@ -29,6 +29,23 @@ class MethodDataModule(pl.LightningDataModule):
             mean=clip_mean,
             std=clip_std
         )
+    
+    def set_dataset_params(self, args):
+        if args.dataset_name == "Opportunity++":
+            args.data_root = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
+            args.json_train_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject/pretrain.json"
+            args.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
+            args.start_index = 194
+            args.end_index = 230
+        elif args.dataset_name == "HWU-USP":
+            args.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
+            args.json_train_path = "/mnt/hdd4tb/junho/HWU-USP_v2/pretrain.json"
+            args.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_11.npy"
+            args.start_index = 1
+            args.end_index = 11
+        else:
+            raise ValueError(f"Invalid dataset name: {args.dataset_name}")
+        return args
 
     # 이 메서드는 단일 프로세스에서만 실행됩니다.
     # 파일 다운로드나 데이터 전처리 등 한 번만 수행해야 할 작업을 여기에 둡니다.
@@ -41,7 +58,10 @@ class MethodDataModule(pl.LightningDataModule):
                 data_root=self.hparams.data_root,
                 num_frames=self.hparams.num_frames,
                 transform=self.train_transform,
-                sensor_transform=None
+                sensor_transform=None,
+                threshold_epoch=self.hparams.threshold_epoch,
+                start_index=self.args.start_index,
+                end_index=self.args.end_index
             )
             stats = calculate_sensor_stats(temp_dataset)
             save_stats(stats, self.hparams.stats_file_path)
@@ -59,7 +79,9 @@ class MethodDataModule(pl.LightningDataModule):
                 num_frames=self.hparams.num_frames,
                 transform=self.train_transform,
                 sensor_transform=sensor_preprocessor,
-                threshold_epoch=self.hparams.threshold_epoch
+                threshold_epoch=self.hparams.threshold_epoch,
+                start_index=self.args.start_index,
+                end_index=self.args.end_index
             )
             print(f"Train dataset size: {len(self.train_dataset)}")
 

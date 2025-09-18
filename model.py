@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,6 +9,7 @@ import matplotlib.pyplot as plt
 from transformers import CLIPVisionModelWithProjection, AutoModel
 from peft import LoraConfig, get_peft_model
 from einops import repeat
+import torch.distributed as dist
 
 from visualization import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX
 from utils import compute_hungarian_matching
@@ -121,6 +123,92 @@ class SensorModel(nn.Module):
         out = {"emb": hidden[-1]} # -> (B, feature_dim)
         return out
     
+# # 1. 채널 어텐션 (Squeeze-and-Excitation) 블록 정의
+# # 이 부분은 수정 없이 그대로 사용합니다.
+# class SEBlock(nn.Module):
+#     """
+#     Squeeze-and-Excitation 블록으로, 채널별 중요도를 동적으로 학습합니다.
+#     """
+#     def __init__(self, num_channels, reduction_ratio=16):
+#         super(SEBlock, self).__init__()
+#         # Squeeze 과정: 글로벌 정보를 요약
+#         self.squeeze = nn.AdaptiveAvgPool1d(1)
+#         # Excitation 과정: 어떤 채널이 중요한지 학습
+#         self.excitation = nn.Sequential(
+#             nn.Linear(num_channels, num_channels // reduction_ratio, bias=False),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(num_channels // reduction_ratio, num_channels, bias=False),
+#             nn.Sigmoid()
+#         )
+
+#     def forward(self, x):
+#         batch_size, channels, _ = x.shape
+#         # Squeeze를 통해 (batch, channels, 1) -> (batch, channels)로 변환
+#         y = self.squeeze(x).view(batch_size, channels)
+#         # Excitation을 통해 채널별 중요도(가중치) 계산
+#         y = self.excitation(y).view(batch_size, channels, 1)
+#         # 원래의 입력(x)에 중요도를 곱하여 스케일 조정 (Rescale)
+#         return x * y.expand_as(x)
+
+# # 2. 양방향 풀링이 적용된 최종 센서 인코더
+# class SensorModel(nn.Module):
+#     """
+#     순간적인 행동(positive & negative peaks)을 포착하기 위해 
+#     양방향 풀링(Bi-directional Pooling)과 채널 어텐션을 사용하는 센서 인코더.
+#     """
+#     def __init__(self, sensor_channels, size_embeddings=128):
+#         super(SensorModel, self).__init__()
+        
+#         # 1D CNN 레이어
+#         self.conv1 = nn.Conv1d(in_channels=sensor_channels, out_channels=64, kernel_size=3, padding=1)
+#         self.bn1 = nn.BatchNorm1d(64)
+#         self.conv2 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+#         self.bn2 = nn.BatchNorm1d(128)
+
+#         # 채널 어텐션 블록
+#         self.se_block = SEBlock(num_channels=128)
+        
+#         # Max Pooling 레이어 (양방향 풀링에 공통으로 사용)
+#         self.temporal_pool = nn.AdaptiveMaxPool1d(1)
+        
+#         # 최종 임베딩을 위한 MLP
+#         # --- 수정된 부분 --- #
+#         # 양방향 풀링으로 max와 min 특징이 결합되므로, 입력 차원이 2배가 됨 (128 -> 256)
+#         self.fc = nn.Sequential(
+#             nn.Linear(128 * 2, 128), # 입력 차원 수정
+#             nn.ReLU(inplace=True),
+#             nn.Linear(128, size_embeddings)
+#         )
+
+#     def forward(self, x):
+#         # 입력 데이터 shape: (batch_size, num_channels, sequence_length)
+        
+#         # CNN으로 특징 추출
+#         x = F.relu(self.bn1(self.conv1(x)))
+#         features = F.relu(self.bn2(self.conv2(x)))
+        
+#         # 채널 어텐션 적용
+#         features = self.se_block(features)
+        
+#         # --- 양방향 풀링 (Bi-directional Pooling) --- #
+#         # 1. 양의 방향으로 가장 큰 순간 포착
+#         max_pool_features = self.temporal_pool(features) 
+        
+#         # 2. 음의 방향으로 가장 큰 순간 포착 (min pooling 효과)
+#         # features에 -를 붙여서 max_pool을 하면 가장 작은 값을 찾는 효과
+#         min_pool_features = self.temporal_pool(-features)
+        
+#         # 3. 두 특징을 채널 차원에서 결합 (concatenate)
+#         # 결합 전에 min_pool_features에 다시 -를 붙여 원래 값으로 복원
+#         pooled_features = torch.cat([max_pool_features, -min_pool_features], dim=1)
+        
+#         # Flatten
+#         pooled_features = pooled_features.view(pooled_features.size(0), -1) 
+        
+#         # MLP로 최종 임베딩 생성
+#         embedding = self.fc(pooled_features)
+        
+#         return {"emb": embedding}
 
 #################################################################
 
@@ -639,15 +727,23 @@ class VisionModel(nn.Module):
 #################################################################
 
 
-# --- 3. ODC 메모리 뱅크 관리자 ---
+# --- 3. 메모리 뱅크 관리자 ---
 class ClusteringManager(nn.Module):
-    def __init__(self, num_clusters, feature_dim, momentum=0.01, temperature=0.1, device='cuda'):
+    def __init__(self, num_clusters, feature_dim, momentum=0.01, temperature=0.1, device='cuda', local_rank=0):
         super().__init__()
         self.num_clusters = num_clusters
         self.feature_dim = feature_dim
         self.momentum = momentum
         self.temperature = temperature
         self.device = device
+        self.local_rank = local_rank
+
+        if self.local_rank == 0:
+            # key: sample_id, value: feature
+            self.feature_bank = torch.zeros((10000, feature_dim),
+                                            dtype=torch.float32)
+            # key: sample_id, value: cluster_id
+            self.label_bank = None
         
         # 클러스터 중심점(centroids) 초기화 - 더 넓게 분포되도록 초기화
         # 각 차원마다 균등 분포를 사용하여 더 잘 분산되도록 함
@@ -662,16 +758,6 @@ class ClusteringManager(nn.Module):
             q, r = torch.linalg.qr(centroids.t())  # 직교 행렬 Q 얻기
             centroids = q[:, :num_clusters].t()  # 직교 벡터로 중심점 설정
         self.register_buffer('centroids', centroids)
-        # 클러스터 할당 히스토리
-        self.cluster_size = torch.zeros(num_clusters, device=device)
-        
-        # Pseudo label 메모리 뱅크 (ODC 논문과 유사하게 중앙화된 방식으로 관리)
-        self.memory_bank = {}
-        # 각 샘플을 고유하게 식별할 수 있는 ID를 저장하기 위한 딕셔너리
-        # key: sample_id, value: pseudo_label
-        
-        # 전체 데이터셋에 대한 특징 메모리 뱅크 (샘플 ID -> 특징 벡터)
-        self.feature_bank = {}
         
         # 메모리 뱅크 초기화 여부를 추적
         self.memory_initialized = False
@@ -683,31 +769,250 @@ class ClusteringManager(nn.Module):
         self.min_cluster_size = 10  # 이 값보다 작으면 비어있다고 간주
         
         # 가중치 계산을 위한 상수
-        self.class_weight_power = 1.0  # 클러스터 크기에 적용할 거듭제곱
+        self.class_weight_power = 0.5  # 클러스터 크기에 적용할 거듭제곱
 
         self.mapping = None
-        
+
+        self.kmeans = KMeans(n_clusters=num_clusters, n_init='auto', random_state=42)
+        # 전체 데이터셋의 pseudo label을 계산하고 메모리 뱅크에 저장하는 함수
+
     @torch.no_grad()
-    def update_centroids_with_momentum(self, features, cluster_ids):
-        """모멘텀 방식으로 중심점만 업데이트합니다.
-        클러스터 크기는 update_memory_bank에서 전체 데이터셋을 기준으로 계산됩니다."""
-        for k in range(self.num_clusters):
-            # 현재 클러스터에 할당된 특징들 선택
-            mask = (cluster_ids == k)
-            cluster_samples = mask.sum()
+    def _compute_centroids_idx(self, cinds):
+        """Compute a few centroids."""
+        assert self.local_rank == 0
+        num = len(cinds)
+        centroids = torch.zeros((num, self.feature_dim), dtype=torch.float32)
+        for i, c in enumerate(cinds):
+            idx = np.where(self.label_bank.numpy() == c)[0]
+            centroids[i, :] = self.feature_bank[idx, :].mean(dim=0)
+        return centroids
+
+    def _compute_centroids(self):
+        """Compute all non-empty centroids."""
+        assert self.local_rank == 0
+        label_bank_np = self.label_bank.numpy()
+        argl = np.argsort(label_bank_np)
+        sortl = label_bank_np[argl]
+        diff_pos = np.where(sortl[1:] - sortl[:-1] != 0)[0] + 1
+        start = np.insert(diff_pos, 0, 0)
+        end = np.insert(diff_pos, len(diff_pos), len(label_bank_np))
+        class_start = sortl[start]
+        # keep empty class centroids unchanged
+        centroids = self.centroids.cpu().clone()
+        for i, st, ed in zip(class_start, start, end):
+            centroids[i, :] = self.feature_bank[argl[st:ed], :].mean(dim=0)
+        return centroids
+
+    def _gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather tensors from all replicas into a single tensor."""
+        # 현재 분산 그룹의 GPU 개수를 가져옵니다.
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return tensor
+
+        # 입력 텐서가 반드시 GPU에 있도록 보장합니다.
+        tensor = tensor.cuda()
+
+        # 1. 최종적으로 모일 전체 텐서의 크기를 계산하고, '같은 device'에 빈 텐서를 생성합니다.
+        shape = (world_size * tensor.shape[0], *tensor.shape[1:])
+        gathered_tensor = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
+        
+        # 2. all_gather_into_tensor를 호출하여 빈 텐서를 채웁니다.
+        dist.all_gather_into_tensor(gathered_tensor, tensor)
+        
+        return gathered_tensor
+
+    def update_samples_memory(self, idx: torch.Tensor,
+                              feature: torch.Tensor):
+        """Update samples memory."""
+        assert self.initialized
+        feature_norm = feature / (feature.norm(dim=1).view(-1, 1) + 1e-10
+                                  )  # normalize
+
+        idx = self._gather(idx)
+        feature_norm = self._gather(feature_norm)
+        
+        idx = idx.cpu()
+        if self.local_rank == 0:
+            feature_old = self.feature_bank[idx, ...].cuda()
+            feature_new = (1 - self.momentum) * feature_old + \
+                self.momentum * feature_norm
+            feature_norm = feature_new / (
+                feature_new.norm(dim=1).view(-1, 1) + 1e-10)
+            self.feature_bank[idx, ...] = feature_norm.cpu()
+        dist.barrier()
+        dist.broadcast(feature_norm, 0)
+        # compute new labels
+        # similarity_to_centroids = self.compute_similarity_scores(feature_norm.permute(1, 0))
+        feature_norm = feature_norm.permute(1, 0)
+        centroids_norm = F.normalize(self.centroids, dim=1)
+        similarity_to_centroids = torch.mm(centroids_norm,
+                                           feature_norm)  # CxN
+        newlabel = similarity_to_centroids.argmax(dim=0)  # cuda tensor
+        newlabel_cpu = newlabel.cpu()
+        change_ratio = (newlabel_cpu != self.label_bank[idx]
+                        ).sum().float().cuda() / float(newlabel_cpu.shape[0])
+        self.label_bank[idx] = newlabel_cpu.clone()  # copy to cpu
+        print("update_samples_memory", change_ratio)
+        return change_ratio
+
+    @torch.no_grad()
+    def update_centroids_memory(self, cinds = None):
+        """Update centroids memory."""
+        if self.local_rank == 0:
+            if cinds is None:
+                center = self._compute_centroids()
+                self.centroids.copy_(center)
+            else:
+                center = self._compute_centroids_idx(cinds)
+                self.centroids[
+                    torch.LongTensor(cinds).cuda(), :] = center.cuda()
+        dist.broadcast(self.centroids, 0)
+
+        print("update_centroids_memory", self.centroids.shape)
+
+    @torch.no_grad()
+    def deal_with_small_clusters(self):
+        """
+        Gather all label_banks, perform clustering logic on rank 0,
+        and return the updated centroids.
+        """
+        # 1. 모든 GPU의 label_bank를 rank 0으로 모읍니다.
+        #    _gather 함수는 모든 GPU에서 호출되어야 합니다.
+        global_label_bank = self._gather(self.label_bank)
+
+        # 2. Rank 0 에서만 모든 계산을 수행합니다.
+        if self.local_rank == 0:
+            # 글로벌 데이터를 기준으로 small_clusters를 안전하게 계산
+            global_histogram = np.bincount(
+                global_label_bank.cpu().numpy(), minlength=self.num_clusters)
+            small_clusters = np.where(global_histogram < self.min_cluster_size)[0].tolist()
+
+            if len(small_clusters) == 0:
+                # 변경 사항이 없으면 현재 centroids를 그대로 반환
+                return self.centroids
+
+            print(f'[Rank 0] Dealing with {len(small_clusters)} small clusters.')
+
+            # 재할당 로직 수행 (모든 데이터가 Rank 0에 있으므로 동기화 불필요)
+            for s in small_clusters:
+                idx = np.where(global_label_bank.cpu().numpy() == s)[0]
+                if len(idx) == 0:
+                    continue
+                
+                # feature_bank도 모든 GPU에 걸쳐 동일한 복사본이 있어야 합니다.
+                # (만약 아니라면 feature_bank도 gather가 필요합니다)
+                inclusion = np.setdiff1d(np.arange(self.num_clusters), np.array(small_clusters), assume_unique=True)
+                inclusion_tensor = torch.from_numpy(inclusion).cuda()
+
+                # feature_bank에서 idx에 해당하는 부분만 가져와야 합니다.
+                # feature_bank가 분산되어 있다면, 이 부분도 수정이 필요합니다.
+                # 여기서는 self.feature_bank가 모든 GPU에 복제되어 있다고 가정합니다.
+                gathered_features = self._gather(self.feature_bank) # 예시: feature_bank도 gather
+
+                target_idx = torch.mm(
+                    self.centroids[inclusion_tensor, :],
+                    gathered_features[idx, :].cuda().permute(1, 0)
+                ).argmax(dim=0)
+                
+                target = inclusion_tensor[target_idx]
+                global_label_bank[idx] = target.cpu()
+
+            # 모든 재할당 후, Rank 0에서 최종 centroids 계산
+            # (이 로직은 _compute_centroids 같은 함수를 호출해야 할 수 있습니다)
+            final_center = self._compute_centroids(global_label_bank, gathered_features) # 예시
+            self.centroids.copy_(final_center)
+        dist.broadcast(self.centroids, 0)
+        # 3. Rank 0은 계산된 centroids를 반환, 나머지는 현재 자신의 centroids를 반환
+        return self.centroids
+
+    @torch.no_grad()
+    def _partition_max_cluster(
+            self, max_cluster: np.ndarray):
+        """Partition the largest cluster into two sub-clusters."""
+        assert self.local_rank == 0
+        max_cluster_idx = np.where(self.label_bank == max_cluster)[0]
+
+        assert len(max_cluster_idx) >= 2
+        max_cluster_features = self.feature_bank[max_cluster_idx, :]
+        if np.any(np.isnan(max_cluster_features.numpy())):
+            raise Exception('Has nan in features.')
+        kmeans_ret = self.kmeans.fit(max_cluster_features)
+        sub_cluster1_idx = max_cluster_idx[kmeans_ret.labels_ == 0]
+        sub_cluster2_idx = max_cluster_idx[kmeans_ret.labels_ == 1]
+        if not (len(sub_cluster1_idx) > 0 and len(sub_cluster2_idx) > 0):
+            print(
+                'Warning: kmeans partition fails, resort to random partition.')
+            sub_cluster1_idx = np.random.choice(
+                max_cluster_idx, len(max_cluster_idx) // 2, replace=False)
+            sub_cluster2_idx = np.setdiff1d(
+                max_cluster_idx, sub_cluster1_idx, assume_unique=True)
+        return sub_cluster1_idx, sub_cluster2_idx
+
+    @torch.no_grad()
+    def _redirect_empty_clusters(self, empty_clusters: np.ndarray):
+        """Re-direct empty clusters."""
+        print("empty_clusters", empty_clusters)
+        for e in empty_clusters:
+            assert (self.label_bank != e).all().item(), \
+                f'Cluster #{e} is not an empty cluster.'
             
-            if cluster_samples > 0:
-                # 현재 클러스터에 할당된 특징들의 평균
-                new_centroid = features[mask].mean(dim=0)
-                # new_centroid, _ = torch.median(features[mask], dim=0)
-                # 중심점만 모멘텀으로 업데이트
-                self.centroids[k] = self.momentum * self.centroids[k] + (1 - self.momentum) * new_centroid
-                # print("new_centroid", new_centroid)
-                # print("self.centroids[k]", self.centroids[k])
-                # 정규화는 한 번만 수행 (중요: 정규화는 특징 차원을 따라 dim=0이 아니라 dim=-1 사용)
-                # self.centroids[k] = F.normalize(self.centroids[k], dim=-1)
-        # print("centroids updated", self.centroids)
-        # 참고: 클러스터 크기(self.cluster_size)는 update_memory_bank에서 전체 데이터셋을 기준으로 계산됨
+            # 1. 마스터에서만 max_cluster를 계산
+            if self.local_rank == 0:
+                max_cluster_val = np.bincount(
+                    self.label_bank, minlength=self.num_clusters).argmax().item()
+                # 값을 담을 텐서 생성
+                max_cluster_tensor = torch.tensor([max_cluster_val], dtype=torch.int64).cuda()
+            else:
+                # 다른 프로세스들은 값을 받을 빈 텐서 생성
+                max_cluster_tensor = torch.zeros(1, dtype=torch.int64).cuda()
+            
+            # 2. 모든 프로세스에 max_cluster 값을 broadcast
+            dist.broadcast(max_cluster_tensor, 0)
+            
+            # 3. 이제 모든 프로세스가 동일한 max_cluster 값을 가짐
+            max_cluster = max_cluster_tensor.item()
+            # gather partitioning indices
+            if self.local_rank == 0:
+                sub_cluster1_idx, sub_cluster2_idx = \
+                    self._partition_max_cluster(max_cluster)
+                if len(sub_cluster1_idx) == 0 or len(sub_cluster2_idx) == 0:
+                    print(f"Warning: empty partition at cluster {max_cluster}")
+                    continue
+                size1 = torch.LongTensor([len(sub_cluster1_idx)]).cuda()
+                size2 = torch.LongTensor([len(sub_cluster2_idx)]).cuda()
+                sub_cluster1_idx_tensor = torch.from_numpy(
+                    sub_cluster1_idx).long().cuda()
+                sub_cluster2_idx_tensor = torch.from_numpy(
+                    sub_cluster2_idx).long().cuda()
+            else:
+                size1 = torch.LongTensor([0]).cuda()
+                size2 = torch.LongTensor([0]).cuda()
+            print("all_reduce ", self.local_rank)
+            dist.all_reduce(size1)
+            print("get reduce 1")
+            dist.all_reduce(size2)
+            print("get sizes", size1, size2)
+            if self.local_rank != 0:
+                sub_cluster1_idx_tensor = torch.zeros(
+                    (size1.item(), ), dtype=torch.int64).cuda()
+                sub_cluster2_idx_tensor = torch.zeros(
+                    (size2.item(), ), dtype=torch.int64).cuda()
+            dist.broadcast(sub_cluster1_idx_tensor, 0)
+            dist.broadcast(sub_cluster2_idx_tensor, 0)
+
+            if self.local_rank != 0:
+                sub_cluster1_idx = sub_cluster1_idx_tensor.cpu().numpy()
+                sub_cluster2_idx = sub_cluster2_idx_tensor.cpu().numpy()
+                print(f"[Rank {self.local_rank}] e={e}, max_cluster={max_cluster}, "\
+                f"sub1={len(sub_cluster1_idx)}, sub2={len(sub_cluster2_idx)}")
+
+            # reassign samples in partition #2 to the empty class
+            self.label_bank[sub_cluster2_idx] = e
+            # update centroids of max_cluster and e
+            self.update_centroids_memory([max_cluster, e])
+            print("_redirect_empty_clusters", max_cluster, e)
+
 
     def compute_similarity_scores(self, features):
         """특징과 중심점 간의 유사도 점수를 계산합니다."""
@@ -719,10 +1024,14 @@ class ClusteringManager(nn.Module):
         # 온도 파라미터 적용
         return similarity / self.temperature
         
+    @torch.no_grad()
     def compute_class_weights(self):
         """클러스터 크기에 근거한 클래스 가중치를 계산합니다."""
         # 클러스터 크기가 0인 경우를 방지하기 위한 정규화
-        normalized_sizes = self.cluster_size + 1e-8
+        histogram = np.bincount(
+            self.label_bank.numpy(), minlength=self.num_clusters)
+        cluster_size = torch.tensor(histogram, device=self.centroids.device)
+        normalized_sizes = cluster_size + 1e-8
         
         # 클러스터 크기의 그대로의 역수를 가중치로 사용
         # 더 강한 가중치를 적용하기 위해 거듭제곱을 높임
@@ -738,249 +1047,135 @@ class ClusteringManager(nn.Module):
         
         # 가중치 정규화 (0~1 범위 밖으로 팬는 것 방지)
         weights = weights / weights.sum() * self.num_clusters
-        
         return weights
-        
-    def get_largest_cluster(self):
-        """가장 큰 클러스터와 그 크기를 반환합니다.
-        최소 샘플 개수를 보장하여 실질적으로 분할 가능한 클러스터를 반환합니다."""
-        # 최소 샘플 수 기준 (최소 10개 이상은 있어야 분할 의미가 있음)
-        min_samples_for_split = 10
-        valid_clusters = torch.where(self.cluster_size >= min_samples_for_split)[0]
-        
-        if len(valid_clusters) == 0:
-            # 모든 클러스터가 작으면 그나마 가장 큰 것 반환
-            largest_idx = torch.argmax(self.cluster_size)
-        else:
-            # 충분히 큰 클러스터 중에서 가장 큰 것 선택
-            largest_idx = valid_clusters[torch.argmax(self.cluster_size[valid_clusters])]
-            
-        return largest_idx, self.cluster_size[largest_idx]
-        
-    def get_empty_clusters(self):
-        """빈 클러스터(임계값 미만)를 반환합니다."""
-        # 클러스터 크기가 임계값보다 작거나, 상대적으로 너무 작은 클러스터 찾기
-        avg_size = self.cluster_size.mean().item()
-        relative_threshold = avg_size * 0.2  # 평균의 20% 미만인 클러스터도 빈 것으로 간주
-        threshold = min(self.min_cluster_size, relative_threshold)
-        return torch.where(self.cluster_size < threshold)[0]
-        
-    def redistribute_cluster(self, empty_idx, largest_idx, features, labels):
-        """크기가 큰 클러스터를 분할하여 빈 클러스터를 재활용합니다."""
-        # 가장 큰 클러스터에 속한 샘플들을 찾기
-        largest_cluster_samples = (labels == largest_idx)
-        largest_cluster_features = features[largest_cluster_samples]
-        
-        # 실제 샘플 수 확인
-        sample_count = len(largest_cluster_features)
-        
-        # 최소 4개 이상의 샘플이 있어야 의미 있는 분할이 가능함
-        if sample_count < 4:
-            print(f"Warning: Largest cluster {largest_idx} has only {sample_count} samples. Cannot redistribute.")
-            return False
-            
-        # 클러스터 내에서 2개의 서브클러스터로 분할
-        # 최대한 다양한 분할을 위해 n_init 값을 높이고, random_state를 다르게 설정
-        try:
-            kmeans = KMeans(n_clusters=2, n_init=10, random_state=np.random.randint(0, 1000)).fit(largest_cluster_features.cpu().numpy())
-            sub_labels = torch.tensor(kmeans.labels_, device=self.device)
-            
-            # 재분배 결과 확인 (최소한 1개 이상의 샘플이 각 서브클러스터에 할당되었는지)
-            sub_counts = [(sub_labels == i).sum().item() for i in range(2)]
-            if min(sub_counts) < 1:
-                print(f"Warning: Subcluster division resulted in imbalanced clusters: {sub_counts}. Cannot redistribute.")
-                return False
-        except Exception as e:
-            print(f"Error during KMeans clustering: {e}. Cannot redistribute.")
-            return False
-        
-        # 서브클러스터 중심점 계산
-        sub_centroids = []
-        for i in range(2):
-            sub_centroid = largest_cluster_features[sub_labels == i].mean(dim=0)
-            # 정규화 시 dim=-1 사용
-            sub_centroids.append(F.normalize(sub_centroid, dim=-1))
-        
-        # 하나는 기존 클러스터로, 하나는 빈 클러스터로 할당
-        self.centroids[largest_idx] = sub_centroids[0]
-        self.centroids[empty_idx] = sub_centroids[1]
-        
-        # 클러스터 크기 업데이트 (위에서 이미 계산한 sub_counts 사용)
-        self.cluster_size[largest_idx] = sub_counts[0]
-        self.cluster_size[empty_idx] = sub_counts[1]
-        
-        print(f"Redistributed cluster: Split cluster {largest_idx} ({sub_counts[0]} samples) "
-            f"and reassigned {sub_counts[1]} samples to empty cluster {empty_idx}")
-            
-        # 만약 재분배 후에도 여전히 작은 클러스터가 있다면 로그로 알리기
-        if min(sub_counts) < self.min_cluster_size:
-            print(f"Warning: After redistribution, one of the clusters still has fewer than {self.min_cluster_size} samples ({min(sub_counts)}).")
-            
-        # 메모리 뱅크 업데이트 필요 (외부에서 처리)
-        
-        return True
 
-
-#################################################################
-
-
-# --- 4. ODC 모델 ---
+# --- 4. Clustering 모델 ---
 class ClusteringModel(nn.Module):
-    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, train_dataloader):
+    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, train_dataloader, top_k=1):
         super().__init__()
-        
         # 딥러닝 백본 선택
         self.encoder = encoder
-            
-        # ODC 관리자
-        self.clustering_manager = ClusteringManager(num_clusters=num_clusters, feature_dim=embedding_dim)
+        self.top_k = top_k
+        self.local_rank = os.environ.get("LOCAL_RANK", "0")
+        # Clustering 관리자
+        self.clustering_manager = ClusteringManager(num_clusters=num_clusters, feature_dim=embedding_dim, local_rank=self.local_rank)
         self.projection_layer = nn.Linear(num_sensors, embedding_dim)
         self.epoch = 0
         self.train_dataloader = train_dataloader
+        self.centroids_update_interval = 1
+        self.deal_with_small_clusters_interval = 1
+        self.cls_head = nn.Linear(embedding_dim, num_clusters)
+        self.attention_weight = nn.Parameter(torch.randn(num_sensors))
+
+    @torch.no_grad()
+    def init_prototypes_with_data(self, device, num_clusters):
+        """(수정된 버전) 텐서를 미리 할당하고, sample_ids를 이용해 채워 넣습니다."""
+        self.eval()
         
+        print("Pre-allocating tensor on GPU and collecting features...")
+
+        # 1. (가장 중요) 데이터셋에서 '전체 샘플 수'를 안정적으로 가져옵니다.
+        num_total_samples = len(self.train_dataloader().dataset)
+        
+        # 2. 이 크기에 맞춰 GPU에 빈 텐서를 '미리 할당'합니다.
+        all_features_gpu = torch.empty(num_total_samples, self.clustering_manager.feature_dim, device=device)
+        
+        # 일부 데이터만 사용하여 특징 추출
+        for i, (videos, sensors, labels, sample_ids) in enumerate(self.train_dataloader()):
+                
+            sensors = sensors.to(device)
+            # sample_ids도 반드시 GPU 텐서여야 합니다.
+            sample_ids = sample_ids.clone().to(dtype=torch.long, device=device)
+            
+            # 특징 추출 (GPU에서)
+            _, features = self(sensors, return_features=True)
+            representative_feature = self.get_representative_sensor_feature(sensors, labels, num_total_sensors=END_INDEX-START_INDEX+1, top_k=4, id=sample_ids)
+            representative_feature = self.projection_layer(representative_feature)
+            features += representative_feature
+
+            # 3. 'sample_ids'를 인덱스로 사용하여, 계산된 features를 올바른 위치에 직접 삽입합니다.
+            all_features_gpu[sample_ids, ...] = features
+
+        self.clustering_manager.feature_bank = all_features_gpu.cpu()
+        print("feature bank", self.clustering_manager.feature_bank.shape)
+
+        # --- 이후 KMeans 로직은 동일 ---
+        print("Moving features to CPU for KMeans...")
+        all_features_cpu_numpy = all_features_gpu.cpu().numpy()
+        
+        print(f"Running KMeans with {len(all_features_cpu_numpy)} samples on CPU...")
+        kmeans=self.clustering_manager.kmeans.fit(all_features_cpu_numpy)
+        
+        prototypes_gpu = torch.from_numpy(kmeans.cluster_centers_).to(device)
+        self.clustering_manager.centroids.copy_(F.normalize(prototypes_gpu, dim=-1))
+
+        # label bank 초기화
+        print("Initializing label bank with KMeans results...")
+        # 1. KMeans 결과를 PyTorch 텐서로 변환합니다. (레이블이므로 long 타입)
+        initial_labels = torch.from_numpy(kmeans.labels_).long()
+        print("initial_labels", initial_labels)
+        # 2. 이 텐서를 label_bank에 복사하여 초기화합니다.
+        #    .copy_()를 사용하여 텐서 내용을 바로 업데이트합니다.
+        self.clustering_manager.label_bank = initial_labels
+        
+        print("Prototypes initialized.")
+        self.clustering_manager.initialized = True
+        self.train()
+        return self.clustering_manager.centroids.clone()
+
     def forward(self, x, sample_ids=None, return_features=False, labels=None, step="train"):
         # x는 (B, C, T) 형태의 텐서
         
-        # 특징 추출
         features = self.encoder(x)["emb"]
         if step == "train" or step == "val":
-            rule_feature = self.get_representative_sensor_feature(x, labels, num_total_sensors=END_INDEX-START_INDEX+1, top_k=4, id=sample_ids)
-            rule_feature = self.projection_layer(rule_feature)
+            # print("x", x.shape)
+            # representative_feature = torch.max(torch.abs(x), dim=-1).values
+            # representative_feature = torch.quantile(torch.abs(x), q=0.99, dim=-1)
+            # representative_feature = torch.var(x, dim=-1)
+            # representative_feature = representative_feature * self.attention_weight
+            # if labels is not None and self.global_rank == 0:  
+            #     for i in range(len(labels)):
+            #         print("representative_feature", representative_feature[i])
+            #         print("ACTION_MERGE_LABELS", ACTION_MERGE_LABELS[labels[i].item()])
+            #         if "Motion" in ACTION_MERGE_LABELS[labels[i].item()]:
+            #             print("motion imu", x[i])
+            # print("representative_feature", representative_feature.shape)
+            # print("rule_feature", rule_feature.shape)
+            # print("features", features.shape)
+            # top_k_indices = torch.topk(representative_feature, k=self.top_k, dim=-1).indices
+            # mask = torch.zeros_like(representative_feature)
+            # mask.scatter_(1, top_k_indices, 1)
+            # representative_feature = representative_feature * mask
         # 클러스터 유사도 점수 계산
-            features += rule_feature
+            representative_feature = self.get_representative_sensor_feature(x, labels, num_total_sensors=END_INDEX-START_INDEX+1, top_k=self.top_k, id=sample_ids)
+            representative_feature = self.projection_layer(representative_feature)
+            features += representative_feature
             
         similarity_scores = self.clustering_manager.compute_similarity_scores(features)
+        # similarity_scores = self.cls_head(features)
 
         # print("features", features)
         if return_features:
             return similarity_scores, features
         return similarity_scores
-    # 전체 데이터셋의 pseudo label을 계산하고 메모리 뱅크에 저장하는 함수
-    @torch.no_grad()
-    def init_prototypes_with_data(self, device, num_clusters):
-        """실제 데이터 포인트를 사용하여 프로토타입을 초기화합니다."""
-        self.eval()
-        
-        # 처음 몇 배치만 사용하여 특징 추출
-        all_features = []
-        all_labels = []
-        
-        # 일부 데이터만 사용하여 특징 추출
-        for i, (videos, sensors, labels, sample_ids) in enumerate(self.train_dataloader()):
-            if i >= 5:  # 처음 5배치만 사용
-                break
-                
-            sensors = sensors.to(device)
-            labels = labels.to(device)
-            
-            # 특징 추출
-            _, features = self(sensors, return_features=True)
-            
-            all_features.append(features.cpu())
-            if labels is not None:
-                all_labels.append(labels.cpu())
-        
-        # 전체 특징 병합
-        all_features = torch.cat(all_features, dim=0)
-        
-        # KMeans 클러스터링으로 초기 프로토타입 추출
-        print(f"Running KMeans with {len(all_features)} samples to initialize prototypes...")
-        kmeans = KMeans(n_clusters=num_clusters, n_init=20, random_state=42).fit(all_features.numpy())
-        
-        # 초기 프로토타입 설정
-        for k in range(num_clusters):
-            cluster_samples = (torch.tensor(kmeans.labels_) == k)
-            if cluster_samples.sum() > 0:
-                # 클러스터에 속한 특징들의 평균으로 프로토타입 초기화
-                prototype = all_features[cluster_samples].mean(dim=0)
-                self.clustering_manager.centroids[k] = F.normalize(prototype.to(device), dim=-1)
-                # 초기 클러스터 크기 설정
-                self.clustering_manager.cluster_size[k] = cluster_samples.sum().float().to(device)
-        
-        print("Prototypes initialized with actual data points.")
-        self.train()
-        return self.clustering_manager.centroids.clone()   
-        
-    @torch.no_grad()
-    def update_centroids(self, features, cluster_ids):
-        """ODC Manager의 중심점을 업데이트합니다."""
-        self.clustering_manager.update_centroids_with_momentum(features, cluster_ids)
     
-
-    # 전체 데이터셋의 pseudo label을 계산하고 메모리 뱅크에 저장하는 함수
     @torch.no_grad()
-    def update_memory_bank(self, device):
-        """전체 데이터셋에 대한 pseudo label과 특징을 계산하고 메모리 뱅크에 저장합니다.
-        ODC 논문과 유사하게 전체 데이터셋에 대한 중앙화된 메모리 뱅크를 관리합니다."""
-        self.eval()
-        
-        # 메모리 뱅크 업데이트 진행바
-        progress_bar = tqdm(self.train_dataloader(), desc="Updating memory bank")
-        
-        # 전체 샘플 수와 업데이트된 샘플 수 추적
-        total_samples = 0
-        updated_samples = 0
-        
-        # 클러스터 할당 카운터 (전체 데이터셋에 대한 클러스터 크기 계산용)
-        cluster_counts = torch.zeros(self.clustering_manager.num_clusters, device=device)
-        
-        for videos, sensors, labels, sample_ids in progress_bar:
-            sensors = sensors.to(device)
-            sample_ids = sample_ids
-            total_samples += len(sensors)
-            
-            # 모델 순전파 (특징 벡터도 얻기)
-            scores, features = self(sensors, return_features=True)
-            
-            # 클러스터 할당 (argmax)
-            current_cluster_ids = torch.argmax(scores, dim=1)
-            
-            # 클러스터 할당 카운트 (히스토그램)
-            for cluster_id in range(self.clustering_manager.num_clusters):
-                cluster_counts[cluster_id] += (current_cluster_ids == cluster_id).sum()
-            
-            # 메모리 뱅크에 pseudo label과 특징 벡터 저장
-            self._update_memory_bank(sample_ids, current_cluster_ids, features)
-            updated_samples += len(sample_ids)
-            
-            # 진행 상황 업데이트
-            progress_bar.set_postfix(updated=f"{updated_samples}/{total_samples}")
-        print("cluster_counts", cluster_counts)
-        # 전체 데이터셋에 대한 클러스터 크기 업데이트 (ODC 논문 방식)
-        self.clustering_manager.cluster_size = cluster_counts
-        
-        # 메모리 뱅크 초기화 완료 표시
-        self.clustering_manager.memory_initialized = True
-        print(f"Memory bank initialized with {updated_samples} samples.")
-        
-        self.train()
-
-    @torch.no_grad()
-    def _update_memory_bank(self, sample_ids, pseudo_labels, features=None):
-        """샘플별 pseudo label과 특징을 메모리 뱅크에 저장합니다.
-        ODC 논문에서처럼 전체 데이터셋에 대한 메모리를 유지합니다."""
-        for idx, sample_id in enumerate(sample_ids):
-            self.clustering_manager.memory_bank[sample_id] = pseudo_labels[idx].item()
-            
-            # 특징 벡터도 저장 (제공된 경우)
-            if features is not None:
-                self.clustering_manager.feature_bank[sample_id] = features[idx].detach()
-    
-    
     def get_pseudo_labels(self, sample_ids):
-        """메모리 뱅크에서 샘플에 대한 pseudo label을 조회합니다."""
-        device = next(self.parameters()).device
-        pseudo_labels = []
+        """(개선된 버전) 메모리 뱅크에서 pseudo label을 효율적으로 조회합니다."""
+        # sample_ids는 Dataset에서 온 정수 인덱스의 '리스트'라고 가정
         
-        # 각 샘플 ID에 대해 저장된 pseudo label 조회
-        for sample_id in sample_ids:
-            if sample_id in self.clustering_manager.memory_bank:
-                pseudo_labels.append(self.clustering_manager.memory_bank[sample_id])
-            else:
-                # 메모리 뱅크에 없는 경우 -1 (무시할 값) 반환
-                pseudo_labels.append(-1)
+        # 1. label_bank가 있는 디바이스 정보를 가져옵니다.
+        device = self.clustering_manager.label_bank.device
         
-        return torch.tensor(pseudo_labels, device=device)
+        # 2. 파이썬 리스트를 모델과 같은 디바이스의 텐서로 변환합니다.
+        sids_tensor = sample_ids.detach().clone().to(dtype=torch.long, device=device)
+        
+        # 3. 텐서 인덱싱을 이용해 한 번에 모든 레이블을 가져옵니다. (훨씬 빠름)
+        #    label_bank가 (N,) 크기라면, sids_tensor의 각 값을 인덱스로 사용하여
+        #    해당 위치의 레이블들을 한 번에 조회합니다.
+        pseudo_labels = self.clustering_manager.label_bank[sids_tensor]
+        
+        return pseudo_labels
     
         # --- 1. 규칙 기반 특징 추출기 ---
     def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=97, top_k=1, id=None):
@@ -990,7 +1185,11 @@ class ClusteringModel(nn.Module):
         """
         
         # 각 채널(센서)의 분산 계산 (max - min)
-        ranges = torch.var(imu_batch, dim=2)
+        ranges = torch.quantile(torch.abs(imu_batch), q=0.99, dim=2)
+        # ranges = torch.max(torch.abs(imu_batch), dim=2).values
+        # ranges = torch.mean(torch.abs(imu_batch), dim=2)
+
+        # ranges = torch.var(imu_batch, dim=2)
         # 가장 분산이 큰 센서의 인덱스 찾기 (분산이 0인것 제외)
     
         min_range, _ = torch.min(ranges, dim=1, keepdim=True)
@@ -1059,160 +1258,101 @@ class ClusteringModel(nn.Module):
     def update_epoch(self, epoch):
         self.epoch = epoch
         
-    def evaluate_odc(self, device):
-        """ODC 모델을 평가합니다."""
+    @torch.no_grad()
+    def evaluate(self, device):
+        assert self.local_rank != 0 
+        """ODC 모델을 DDP 환경에서 효율적으로 평가합니다."""
+        print("evaluate_odc: Starting evaluation...")
         self.eval()
-        all_features = []
-        all_labels = []
-        all_cluster_ids = []
-        
-        with torch.no_grad():
-            for _, imu_data, labels, _ in self.train_dataloader():
-                
-                imu_data = imu_data.to(device)
-                labels = labels.to(device)
-                # 모델 순전파
-                scores, features = self(imu_data, return_features=True, labels=labels, step="val")
-                
-                # 클러스터 할당
-                cluster_ids = torch.argmax(scores, dim=1)
-                
-                if labels is not None:
-                    all_features.append(features.detach().cpu().numpy())
-                    all_labels.append(labels.detach().cpu().numpy())
-                    all_cluster_ids.append(cluster_ids.detach().cpu().numpy())
-        
-        print("evaluate_odc")
-        # 정확도 계산
-        if all_labels:
-            print("Validation Accuracy Calculation")
-            all_features = np.vstack(all_features)
-            all_labels = np.concatenate(all_labels)
-            all_cluster_ids = np.concatenate(all_cluster_ids)
-            
-            # 매핑 없이 정확도 계산
-            raw_accuracy, new_mapping = compute_hungarian_matching(all_cluster_ids, all_labels, self.clustering_manager.num_clusters)
-            self.mapping = new_mapping
-            # 기존 매핑 적용 시 정확도
-            if self.mapping is not None:
-                mapped_cluster_ids = np.array([self.mapping.get(c, c) for c in all_cluster_ids])
-                mapped_accuracy = np.mean(mapped_cluster_ids == all_labels)
-                print(f"Val Accuracy with Existing Mapping: {mapped_accuracy:.4f}")
-                wandb.log({
-                    "epoch": self.epoch,
-                    "val_accuracy_raw": raw_accuracy,
-                    "val_accuracy_mapped": mapped_accuracy
-                })
-            else:
-                wandb.log({
-                    "epoch": self.epoch,
-                    "val_accuracy": raw_accuracy
-                })
-            
-            # 시각화 (선택적)
-            if True:
-                # 프로토타입 가져오기
-                prototypes = self.clustering_manager.centroids.detach().cpu().numpy()
-                
-                # 메모리 뱅크에서 pseudo label 가져오기
-                memory_bank_labels = []
-                sample_ids = []
-                
-                # 다시 데이터를 반복하면서 샘플 ID 수집
-                for _, _, _, sample_ids in self.train_dataloader():              
-                    sample_ids.extend(sample_ids)
-                
-                # ODC 논문과 유사하게 메모리 뱅크에서 직접 특징과 라벨을 추출
-                if self.clustering_manager.memory_initialized:
-                    # 메모리 뱅크에서 특징과 라벨 추출
-                    memory_features = []
-                    memory_labels = []
-                    
-                    # 메모리 뱅크에서 샘플 ID 가져오기
-                    all_sample_ids = list(self.clustering_manager.memory_bank.keys())
-                    
-                    # 검증 데이터만 필터링 (샘플 ID 접두사로 구분)
-                    val_sample_ids = [sid for sid in all_sample_ids if sid.startswith("val_")]
-                    
-                    if len(val_sample_ids) > 0:
-                        # 메모리 뱅크에서 라벨과 특징 추출
-                        for sid in val_sample_ids:
-                            memory_labels.append(self.clustering_manager.memory_bank[sid])
-                            if sid in self.clustering_manager.feature_bank:
-                                memory_features.append(self.clustering_manager.feature_bank[sid].cpu().numpy())
-                        
-                        if len(memory_features) > 0:
-                            # 특징과 라벨을 numpy 배열로 변환
-                            memory_features = np.array(memory_features)
-                            memory_labels = np.array(memory_labels)
-                            
-                            # 매핑 적용
-                            if self.mapping is not None:
-                                mapped_memory_labels = np.array([self.mapping.get(c, c) for c in memory_labels])
-                            else:
-                                mapped_memory_labels = np.array([new_mapping.get(c, c) for c in memory_labels])
-                            
-                            # 실제 라벨 (있는 경우)
-                            if len(all_labels) > 0:
-                                # 메모리 뱅크는 전체 데이터셋을 포함하므로 all_labels와 길이가 다를 수 있음
-                                vis_labels = np.zeros(len(memory_features), dtype=np.int64)
-                                vis_labels[:min(len(all_labels), len(vis_labels))] = all_labels[:min(len(all_labels), len(vis_labels))]
-                            else:
-                                vis_labels = np.zeros(len(memory_features), dtype=np.int64)
-                            print("Mapped memory labels", mapped_memory_labels)
-                            # t-SNE 시각화 (2D와 3D 모두)
-                            fig_2d, fig_3d = visualize_tsne(
-                                memory_features, vis_labels, mapped_memory_labels,
-                                prototypes=prototypes,
-                                title=f"ODC Validation at Epoch {self.epoch+1} (Memory Bank)",
-                                num_classes=self.clustering_manager.num_clusters
-                            )
-                        else:
-                            # 메모리 뱅크에 특징이 없는 경우 기존 방식 사용
-                            if self.mapping is not None:
-                                mapped_ids = np.array([self.mapping.get(c, c) for c in all_cluster_ids])
-                            else:
-                                mapped_ids = np.array([new_mapping.get(c, c) for c in all_cluster_ids])
-                            
-                            fig_2d, fig_3d = visualize_tsne(
-                                all_features, all_labels, mapped_ids,
-                                prototypes=prototypes,
-                                title=f"ODC Validation at Epoch {self.epoch+1} (No Memory Features)",
-                                num_classes=self.clustering_manager.num_clusters
-                            )
-                    else:
-                        # 검증 샘플이 메모리 뱅크에 없는 경우 기존 방식 사용
-                        if self.mapping is not None:
-                            mapped_ids = np.array([self.mapping.get(c, c) for c in all_cluster_ids])
-                        else:
-                            mapped_ids = np.array([new_mapping.get(c, c) for c in all_cluster_ids])
-                        
-                        fig_2d, fig_3d = visualize_tsne(
-                            all_features, all_labels, mapped_ids,
-                            prototypes=prototypes,
-                            title=f"ODC Validation at Epoch {self.epoch+1} (No Val Samples in Memory)",
-                            num_classes=self.clustering_manager.num_clusters
-                        )
-                else:
-                    # 메모리 뱅크가 초기화되지 않은 경우 기존 방식 사용
-                    if self.mapping is not None:
-                        mapped_ids = np.array([self.mapping.get(c, c) for c in all_cluster_ids])
-                    else:
-                        mapped_ids = np.array([new_mapping.get(c, c) for c in all_cluster_ids])
-                    
-                    fig_2d, fig_3d = visualize_tsne(
-                        all_features, all_labels, mapped_ids,
-                        prototypes=prototypes,
-                        title=f"ODC Validation at Epoch {self.epoch+1}",
-                        num_classes=self.clustering_manager.num_clusters
-                    )
-                
+
+        # --- 1. 데이터 처리 (모든 Rank에서 실행) ---
+        # 각 Rank에서 처리한 결과를 저장할 로컬 리스트
+        features_list = []
+        labels_list = []
+        cluster_ids_list = []
+
+        # DDP 환경에서는 DistributedSampler가 데이터를 분배합니다.
+        for _, imu_data, labels, _ in self.train_dataloader():
+            imu_data = imu_data.to(device)
+            labels = labels.to(device)
+
+            # 모델 순전파
+            scores, features = self(imu_data, return_features=True, labels=labels, step="val")
+
+            # 클러스터 할당
+            cluster_ids = torch.argmax(scores, dim=1)
+
+            features_list.append(features.detach())
+            labels_list.append(labels.detach())
+            cluster_ids_list.append(cluster_ids.detach())
+
+        # --- 2. 로컬 결과 취합 (모든 Rank에서 실행) ---
+        # 리스트에 담긴 텐서들을 하나의 텐서로 결합
+        if len(features_list) > 0:
+            features_local = torch.cat(features_list, dim=0)
+            labels_local = torch.cat(labels_list, dim=0)
+            cluster_ids_local = torch.cat(cluster_ids_list, dim=0)
+        else:
+            # 이 Rank에 할당된 데이터가 없는 경우 (데이터셋이 매우 작을 때 발생 가능)
+            # 예외 처리가 필요하지만, 여기서는 데이터가 있다고 가정합니다.
+            return None # 또는 적절한 빈 값 반환
+        # if self.rank == 0:
+
+        # --- 3. All Gather (모든 Rank의 결과를 Rank 0으로 모으기) ---
+        # features_gathered = self.clustering_manager._gather(features_local)
+        # labels_gathered = self.clustering_manager._gather(labels_local)
+        # cluster_ids_gathered = self.clustering_manager._gather(cluster_ids_local)
+
+    # --- 4. 최종 계산 및 로깅 (Rank 0에서만 실행) ---
+        print("evaluate_odc: Rank 0 calculating results...")
+
+        # # 모든 Rank의 결과를 하나의 Numpy 배열로 결합
+        all_features = features_local.cpu().numpy()
+        all_labels = labels_local.cpu().numpy()
+        all_cluster_ids = cluster_ids_local.cpu().numpy()
+
+        # 정확도 계산 로직
+        print("Validation Accuracy Calculation")
+        # compute_hungarian_matching 함수가 정의되어 있어야 함
+        raw_accuracy, new_mapping = compute_hungarian_matching(all_cluster_ids, all_labels, self.clustering_manager.num_clusters)
+        self.mapping = new_mapping # 매핑 업데이트
+
+        mapped_cluster_ids = np.array([self.mapping.get(c, c) for c in all_cluster_ids])
+        mapped_accuracy = np.mean(mapped_cluster_ids == all_labels)
+        print(f"Val Accuracy with Existing Mapping: {mapped_accuracy:.4f}")
+
+        wandb.log({
+            "epoch": self.epoch,
+            "val_accuracy_raw": raw_accuracy,
+            "val_accuracy_mapped": mapped_accuracy
+        })
+
+        # 시각화 로직 (t-SNE)
+        if True: # 시각화 플래그
+            prototypes = self.clustering_manager.centroids.detach().cpu().numpy()
+
+            # t-SNE 시각화 (DDP에서는 gather된 전체 데이터를 사용)
+            # visualize_tsne 함수가 정의되어 있어야 함
+            try:
+                fig_2d, fig_3d = visualize_tsne(
+                    all_features, all_labels, mapped_cluster_ids,
+                    prototypes=prototypes,
+                    title=f"ODC Validation at Epoch {self.epoch+1}",
+                    num_classes=self.clustering_manager.num_clusters
+                )
+
                 wandb.log({
                     "val_tsne_2d": wandb.Image(fig_2d),
                     "val_tsne_3d": wandb.Image(fig_3d)
                 })
-                print("Validation TSNE 2D and 3D saved")
+                print("Validation TSNE 2D and 3D saved to wandb.")
                 plt.close(fig_2d)
                 plt.close(fig_3d)
-        
-        return all_features, all_labels, all_cluster_ids
+            except Exception as e:
+                print(f"Error during t-SNE visualization: {e}")
+
+        # 모든 Rank가 평가를 마칠 때까지 대기 (다음 epoch으로 넘어가기 전 동기화)
+        print("evaluate_odc: All ranks have finished evaluation.")
+
+        # Rank 0에서만 결과 반환 (필요시)   
+        return mapped_accuracy # 혹은 필요한 지표
