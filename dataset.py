@@ -51,15 +51,21 @@ class SensorTransform:
         self.mean = np.mean(all_data, axis=1)
         self.std = np.std(all_data, axis=1)
         print("Mean and Std calculated and stored.")
-
+   
     def _apply_filter(self, data):
         return filtfilt(self.b, self.a, data, axis=1)
 
     def _apply_normalization(self, data):
+        # print("Before normalization, data", data[5], data[6])
+        # data[5-1] = abs(data[5-1]-1)
+        # data[6-1] = abs(data[6-1]-1)
+        # print("Mean:", self.mean)
+        # print("Std:", self.std)
+        # return data
         if self.mean is not None and self.std is not None:
             mean = self.mean[:, np.newaxis]
             std = self.std[:, np.newaxis]
-            return (data - mean) / (std + 1e-8)
+            data = (data - mean) / (std + 1e-8)
         return data
 
     def _resize_to_target_len(self, data, device):
@@ -281,6 +287,8 @@ class VideoSensorDataset(Dataset):
         raw = selected_df.values
 
         sensor_data = raw.T # (C, T)
+        sensor_data [5-1] = abs(sensor_data [5-1]-1)
+        sensor_data [6-1] = abs(sensor_data [6-1]-1)
 
         # 센서 데이터 전처리 적용
         if self.sensor_transform:

@@ -18,8 +18,10 @@ from tqdm import tqdm
 
 #################################################################
 
+import torch
+import torch.nn as nn
 
-class Block(nn.Module):
+class Block(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, pool_type="max", embedding_size=32):
         super().__init__()
         if pool_type == "max":
@@ -28,6 +30,7 @@ class Block(nn.Module):
             pool_fn = torch.nn.AdaptiveAvgPool1d(output_size=embedding_size)
         else:
             raise ValueError(f"pool_type {pool_type} not supported")
+
         self.net = torch.nn.Sequential(
             torch.nn.Conv1d(
                 in_channels=in_channels,
@@ -36,92 +39,86 @@ class Block(nn.Module):
                 dilation=2,
                 bias=False,
             ),
+            nn.ReLU(),
+            nn.BatchNorm1d(out_channels),
             pool_fn,
         )
-        
+
     def forward(self, batch):
         return self.net(batch)
     
-
-# class SensorModel(nn.Module):
-#     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
-#         super().__init__()
-
-#         num_groups_for_input = 1
-
-#         self.backbone = nn.Sequential(
-#             nn.GroupNorm(num_groups_for_input, sensor_channels),
-#             Block(sensor_channels, input_dim, 10),
-#             Block(input_dim, input_dim, 5),
-#             Block(input_dim, input_dim, 5, pool_type="adaptive", embedding_size=32),
-#             nn.GroupNorm(4, input_dim),
-#             nn.GRU(
-#                 batch_first=True, input_size=input_dim, hidden_size=size_embeddings
-#             ),
-#         )
-
-#     def forward(self, batch):
-#         # GRU는 (output, h_n) 형태의 튜플을 반환합니다.
-#         # h_n (마지막 타임스텝의 은닉 상태)을 사용합니다.
-#         # h_n의 shape: (num_layers, batch_size, hidden_size)
-#         _, last_hidden_state = self.backbone(batch)
-        
-#         # GRU 레이어가 하나이므로 첫 번째 요소를 선택하고, batch 차원을 유지하기 위해 squeeze(0) 대신 [0]을 사용합니다.
-#         emb = last_hidden_state[0] # Shape: (batch_size, hidden_size)        
-        
-#         out = {"emb": emb}
-#         return out
-
-
 class SensorModel(nn.Module):
-    """각 센서 채널을 독립적으로 처리한 후, 그 특징들을 GRU로 융합하는 모델"""
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
         super().__init__()
-        self.in_channels = sensor_channels
-        self.per_channel_dim = input_dim
-
-        # 1. 각 채널에 독립적으로 적용될 작은 1D CNN
-        # 모든 채널이 이 동일한 CNN을 공유함
-        self.channel_encoder = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.Conv1d(8, input_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1) # 각 채널의 시계열을 하나의 벡터로
+        self.backbone = torch.nn.Sequential(
+            torch.nn.GroupNorm(1, sensor_channels),
+            Block(sensor_channels, input_dim, 5),
+            Block(input_dim, input_dim *2, 3),
+            Block(input_dim *2, input_dim *2, 3, pool_type="adaptive", embedding_size=32),
+            torch.nn.GroupNorm(4, input_dim *2),
+            torch.nn.GRU(
+                batch_first=True, input_size=input_dim, hidden_size=size_embeddings
+            ),
         )
-        
-        # 2. 채널별 특징들을 융합(fusion)하기 위한 GRU
-        self.fusion_gru = nn.GRU(
-            input_size=input_dim,
-            hidden_size=size_embeddings,
-            batch_first=True
-        )
+        self.ssl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+        self.mmcl_head = torch.nn.Linear(size_embeddings, size_embeddings)
 
-    def forward(self, x):
-        # x shape: (Batch, Channels, SequenceLength)
-        B, C, L = x.shape
-        
-        # 1. 각 채널을 독립적으로 처리하기 위해 차원 변경
-        # (B, C, L) -> (B * C, 1, L)
-        x_reshaped = x.view(-1, 1, L)
-        
-        # 2. 채널별 인코딩
-        channel_features = self.channel_encoder(x_reshaped) # -> (B * C, per_channel_dim, 1)
-        channel_features = channel_features.squeeze(-1) # -> (B * C, per_channel_dim)
-        
-        # 3. 다시 배치 형태로 복원
-        # (B * C, per_channel_dim) -> (B, C, per_channel_dim)
-        channel_features_batched = channel_features.view(B, C, self.per_channel_dim)
-        
-        # (여기서 top_k 센서 선택 로직을 적용할 수 있습니다)
-        # 예를 들어, 특정 규칙으로 k개의 채널 인덱스를 선택하여
-        # selected_features = channel_features_batched[:, top_k_indices, :] 와 같이 처리한 후 fusion_gru에 넣을 수 있습니다.
-        
-        # 4. GRU로 채널 간의 관계를 학습하여 최종 특징 추출
-        _, hidden = self.fusion_gru(channel_features_batched)
-        
-        out = {"emb": hidden[-1]} # -> (B, feature_dim)
+    def forward(self, batch):
+        emb = self.backbone(batch)[1][0] # Last hidden state
+        ssl_out = self.ssl_head(emb)
+        mmcl_out = self.mmcl_head(emb)
+        out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
         return out
+
+# class SensorModel(nn.Module):
+#     """각 센서 채널을 독립적으로 처리한 후, 그 특징들을 GRU로 융합하는 모델"""
+#     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
+#         super().__init__()
+#         self.in_channels = sensor_channels
+#         self.per_channel_dim = input_dim
+
+#         # 1. 각 채널에 독립적으로 적용될 작은 1D CNN
+#         # 모든 채널이 이 동일한 CNN을 공유함
+#         self.channel_encoder = nn.Sequential(
+#             nn.Conv1d(1, 8, kernel_size=5, padding=2),
+#             nn.ReLU(),
+#             nn.Conv1d(8, input_dim, kernel_size=3, padding=1),
+#             nn.ReLU(),
+#             nn.AdaptiveAvgPool1d(1) # 각 채널의 시계열을 하나의 벡터로
+#         )
+        
+#         # 2. 채널별 특징들을 융합(fusion)하기 위한 GRU
+#         self.fusion_gru = nn.GRU(
+#             input_size=input_dim,
+#             hidden_size=size_embeddings,
+#             batch_first=True
+#         )
+
+#     def forward(self, x):
+#         # x shape: (Batch, Channels, SequenceLength)
+#         B, C, L = x.shape
+        
+#         # 1. 각 채널을 독립적으로 처리하기 위해 차원 변경
+#         # (B, C, L) -> (B * C, 1, L)
+#         x_reshaped = x.view(-1, 1, L)
+        
+#         # 2. 채널별 인코딩
+#         channel_features = self.channel_encoder(x_reshaped) # -> (B * C, per_channel_dim, 1)
+#         channel_features = channel_features.squeeze(-1) # -> (B * C, per_channel_dim)
+        
+#         # 3. 다시 배치 형태로 복원
+#         # (B * C, per_channel_dim) -> (B, C, per_channel_dim)
+#         channel_features_batched = channel_features.view(B, C, self.per_channel_dim)
+        
+#         # (여기서 top_k 센서 선택 로직을 적용할 수 있습니다)
+#         # 예를 들어, 특정 규칙으로 k개의 채널 인덱스를 선택하여
+#         # selected_features = channel_features_batched[:, top_k_indices, :] 와 같이 처리한 후 fusion_gru에 넣을 수 있습니다.
+        
+#         # 4. GRU로 채널 간의 관계를 학습하여 최종 특징 추출
+#         _, hidden = self.fusion_gru(channel_features_batched)
+        
+#         out = {"emb": hidden[-1]} # -> (B, feature_dim)
+#         return out
     
 # # 1. 채널 어텐션 (Squeeze-and-Excitation) 블록 정의
 # # 이 부분은 수정 없이 그대로 사용합니다.
@@ -1066,6 +1063,12 @@ class ClusteringModel(nn.Module):
         self.deal_with_small_clusters_interval = 1
         self.cls_head = nn.Linear(embedding_dim, num_clusters)
         self.attention_weight = nn.Parameter(torch.randn(num_sensors))
+        self.gate = nn.Sequential(
+            nn.Linear(embedding_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid() # 0과 1 사이의 가중치(알파)를 출력
+        )
 
     @torch.no_grad()
     def init_prototypes_with_data(self, device, num_clusters):
@@ -1124,37 +1127,21 @@ class ClusteringModel(nn.Module):
         return self.clustering_manager.centroids.clone()
 
     def forward(self, x, sample_ids=None, return_features=False, labels=None, step="train"):
-        # x는 (B, C, T) 형태의 텐서
-        
         features = self.encoder(x)["emb"]
         if step == "train" or step == "val":
-            # print("x", x.shape)
-            # representative_feature = torch.max(torch.abs(x), dim=-1).values
-            # representative_feature = torch.quantile(torch.abs(x), q=0.99, dim=-1)
-            # representative_feature = torch.var(x, dim=-1)
-            # representative_feature = representative_feature * self.attention_weight
-            # if labels is not None and self.global_rank == 0:  
-            #     for i in range(len(labels)):
-            #         print("representative_feature", representative_feature[i])
-            #         print("ACTION_MERGE_LABELS", ACTION_MERGE_LABELS[labels[i].item()])
-            #         if "Motion" in ACTION_MERGE_LABELS[labels[i].item()]:
-            #             print("motion imu", x[i])
-            # print("representative_feature", representative_feature.shape)
-            # print("rule_feature", rule_feature.shape)
-            # print("features", features.shape)
-            # top_k_indices = torch.topk(representative_feature, k=self.top_k, dim=-1).indices
-            # mask = torch.zeros_like(representative_feature)
-            # mask.scatter_(1, top_k_indices, 1)
-            # representative_feature = representative_feature * mask
-        # 클러스터 유사도 점수 계산
+
+            # 클러스터 유사도 점수 계산
             representative_feature = self.get_representative_sensor_feature(x, labels, num_total_sensors=END_INDEX-START_INDEX+1, top_k=self.top_k, id=sample_ids)
             representative_feature = self.projection_layer(representative_feature)
-            features += representative_feature
+            # alpha = self.gate(features)
+            alpha=1
+            if self.local_rank == 0 and labels is not None:
+                wandb.log("alpha", alpha.squeeze(), labels)
+            features = features + alpha * representative_feature
             
         similarity_scores = self.clustering_manager.compute_similarity_scores(features)
         # similarity_scores = self.cls_head(features)
 
-        # print("features", features)
         if return_features:
             return similarity_scores, features
         return similarity_scores
@@ -1191,12 +1178,12 @@ class ClusteringModel(nn.Module):
 
         # ranges = torch.var(imu_batch, dim=2)
         # 가장 분산이 큰 센서의 인덱스 찾기 (분산이 0인것 제외)
+        return ranges
     
         min_range, _ = torch.min(ranges, dim=1, keepdim=True)
         max_range, _ = torch.max(ranges, dim=1, keepdim=True)
         weighted_features = (ranges - min_range) / (max_range - min_range + 1e-8)
         # 정규화 x
-        # weighted_features = ranges
         # 3. Top-K에 해당하지 않는 값들을 0으로 마스킹
         # 가장 큰 Top-K 값만 남기고 나머지는 0으로 만들기 위한 마스크 생성
         _, top_indices = torch.topk(weighted_features, k=top_k, dim=1)
