@@ -35,14 +35,14 @@ class MethodDataModule(pl.LightningDataModule):
             args.data_root = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
             args.json_train_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject/pretrain.json"
             # args.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
-            args.stats_file_path = "/home/jaemo/channel_stats/sensor_stats_37_activate=0.npy"
+            args.stats_file_path = "/home/jaemo/channel_stats/sensor_stats_37.npy"
             args.start_index = 194
             args.end_index = 230
         elif args.dataset_name == "HWU-USP":
             args.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
             args.json_train_path = "/mnt/hdd4tb/junho/HWU-USP_v2/pretrain.json"
             # args.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_11_activate=0.npy"
-            args.stats_file_path = "/home/jaemo/channel_stats/sensor_stats_11_activate=0.npy"
+            args.stats_file_path = "/home/jaemo/channel_stats/sensor_stats_11.npy"
             args.start_index = 1
             args.end_index = 11
         else:
