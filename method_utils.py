@@ -1,7 +1,5 @@
 import numpy as np
 from tqdm import tqdm
-from scipy.optimize import linear_sum_assignment
-
 
 ####################################################################
 
@@ -50,21 +48,4 @@ def load_stats(path):
 
 
 #################################################################
-
-
-# --- 헝가리안 매칭을 통한 클러스터-라벨 매핑 ---
-def compute_hungarian_matching(pred_labels, true_labels, num_clusters):
-    """클러스터 ID와 실제 레이블 간의 최적 매핑을 찾아 정확도를 계산"""
-    cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
-    for i in range(len(pred_labels)):
-        cost_matrix[pred_labels[i], true_labels[i]] += 1
-    row_ind, col_ind = linear_sum_assignment(-cost_matrix)
-    mapped_preds = np.zeros_like(pred_labels)
-    mapping = {i: j for i, j in zip(row_ind, col_ind)}
-    for i, j in mapping.items():
-        mapped_preds[pred_labels == i] = j
-    accuracy = np.mean(mapped_preds == true_labels)
-    print("Accuracy: ", accuracy, "Mapping: ", mapping)
-    return accuracy, mapping
-
 

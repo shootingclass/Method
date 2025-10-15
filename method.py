@@ -13,19 +13,17 @@ import torch.distributed as dist
 
 # --- 사용자 정의 모듈 임포트 ---
 from model import SensorModel, VisionModel, ClusteringModel
-
+from baseline_modules.base import BasePretrainModule
 
 ####################################################################
 
 
 
-class MethodLightningModule(pl.LightningModule):
+class MethodLightningModule(BasePretrainModule):
 
     def __init__(self, args, train_dataloader):
-        super().__init__()
-
-        self.args = self.set_dataset_params(args)
-        self.save_hyperparameters(self.args)
+        super().__init__(args)
+        # 1. 모델 구성 요소 초기화
 
         self.video_model = VisionModel(image_size=224)
         self.sensor_model = SensorModel(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
@@ -44,17 +42,9 @@ class MethodLightningModule(pl.LightningModule):
     
         self.mean = [0.48145466, 0.4578275, 0.40821073]
         self.std = [0.26862954, 0.26130258, 0.27577711]
-    
-    def set_dataset_params(self, args):
-        if args.dataset_name == "Opportunity++":
-            args.num_sensors = 37
-            args.num_classes = 7
-            args.top_k = 4
-        elif args.dataset_name == "HWU-USP":
-            args.num_sensors = 11
-            args.num_classes = 9
-            args.top_k = 1
-        return args
+        self.success_labels=[0 for i in range(self.hparams.num_classes)]
+        self.fail_labels=[0 for i in range(self.hparams.num_classes)]
+
     
     # 에포크 시작 시 clustering_model 상태 업데이트
     def on_train_epoch_start(self):
@@ -65,7 +55,6 @@ class MethodLightningModule(pl.LightningModule):
             self.clustering_model.init_prototypes_with_data(self.device, self.hparams.num_classes)
 
     def training_step(self, batch, batch_idx):
-
         # 0. 데이터 준비 (Lightning이 자동으로 device로 옮겨줍니다)
         videos, sensors, labels, sample_ids = batch
 
@@ -124,9 +113,52 @@ class MethodLightningModule(pl.LightningModule):
         # # self.epoch을 사용하여 현재 에포크를 확인합니다.
         if self.epoch < self.hparams.threshold_epoch:
             
-            # 최종 손실을 반환하면 Lightning이 알아서 backward 및 step을 수행합니다.
             return loss_cluster
-        
+            # # 최종 손실을 반환하면 Lightning이 알아서 backward 및 step을 수행합니다.
+            
+            # cropped_videos, iou_scores = self.video_model.patch_selection(videos, labels)
+            # # 모델의 forward pass를 크롭된 비디오로 수행
+            # # 이제부터는 'cropped_videos'를 사용합니다.
+            # logits = self.video_model(cropped_videos)['logits']
+            
+            # # 'iou_scores'를 사용해 yolo_loss를 계산합니다.
+            # yolo_loss = 1.0 - iou_scores.mean()
+            
+            # self.log('avg_iou', iou_scores.mean())
+
+            # # 3. 최종 Loss 계산 및 학습
+            # accuracy = (logits.argmax(dim=1) == labels).float().mean()
+            # loss_patch = F.cross_entropy(logits, labels)
+            # loss = loss_patch + yolo_loss
+            # # loss = loss_patch + loss_cluster
+            # fail_label = (logits.argmax(dim=1) != labels)
+            # success_label = (logits.argmax(dim=1) == labels)
+            # successed_true_labels = labels[success_label].tolist()
+            # for success_label in successed_true_labels:
+            #     self.success_labels[success_label] += 1
+            # # boolean Tensor를 이용해 틀린 예측에 해당하는 실제 정답 레이블을 추출
+            # failed_true_labels = labels[fail_label].tolist()
+            # for fail_label in failed_true_labels:
+            #     self.fail_labels[fail_label] += 1
+
+            # if self.global_rank == 0:
+            #     metrics_to_log = {
+            #         'train_acc': accuracy,
+            #         'train_loss': loss,
+            #     }
+                
+            #     # 틀린 레이블이 있을 경우에만 히스토그램을 로그
+            #     if failed_true_labels:
+            #         print(f"Logging failed labels histogram with {len(failed_true_labels)} entries.")
+            #         # 'failed_labels_dist'라는 이름으로 히스토그램을 생성하여 기록
+            #         print("success labels:", self.success_labels)
+            #         print("failed labels:", self.fail_labels)
+            #         metrics_to_log['failed_labels_dist'] = wandb.Histogram(failed_true_labels)
+                    
+            #     wandb.log(metrics_to_log)
+            
+            return loss
+
         # --- 3. 분리(Disentanglement) 단계 ---
         model_output = self.video_model(videos)
         v_motion = model_output['v_motion']
@@ -199,7 +231,7 @@ class MethodLightningModule(pl.LightningModule):
 
     # epoch 종료 시 한번만 호출됨
     def on_train_epoch_end(self):    
-
+        # return
         # 에포크가 끝난 후 epoch 업데이트
         self.epoch += 1
         self.clustering_model.update_epoch(self.epoch)
@@ -223,6 +255,8 @@ class MethodLightningModule(pl.LightningModule):
                 self.clustering_model.evaluate(self.device)
 
             if self.epoch < self.hparams.threshold_epoch:
+                print("threshold_epoch not reached, skipping feature visualization.")
+                self.train()  # 모델을 다시 훈련 모드로 설정
                 return
 
             with torch.no_grad():
@@ -334,10 +368,3 @@ class MethodLightningModule(pl.LightningModule):
                 print("Feature map visualizations logged to wandb.")
             
             self.train()  # 모델을 다시 훈련 모드로 설정
-
-
-    # trainer.fit()`이 호출된 직후, 실제 훈련 루프가 시작되기 바로 전에 단 한 번 호출됨
-    def configure_optimizers(self):
-        parameters = itertools.chain(self.video_model.parameters(), self.clustering_model.parameters(), self.appearance_classifier.parameters())
-        optimizer = optim.AdamW(parameters, lr=self.hparams.lr)
-        return optimizer

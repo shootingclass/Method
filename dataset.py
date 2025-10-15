@@ -120,7 +120,7 @@ class ClipConsistentTransforms:
         # 2. 모든 프레임에 동일한 파라미터로 변환 적용 (루프)
         tensor_frames = []
         for frame in clip:
-            frame = T.Resize(self.size, antialias=True)(frame)
+            frame = T.Resize(self.size, antialias=True)(frame) # crop 구현 완료 전에 임시로 resize 사용
 
             # if apply_flip:
             #     frame = TF.hflip(frame)
@@ -161,7 +161,7 @@ class ClipConsistentTransforms:
 
 
 class VideoSensorDataset(Dataset):
-    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index):
+    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index, cache_dir):
         super().__init__()
         
         self.data_root = data_root
@@ -173,6 +173,8 @@ class VideoSensorDataset(Dataset):
         self.start_index = start_index
         self.end_index = end_index
         self.samples = []
+        self.cache_dir = cache_dir
+        self.use_cache = False
 
         # 1. JSON 파일을 읽어 (비디오 전체 경로, 레이블) 리스트 생성
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -196,61 +198,87 @@ class VideoSensorDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        video_path, sensor_path, label, _ = self.samples[idx]
+        video_path, sensor_path, label, item_id = self.samples[idx]
         item_id = idx
         
         ######### 비디오 전처리 #########       
-        if self.current_epoch < self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
-            
+        if self.current_epoch <= -1:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
             # 1. self.num_frames 개수만큼의 가짜 이미지 '리스트'를 생성합니다.
             dummy_clip = [Image.new('RGB', (224, 224)) for _ in range(self.num_frames)]
 
             # 2. 이미지 리스트(클립)를 transform에 전달합니다.
             # self.transform은 내부적으로 이 리스트를 올바른 모양의 텐서로 변환해 줄 것입니다.
             frames_tensor = self.transform(dummy_clip)
+            print("fake clip used", self.current_epoch)
 
         ######### 비디오 전처리 #########       
         # 1. OpenCV를 사용하여 비디오 캡처 객체 생성
         else:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                if not os.path.exists(video_path):
-                    raise FileNotFoundError(f"Video file not found at the constructed path: {video_path}")
-                raise IOError(f"Cannot open video file, it may be corrupted or in an unsupported format: {video_path}")
-                
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
-            # 2. 프레임 인덱스 샘플링 (균등 샘플링)
-            if total_frames > 1:
-                frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+            parts = video_path.split(os.sep)
+
+            # 3. 마지막 두 부분을 다시 '.'으로 연결
+            if len(parts) >= 2:
+                last_two_parts = '/'.join(parts[-2:])
+            cache_path=os.path.join(self.cache_dir, last_two_parts)
+            cache_path = cache_path.rsplit('.', 1)[0] + '.pt'
+
+            cache_dir_for_file = os.path.dirname(cache_path)
+            os.makedirs(cache_dir_for_file, exist_ok=True) # exist_ok=True로 이미 존재하면 무시
+            if os.path.exists(cache_path):
+                with torch.serialization.safe_globals({Image.Image}):
+                    frames = torch.load(cache_path)
+                # print("cached clip used", cache_path)
             else:
-                # 프레임이 없거나 하나뿐인 비디오 처리
-                frame_indices = np.zeros(self.num_frames, dtype=int)
-            
-            frames = []
-            successful_reads = 0
-            last_successful_frame = None
-
-            for frame_idx in frame_indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                
-                if ret:
-                    successful_reads += 1
-                    # OpenCV(BGR) -> RGB -> PIL Image
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame_pil = Image.fromarray(frame_rgb)
-                    last_successful_frame = frame_pil.copy()
-                    frames.append(frame_pil)
+                print("real clip used", cache_path)
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    if not os.path.exists(video_path):
+                        raise FileNotFoundError(f"Video file not found at the constructed path: {video_path}")
+                    raise IOError(f"Cannot open video file, it may be corrupted or in an unsupported format: {video_path}")
                     
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                # 2. 프레임 인덱스 샘플링 (균등 샘플링)
+                if total_frames > 1:
+                    frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
                 else:
-                    # 프레임 읽기 실패 시, 마지막으로 성공한 프레임 또는 검은 이미지 사용
-                    if last_successful_frame is not None:
-                        frames.append(last_successful_frame.copy())
-                    else:
-                        frames.append(Image.new('RGB', (224, 224)))
+                    # 프레임이 없거나 하나뿐인 비디오 처리
+                    frame_indices = np.zeros(self.num_frames, dtype=int)
+                
+                frames = []
+                successful_reads = 0
+                last_successful_frame = None
 
-            cap.release()
+                for frame_idx in frame_indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, frame = cap.read()
+                    
+                    if ret:
+                        successful_reads += 1
+                        # OpenCV(BGR) -> RGB -> PIL Image
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_pil = Image.fromarray(frame_rgb)
+                        last_successful_frame = frame_pil.copy()
+                        frames.append(frame_pil)
+                        
+                    else:
+                        # 프레임 읽기 실패 시, 마지막으로 성공한 프레임 또는 검은 이미지 사용
+                        if last_successful_frame is not None:
+                            frames.append(last_successful_frame.copy())
+                        else:
+                            frames.append(Image.new('RGB', (224, 224)))
+                try:
+                    temp_cache_path = cache_path + ".tmp"
+                    torch.save(frames, temp_cache_path)
+                    # 쓰기 성공 시에만 최종 이름으로 변경
+                    os.rename(temp_cache_path, cache_path) 
+                except Exception as e:
+                    print(f"Error during atomic cache write for {cache_path}: {e}")
+                    if os.path.exists(temp_cache_path):
+                        os.remove(temp_cache_path)
+                    pass
+
+                cap.release()
 
             # 3. 클립 전체에 대해 한 번에 전처리 적용
             if self.transform:

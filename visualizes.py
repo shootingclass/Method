@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from typing import List
 from sklearn.manifold import TSNE
+from torchvision.transforms.functional import to_pil_image
+from scipy.optimize import linear_sum_assignment
 
 
 #################################################################
@@ -45,6 +47,76 @@ ACTION_MERGE_LABELS = {
 
 #################################################################
 
+
+# --- 헝가리안 매칭을 통한 클러스터-라벨 매핑 ---
+def compute_hungarian_matching(pred_labels, true_labels, num_clusters):
+    """클러스터 ID와 실제 레이블 간의 최적 매핑을 찾아 정확도를 계산"""
+    cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
+    for i in range(len(pred_labels)):
+        cost_matrix[pred_labels[i], true_labels[i]] += 1
+    row_ind, col_ind = linear_sum_assignment(-cost_matrix)
+    mapped_preds = np.zeros_like(pred_labels)
+    mapping = {i: j for i, j in zip(row_ind, col_ind)}
+    for i, j in mapping.items():
+        mapped_preds[pred_labels == i] = j
+    accuracy = np.mean(mapped_preds == true_labels)
+    print("Accuracy: ", accuracy, "Mapping: ", mapping)
+    return accuracy, mapping
+
+def denormalize(tensor):
+    """텐서를 정규화 해제합니다."""
+    # 텐서를 복제하여 원본이 변경되지 않도록 합니다.
+        # 프레임 전처리(Transform) 정의
+    MEAN = [0.48145466, 0.4578275, 0.40821073]
+    STD = [0.26862954, 0.26130258, 0.27577711]
+
+    # 🌟🌟🌟 수정된 부분: 리스트를 텐서로 변환! 🌟🌟🌟
+    # device=tensor.device를 추가하여 GPU/CPU 문제를 방지합니다.
+    mean = torch.tensor(MEAN, device=tensor.device)
+    std = torch.tensor(STD, device=tensor.device)
+
+    # 이제 mean과 std는 텐서이므로 .view()를 사용할 수 있습니다.
+    mean = mean.view(1, -1, 1, 1)
+    std = std.view(1, -1, 1, 1)
+
+    # 역정규화 계산 및 0~1 범위 고정
+    denormalized_tensor = (tensor * std + mean).clamp(0, 1)
+    
+    return denormalized_tensor
+
+def visualize_cropped_tensor(cropped_video_tensor: torch.Tensor, title: str = "Cropped Video Frame"):
+    """
+    크롭된 비디오 텐서를 올바르게 시각화하고 Matplotlib Figure 객체를 반환합니다.
+    """
+    if cropped_video_tensor.ndim != 4:
+        raise ValueError(f"Input tensor must be 4D (C, T, H, W). Got {cropped_video_tensor.ndim}D.")
+    
+    frame_index_to_show = cropped_video_tensor.shape[1] // 2 
+    cropped_frame_tensor = cropped_video_tensor[:, frame_index_to_show, :, :]
+
+    # ‼️‼️‼️ 중요: 정규화 해제 단계 추가 ‼️‼️‼️
+    # 데이터셋을 만들 때 사용했던 mean과 std 값을 여기에 정확히 입력해야 합니다.
+    # 예시 값 (ImageNet 기준):
+    # MEAN = [0.485, 0.456, 0.406]
+    # STD = [0.229, 0.224, 0.225]class MethodDataModule(pl.LightningDataModule):
+        
+    # # CPU로 이동시킨 후 정규화 해제
+    denormalized_frame = denormalize(cropped_frame_tensor.cpu())
+    
+    # # 값 범위를 [0, 1]로 안전하게 클리핑
+    denormalized_frame = torch.clamp(denormalized_frame, 0, 1)
+    # Tensor를 PIL Image로 변환
+    cropped_frame_pil = to_pil_image(denormalized_frame)
+    # cropped_frame_pil = to_pil_image(cropped_frame_tensor.cpu())
+    
+    # Matplotlib으로 시각화
+    fig, ax = plt.subplots(figsize=(8, 8)) # fig와 ax를 함께 받습니다.
+    ax.imshow(cropped_frame_pil)
+    ax.set_title(f"{title} (Frame {frame_index_to_show}) - Shape: {cropped_frame_pil.size[1]}x{cropped_frame_pil.size[0]}")
+    ax.axis('off')
+
+    # ‼️‼️‼️ 중요: plt가 아닌 fig 객체 반환 ‼️‼️‼️
+    return fig
 
 def _superimpose_heatmap_on_image(
     frame_tensor: torch.Tensor,
