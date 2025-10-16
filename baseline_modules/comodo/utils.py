@@ -34,7 +34,7 @@ def initialize_comodo(args, datamodule):
             sample_info = full_train_dataset.samples[idx]
             frames_tensor, _, _, video_id= sample_info
             video_id = sample_info['video_id']
-            cache_path = os.path.join(args.video_cache_dir, f"{video_id}.pt")
+            cache_path = os.path.join(args.baseline_video_cache_dir, f"{video_id}.pt")
 
             if not os.path.exists(cache_path):
                 # 캐시가 없으면, 데이터셋에서 원본 비디오를 가져와 인코딩
@@ -56,7 +56,7 @@ def initialize_comodo(args, datamodule):
     
     for idx in tqdm(idxs_in_queue, desc="[COMODO] Assembling instance queue"):
         video_id = full_train_dataset.samples[idx]['video_id']
-        cache_path = os.path.join(args.video_cache_dir, f"{video_id}.pt")
+        cache_path = os.path.join(args.baseline_video_cache_dir, f"{video_id}.pt")
         queue_encoded_list.append(torch.load(cache_path))
 
     instance_queue_encoded = torch.stack(queue_encoded_list)

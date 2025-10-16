@@ -42,7 +42,7 @@ def set_model_params(args, datamodule):
         args.top_k = 1
         args.sensor_seq_len = 100
 
-    args.video_cache_dir = f"./video_caches/{args.model_name}/{args.dataset_name}"
+    args.baseline_video_cache_dir = f"./video_caches/{args.model_name}/{args.dataset_name}"
     if args.model_name == "method":
         return MethodLightningModule(args, datamodule.val_dataloader())
     elif args.model_name == "comodo":
@@ -95,6 +95,7 @@ def main(args):
     datamodule.setup(stage='fit')
 
     # 2. 라이트닝 모듈 초기화
+    args.cache_dir = datamodule.cache_dir
     model = set_model_params(args, datamodule)
     # model = MethodLightningModule(args, eval_datamodule.train_dataloader)
 

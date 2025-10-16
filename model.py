@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 
 from visualizes import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX, visualize_cropped_tensor, denormalize, compute_hungarian_matching
 from tqdm import tqdm
+from method_utils import time_warp
 
 
 #################################################################
@@ -978,7 +979,7 @@ class VisionModel(nn.Module):
 
 # --- 3. 메모리 뱅크 관리자 ---
 class ClusteringManager(nn.Module):
-    def __init__(self, num_clusters, feature_dim, momentum=0.01, temperature=0.1, device='cuda', local_rank=0):
+    def __init__(self, num_clusters, feature_dim, momentum=0.9, temperature=0.1, device='cuda', local_rank=0):
         super().__init__()
         self.num_clusters = num_clusters
         self.feature_dim = feature_dim
@@ -989,17 +990,17 @@ class ClusteringManager(nn.Module):
 
         if self.local_rank == "0":
              # Rank 0에서만 임시 크기로 생성 (KMeans 전까지)
-             self.feature_bank = torch.zeros((10000, feature_dim), dtype=torch.float32)
+             self.feature_bank = torch.zeros((10000, feature_dim), dtype=torch.float32) # 모든 gpu에서 매 스텝마다 feature_bank는 동기화 (update_samples_memory 참조)
         else:
              # 다른 Rank는 None으로 두는 것이 메모리 절약에 유리하나,
              # DDP에서 속성이 없으면 문제가 되므로, 명시적으로 None으로 설정합니다.
              self.feature_bank = None
         
-        self.label_bank = None # 모든 Rank가 None으로 시작
+        self.label_bank = None # 모든 Rank가 None으로 시작, 모든 gpu에서 매 스텝마다 label_bank는 동기화 (update_samples_memory 참조)
         self.initialized = False
         # 클러스터 중심점(centroids) 초기화 - 더 넓게 분포되도록 초기화
         # 각 차원마다 균등 분포를 사용하여 더 잘 분산되도록 함
-        centroids = torch.rand(num_clusters, feature_dim, device=device) * 2.0 - 1.0  # [-1, 1] 범위의 균등 분포
+        centroids = torch.rand(num_clusters, feature_dim, device=device) * 2.0 - 1.0  # [-1, 1] 범위의 균등 분포. 모든 gpu에서 cetroids는 broadcast 받음 (update_centroids 참조)
         
         # 정규화를 통해 모든 중심점이 단위 구에 있도록 함
         # self.centroids = F.normalize(self.centroids, dim=1)
@@ -1018,7 +1019,7 @@ class ClusteringManager(nn.Module):
         self.pending_memory_update = False
         
         # 빈 클러스터 감지와 재할당을 위한 임계값
-        self.min_cluster_size = 10  # 이 값보다 작으면 비어있다고 간주
+        self.min_cluster_size = 30  # 이 값보다 작으면 비어있다고 간주
         
         # 가중치 계산을 위한 상수
         self.class_weight_power = 0.5  # 클러스터 크기에 적용할 거듭제곱
@@ -1035,14 +1036,14 @@ class ClusteringManager(nn.Module):
         num = len(cinds)
         centroids = torch.zeros((num, self.feature_dim), dtype=torch.float32)
         for i, c in enumerate(cinds):
-            idx = np.where(self.label_bank.numpy() == c)[0]
+            idx = np.where(self.label_bank.cpu().numpy() == c)[0]
             centroids[i, :] = self.feature_bank[idx, :].mean(dim=0)
         return centroids
 
     def _compute_centroids(self):
         """Compute all non-empty centroids."""
         assert self.local_rank == "0"
-        label_bank_np = self.label_bank.numpy()
+        label_bank_np = self.label_bank.cpu().numpy()
         argl = np.argsort(label_bank_np)
         sortl = label_bank_np[argl]
         diff_pos = np.where(sortl[1:] - sortl[:-1] != 0)[0] + 1
@@ -1060,24 +1061,28 @@ class ClusteringManager(nn.Module):
         # 현재 분산 그룹의 GPU 개수를 가져옵니다.
         world_size = dist.get_world_size()
         if world_size == 1:
+            print("world_size == 1, no gather needed")
             return tensor
 
         # 입력 텐서가 반드시 GPU에 있도록 보장합니다.
-        tensor = tensor.cuda()
 
+        # 2. ⭐️ 입력 텐서를 현재 프로세스의 올바른 GPU로 이동시킵니다.
+        # 이렇게 하면 rank 1은 cuda:1로, rank 2는 cuda:2로 텐서를 옮깁니다.
+        
+        tensor = tensor.cuda()
         # 1. 최종적으로 모일 전체 텐서의 크기를 계산하고, '같은 device'에 빈 텐서를 생성합니다.
         shape = (world_size * tensor.shape[0], *tensor.shape[1:])
         gathered_tensor = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
         
         # 2. all_gather_into_tensor를 호출하여 빈 텐서를 채웁니다.
         dist.all_gather_into_tensor(gathered_tensor, tensor)
-        
         return gathered_tensor
 
     def update_samples_memory(self, idx: torch.Tensor,
                               feature: torch.Tensor):
         """Update samples memory."""
         assert self.initialized
+        print(f"[{self.local_rank}] Updating samples memory for {idx.shape[0]} samples.")
         feature_norm = feature / (feature.norm(dim=1).view(-1, 1) + 1e-10
                                   )  # normalize
 
@@ -1091,105 +1096,99 @@ class ClusteringManager(nn.Module):
                 self.momentum * feature_norm
             feature_norm = feature_new / (
                 feature_new.norm(dim=1).view(-1, 1) + 1e-10)
-            self.feature_bank[idx, ...] = feature_norm.cpu()
+            self.feature_bank=self.feature_bank.cuda()
+            self.feature_bank[idx, ...] = feature_norm
         dist.barrier()
-        dist.broadcast(feature_norm, 0)
+        dist.broadcast(feature_norm, src=0) 
         # compute new labels
+
         # similarity_to_centroids = self.compute_similarity_scores(feature_norm.permute(1, 0))
         feature_norm = feature_norm.permute(1, 0)
         centroids_norm = F.normalize(self.centroids, dim=1)
         similarity_to_centroids = torch.mm(centroids_norm,
                                            feature_norm)  # CxN
         newlabel = similarity_to_centroids.argmax(dim=0)  # cuda tensor
-        newlabel_cpu = newlabel.cpu()
-        change_ratio = (newlabel_cpu != self.label_bank[idx]
-                        ).sum().float().cuda() / float(newlabel_cpu.shape[0])
-        self.label_bank[idx] = newlabel_cpu.clone()  # copy to cpu
+        # self.label_bank = self.label_bank.cuda()
+        change_ratio = (newlabel != self.label_bank[idx]
+                        ).sum().float().cuda() / float(newlabel.shape[0])
+        self.label_bank[idx] = newlabel.cuda().clone()  # all gpu have the same label_bank
         print("update_samples_memory", change_ratio)
         return change_ratio
 
     @torch.no_grad()
-    def update_centroids_memory(self, cinds = None):
+    def update_centroids_memory(self):
         """Update centroids memory."""
         if self.local_rank == "0":
-            if cinds is None:
-                center = self._compute_centroids()
-                self.centroids.copy_(center)
-            else:
-                center = self._compute_centroids_idx(cinds)
-                self.centroids[
-                    torch.LongTensor(cinds).cuda(), :] = center.cuda()
-        dist.broadcast(self.centroids, 0)
-
-        print("update_centroids_memory", self.centroids.shape)
+            center = self._compute_centroids()
+            self.centroids.copy_(center)
+        dist.broadcast(self.centroids, src=0)
+        print(f"[{self.local_rank}] Broadcasted centroids shape: {self.centroids}")
 
     @torch.no_grad()
     def deal_with_small_clusters(self):
         """
         Gather all label_banks, perform clustering logic on rank 0,
-        and return the updated centroids.
-        """
-        # 1. 모든 GPU의 label_bank를 rank 0으로 모읍니다.
-        #    _gather 함수는 모든 GPU에서 호출되어야 합니다.
-        global_label_bank = self._gather(self.label_bank)
+        and broadcast the updated label_bank and centroids back to all ranks if needed.
+        """        
 
-        # 2. Rank 0 에서만 모든 계산을 수행합니다.
+        # 1. Rank 0 에서만 모든 계산을 수행합니다.
         if self.local_rank == "0":
-            # 글로벌 데이터를 기준으로 small_clusters를 안전하게 계산
+            # self.label_bank와 self.feature_bank는 모두 동기화 되어있음. rank 0에서 small_clusters를 안전하게 계산
             global_histogram = np.bincount(
-                global_label_bank.cpu().numpy(), minlength=self.num_clusters)
+                self.label_bank.cpu().numpy(), minlength=self.num_clusters)
             small_clusters = np.where(global_histogram < self.min_cluster_size)[0].tolist()
 
             if len(small_clusters) == 0:
-                # 변경 사항이 없으면 현재 centroids를 그대로 반환
-                return self.centroids
+                # 변경 사항이 없으면 pass.
+                pass
+            else:
+                print(f'[Rank 0] Dealing with {len(small_clusters)} small clusters.')
 
-            print(f'[Rank 0] Dealing with {len(small_clusters)} small clusters.')
+                # 재할당 로직 수행 (모든 데이터가 Rank 0에 있으므로 동기화 불필요)
+                for s in small_clusters:
+                    label_bank_np = self.label_bank.cpu().numpy()
+                    idx = np.where(label_bank_np == s)[0]
+                    if len(idx) == 0:
+                        continue
+                    
+                    # feature_bank도 모든 GPU에 걸쳐 동일한 복사본이 있어야 합니다.
+                    # (만약 아니라면 feature_bank도 gather가 필요합니다)
+                    inclusion = np.setdiff1d(np.arange(self.num_clusters), np.array(small_clusters), assume_unique=True)
+                    inclusion_tensor = torch.from_numpy(inclusion).cuda()
 
-            # 재할당 로직 수행 (모든 데이터가 Rank 0에 있으므로 동기화 불필요)
-            for s in small_clusters:
-                idx = np.where(global_label_bank.cpu().numpy() == s)[0]
-                if len(idx) == 0:
-                    continue
-                
-                # feature_bank도 모든 GPU에 걸쳐 동일한 복사본이 있어야 합니다.
-                # (만약 아니라면 feature_bank도 gather가 필요합니다)
-                inclusion = np.setdiff1d(np.arange(self.num_clusters), np.array(small_clusters), assume_unique=True)
-                inclusion_tensor = torch.from_numpy(inclusion).cuda()
+                    # feature_bank에서 idx에 해당하는 부분만 가져와야 합니다.
+                    # feature_bank가 분산되어 있다면, 이 부분도 수정이 필요합니다.
 
-                # feature_bank에서 idx에 해당하는 부분만 가져와야 합니다.
-                # feature_bank가 분산되어 있다면, 이 부분도 수정이 필요합니다.
-                # 여기서는 self.feature_bank가 모든 GPU에 복제되어 있다고 가정합니다.
-                gathered_features = self._gather(self.feature_bank) # 예시: feature_bank도 gather
+                    target_idx = torch.mm(
+                        self.centroids[inclusion_tensor, :],
+                        self.feature_bank[idx, :].cuda().permute(1, 0)
+                    ).argmax(dim=0)
+                    
+                    target = inclusion_tensor[target_idx]
+                    self.label_bank[idx] = target.cuda()
+                # --- 2단계: ⭐️ 이제 비워진 클러스터를 재활용합니다. ⭐️---
+                # _redirect_empty_clusters가 내부적으로 centroid 업데이트와 broadcast를 처리합니다.
+                self._redirect_empty_clusters(small_clusters)
 
-                target_idx = torch.mm(
-                    self.centroids[inclusion_tensor, :],
-                    gathered_features[idx, :].cuda().permute(1, 0)
-                ).argmax(dim=0)
-                
-                target = inclusion_tensor[target_idx]
-                global_label_bank[idx] = target.cpu()
-
-            # 모든 재할당 후, Rank 0에서 최종 centroids 계산
-            # (이 로직은 _compute_centroids 같은 함수를 호출해야 할 수 있습니다)
-            final_center = self._compute_centroids(global_label_bank, gathered_features) # 예시
-            self.centroids.copy_(final_center)
-        dist.broadcast(self.centroids, 0)
+        print("label_bank device:", self.label_bank.device)
+        dist.broadcast(self.centroids, src=0)
+        dist.broadcast(self.label_bank, src=0)
+        dist.broadcast(self.feature_bank, src=0)
         # 3. Rank 0은 계산된 centroids를 반환, 나머지는 현재 자신의 centroids를 반환
-        return self.centroids
+        return 
 
     @torch.no_grad()
     def _partition_max_cluster(
             self, max_cluster: np.ndarray):
         """Partition the largest cluster into two sub-clusters."""
         assert self.local_rank == "0"
-        max_cluster_idx = np.where(self.label_bank == max_cluster)[0]
+        max_cluster_idx = np.where(self.label_bank.cpu().numpy() == max_cluster)[0]
 
         assert len(max_cluster_idx) >= 2
         max_cluster_features = self.feature_bank[max_cluster_idx, :]
-        if np.any(np.isnan(max_cluster_features.numpy())):
+        if np.any(np.isnan(max_cluster_features.cpu().numpy())):
             raise Exception('Has nan in features.')
-        kmeans_ret = self.kmeans.fit(max_cluster_features)
+        kmeans_ret = self.kmeans.fit(max_cluster_features.cpu())
         sub_cluster1_idx = max_cluster_idx[kmeans_ret.labels_ == 0]
         sub_cluster2_idx = max_cluster_idx[kmeans_ret.labels_ == 1]
         if not (len(sub_cluster1_idx) > 0 and len(sub_cluster2_idx) > 0):
@@ -1204,66 +1203,31 @@ class ClusteringManager(nn.Module):
     @torch.no_grad()
     def _redirect_empty_clusters(self, empty_clusters: np.ndarray):
         """Re-direct empty clusters."""
+        assert self.local_rank == "0"
         print("empty_clusters", empty_clusters)
         for e in empty_clusters:
-            assert (self.label_bank != e).all().item(), \
+            assert (self.label_bank.cpu().numpy() != e).all().item(), \
                 f'Cluster #{e} is not an empty cluster.'
             
-            # 1. 마스터에서만 max_cluster를 계산
-            if self.local_rank == "0":
-                max_cluster_val = np.bincount(
-                    self.label_bank, minlength=self.num_clusters).argmax().item()
-                # 값을 담을 텐서 생성
-                max_cluster_tensor = torch.tensor([max_cluster_val], dtype=torch.int64).cuda()
-            else:
-                # 다른 프로세스들은 값을 받을 빈 텐서 생성
-                max_cluster_tensor = torch.zeros(1, dtype=torch.int64).cuda()
+             # 1. 가장 큰 클러스터를 찾습니다.
+            max_cluster = np.bincount(self.label_bank.cpu().numpy(), minlength=self.num_clusters).argmax().item()
             
-            # 2. 모든 프로세스에 max_cluster 값을 broadcast
-            dist.broadcast(max_cluster_tensor, 0)
+            # 2. 가장 큰 클러스터를 둘로 분할합니다.
+            sub_cluster1_idx, sub_cluster2_idx = self._partition_max_cluster(max_cluster)
+
+            if sub_cluster1_idx is None:
+                continue
+
+            # 3. 분할된 그룹 중 하나를 비어있던 클러스터 'e'에 할당합니다.
+            self.label_bank[torch.from_numpy(sub_cluster2_idx)] = e
             
-            # 3. 이제 모든 프로세스가 동일한 max_cluster 값을 가짐
-            max_cluster = max_cluster_tensor.item()
-            # gather partitioning indices
-            if self.local_rank == "0":
-                sub_cluster1_idx, sub_cluster2_idx = \
-                    self._partition_max_cluster(max_cluster)
-                if len(sub_cluster1_idx) == 0 or len(sub_cluster2_idx) == 0:
-                    print(f"Warning: empty partition at cluster {max_cluster}")
-                    continue
-                size1 = torch.LongTensor([len(sub_cluster1_idx)]).cuda()
-                size2 = torch.LongTensor([len(sub_cluster2_idx)]).cuda()
-                sub_cluster1_idx_tensor = torch.from_numpy(
-                    sub_cluster1_idx).long().cuda()
-                sub_cluster2_idx_tensor = torch.from_numpy(
-                    sub_cluster2_idx).long().cuda()
-            else:
-                size1 = torch.LongTensor([0]).cuda()
-                size2 = torch.LongTensor([0]).cuda()
-            print("all_reduce ", self.local_rank)
-            dist.all_reduce(size1)
-            print("get reduce 1")
-            dist.all_reduce(size2)
-            print("get sizes", size1, size2)
-            if self.local_rank != "0":
-                sub_cluster1_idx_tensor = torch.zeros(
-                    (size1.item(), ), dtype=torch.int64).cuda()
-                sub_cluster2_idx_tensor = torch.zeros(
-                    (size2.item(), ), dtype=torch.int64).cuda()
-            dist.broadcast(sub_cluster1_idx_tensor, 0)
-            dist.broadcast(sub_cluster2_idx_tensor, 0)
-
-            if self.local_rank != "0":
-                sub_cluster1_idx = sub_cluster1_idx_tensor.cpu().numpy()
-                sub_cluster2_idx = sub_cluster2_idx_tensor.cpu().numpy()
-                print(f"[Rank {self.local_rank}] e={e}, max_cluster={max_cluster}, "\
-                f"sub1={len(sub_cluster1_idx)}, sub2={len(sub_cluster2_idx)}")
-
-            # reassign samples in partition #2 to the empty class
-            self.label_bank[sub_cluster2_idx] = e
-            # update centroids of max_cluster and e
-            self.update_centroids_memory([max_cluster, e])
-            print("_redirect_empty_clusters", max_cluster, e)
+            # 4. 변경된 두 클러스터(max_cluster, e)의 중심점을 다시 계산하고 모든 GPU에 전파합니다.
+            #    (이제 이 함수는 centroid 동기화만 책임집니다. label_bank 동기화는 호출한 쪽에서 처리합니다.)
+            cinds=[max_cluster, e]
+            center = self._compute_centroids_idx(cinds)
+            self.centroids[
+                torch.LongTensor(cinds).cuda(), :] = center.cuda()
+        print("Redirected empty clusters and updated centroids.")
 
 
     def compute_similarity_scores(self, features):
@@ -1281,8 +1245,9 @@ class ClusteringManager(nn.Module):
         """클러스터 크기에 근거한 클래스 가중치를 계산합니다."""
         # 클러스터 크기가 0인 경우를 방지하기 위한 정규화
         histogram = np.bincount(
-            self.label_bank.numpy(), minlength=self.num_clusters)
+            self.label_bank.cpu().numpy(), minlength=self.num_clusters)
         cluster_size = torch.tensor(histogram, device=self.centroids.device)
+        print("Cluster sizes:", cluster_size)
         normalized_sizes = cluster_size + 1e-8
         
         # 클러스터 크기의 그대로의 역수를 가중치로 사용
@@ -1303,7 +1268,7 @@ class ClusteringManager(nn.Module):
 
 # --- 4. Clustering 모델 ---
 class ClusteringModel(nn.Module):
-    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, train_dataloader, top_k=1):
+    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, train_dataloader, top_k=1, prototype_cache_dir="./cache", dataset_name="custom_dataset"):
         super().__init__()
         # 딥러닝 백본 선택
         self.encoder = encoder
@@ -1324,11 +1289,12 @@ class ClusteringModel(nn.Module):
             nn.Linear(16, 1),
             nn.Sigmoid() # 0과 1 사이의 가중치(알파)를 출력
         )
-        self.cache_dir = "/home/jaemo/Method/cache/opportunity++"
+        self.prototype_cache_dir = prototype_cache_dir
+        self.dataset_name = dataset_name
 
    # 🌟🌟🌟 Broadcast 로직을 분리한 헬퍼 함수 🌟🌟🌟
     def broadcast_prototypes(self, rank, world_size, device):
-        print(f"[{rank}] Broadcasting results from rank 0...")
+        print(f"[{rank}] Broadcasting results from rank 0...", device)
         
         broadcast_device = torch.device(device) 
         num_total_samples = len(self.train_dataloader.dataset)
@@ -1352,12 +1318,14 @@ class ClusteringModel(nn.Module):
         dist.broadcast(label_bank_gpu, src=0)
         # 3. feature_bank 전파 (GPU 텐서 사용)
         dist.broadcast(feature_bank_gpu, src=0)
+        # print(f"[{rank}] Broadcasted label_bank shape: {label_bank_gpu.shape}")
+        # print(f"[{rank}] Broadcasted feature_bank shape: {feature_bank_gpu.shape}")
         
         # 4. Rank != 0은 Broadcast된 GPU 텐서를 자신의 CPU 뱅크로 복사 및 상태 업데이트
         if rank != "0":
             # 🚨 주의: Broadcast된 결과를 자신의 feature_bank 멤버 변수에 할당합니다.
-            self.clustering_manager.label_bank = label_bank_gpu.cpu()
-            self.clustering_manager.feature_bank = feature_bank_gpu.cpu()
+            self.clustering_manager.label_bank = label_bank_gpu
+            self.clustering_manager.feature_bank = feature_bank_gpu
             self.clustering_manager.initialized = True
             
         print(f"[{rank}] Broadcasting complete.")
@@ -1373,8 +1341,8 @@ class ClusteringModel(nn.Module):
 
         # 🌟🌟🌟 1. 초기화 결과 캐시 로드 시도 (Rank 0에서만) 🌟🌟🌟
         dataset_size = len(self.train_dataloader.dataset)
-        cache_filename = f"prototypes_N{dataset_size}_C{num_clusters}.pt"
-        prototype_cache_path = os.path.join(self.cache_dir, cache_filename)
+        cache_filename = f"prototypes_{self.dataset_name}_N{dataset_size}_C{num_clusters}.pt" 
+        prototype_cache_path = os.path.join(self.prototype_cache_dir, cache_filename)
         
         # ⚠️ (중요) Cache 성공 시, 나머지 Rank는 Broadcast를 기다리고 있어야 합니다.
         cache_hit = False
@@ -1387,8 +1355,8 @@ class ClusteringModel(nn.Module):
                 cached_data = torch.load(prototype_cache_path)
                 
                 self.clustering_manager.centroids.copy_(cached_data['centroids'].to(device))
-                self.clustering_manager.label_bank = cached_data['label_bank']
-                self.clustering_manager.feature_bank = cached_data['feature_bank']
+                self.clustering_manager.label_bank = cached_data['label_bank'].to(device)
+                self.clustering_manager.feature_bank = cached_data['feature_bank'].to(device)
                 self.clustering_manager.initialized = True
                 cache_hit = True
                 print(f"[{rank}] Prototypes loaded successfully from cache.")
@@ -1424,6 +1392,7 @@ class ClusteringModel(nn.Module):
                 
                 local_features.append(features) # GPU 상태로 유지
                 local_sample_ids.append(sample_ids) # GPU 상태로 유지
+                print(f"[{rank}] Processed batch {i+1}/{len(self.train_dataloader)}")
             
             local_features_tensor = torch.cat(local_features, dim=0)
             local_ids_tensor = torch.cat(local_sample_ids, dim=0)
@@ -1436,22 +1405,22 @@ class ClusteringModel(nn.Module):
             if rank_str == "0":
                 print(f"[{rank}] Running KMeans...")
                 
-                all_features_cpu = all_features_gpu.cpu()
+                # all_features_cpu = all_features_gpu.cpu()
                 all_ids_cpu = all_ids_gpu.cpu()
                 
                 num_total_samples = len(self.train_dataloader.dataset)
-                feature_bank_temp = torch.empty(num_total_samples, self.clustering_manager.feature_dim, device="cpu")
-                feature_bank_temp[all_ids_cpu, ...] = all_features_cpu # ID를 사용한 최종 재배치
+                feature_bank_temp = torch.empty(num_total_samples, self.clustering_manager.feature_dim, device="gpu")
+                feature_bank_temp[all_ids_cpu, ...] = all_features_gpu # ID를 사용한 최종 재배치
                 
                 self.clustering_manager.feature_bank = feature_bank_temp # CPU Feature Bank 할당
                     
-                all_features_cpu_numpy = self.clustering_manager.feature_bank.numpy()
+                all_features_cpu_numpy = self.clustering_manager.feature_bank.cpu().numpy()
                 kmeans = self.clustering_manager.kmeans.fit(all_features_cpu_numpy)
                 
                 prototypes_gpu = torch.from_numpy(kmeans.cluster_centers_).to(device)
                 self.clustering_manager.centroids.copy_(F.normalize(prototypes_gpu, dim=-1))
                 initial_labels = torch.from_numpy(kmeans.labels_).long()
-                self.clustering_manager.label_bank = initial_labels # CPU Label Bank 할당
+                self.clustering_manager.label_bank = initial_labels.cuda()
                 self.clustering_manager.initialized = True
                 
                 # 🌟🌟🌟 4. K-Means 완료 후, Rank 0에서 캐시 저장 🌟🌟🌟
@@ -1551,150 +1520,75 @@ class ClusteringModel(nn.Module):
         # 4. 마스크를 적용하여 최종 특징 생성
         final_rule_feature = weighted_features * mask
         return final_rule_feature
-
-    # --- 1. 센서 데이터 증강 (Data Augmentation) ---
-    def time_warp(self, x, sigma=0.2, num_knots=4):
-        
-        # """시계열 데이터에 Time Warping 증강 적용 (간소화된 버전)"""
-        B, C, T = x.shape
-        device = x.device
-        
-        # 각 배치 아이템마다 다른 warping 적용
-        warped_x = torch.zeros_like(x)
-        for i in range(B):
-            # 각 시간 포인트에 대한 랜덤 오프셋 생성
-            time_indices = torch.arange(T, device=device, dtype=torch.float32)
-            # 시간 왜곡 함수: sin 파형으로 자연스럽게 왜곡
-            perturb = sigma * T * torch.sin(torch.linspace(0, 4*3.14, T, device=device))
-            perturb = perturb * torch.rand(1, device=device)  # 배치마다 다른 강도
-            
-            # 왜곡된 인덱스 생성
-            warped_indices = time_indices + perturb
-            warped_indices = torch.clamp(warped_indices, 0, T-1)
-            
-            # 선형 보간으로 왜곡 적용
-            warped_indices_low = warped_indices.floor().long()
-            warped_indices_high = warped_indices.ceil().long()
-            warped_indices_high = torch.clamp(warped_indices_high, 0, T-1)
-            
-            # 보간 가중치
-            weight_high = warped_indices - warped_indices_low.float()
-            weight_low = 1.0 - weight_high
-            
-            # 선형 보간으로 왜곡된 시계열 생성
-            x_batch = x[i]  # (C, T)
-            warped_x_batch = torch.zeros_like(x_batch)
-            
-            for t in range(T):
-                low_idx = warped_indices_low[t]
-                high_idx = warped_indices_high[t]
-                warped_x_batch[:, t] = weight_low[t] * x_batch[:, low_idx] + weight_high[t] * x_batch[:, high_idx]
-            
-            warped_x[i] = warped_x_batch
-        
-        return warped_x
     
     def augment_imu_data(self, imu_data):
-        return self.time_warp(imu_data)
+        return time_warp(imu_data)
     
     def update_epoch(self, epoch):
         self.epoch = epoch
         
     @torch.no_grad()
-    def evaluate(self, device):
-        assert self.local_rank == "0", f"evaluate should be called on rank 0 only. now {self.local_rank}" 
-        """ODC 모델을 DDP 환경에서 효율적으로 평가합니다."""
-        print("evaluate_odc: Starting evaluation...")
+    def evaluate(self, outputs):
+        """
+        미리 train step에서 계산된 outputs를 사용하여 평가를 수행합니다 (validation epoch 끝에서 호출하는 것보다 성능 향상이 더딜 수 있음).
+        """
+
         self.eval()
+        features_gathered = self.clustering_manager._gather(torch.cat([x['features'] for x in outputs]))
+        labels_gathered = self.clustering_manager._gather(torch.cat([x['labels'] for x in outputs]))
+        predicted_labels_gathered = self.clustering_manager._gather(torch.cat([x['predicted_labels'] for x in outputs]))
+        print(f"evaluate_odc: Gathered {features_gathered.shape[0]} features from all ranks.")
 
-        # --- 1. 데이터 처리 (모든 Rank에서 실행) ---
-        # 각 Rank에서 처리한 결과를 저장할 로컬 리스트
-        features_list = []
-        labels_list = []
-        cluster_ids_list = []
+        if self.local_rank == "0":
+            # 1. 텐서를 NumPy 배열로 변환
+            all_features = features_gathered.cpu().numpy()
+            all_labels = labels_gathered.cpu().numpy()
+            all_predicted_labels = predicted_labels_gathered.cpu().numpy()
+        
+            print(f"evaluate_odc: Calculating results on {len(all_features)} total samples.")
 
-        # DDP 환경에서는 DistributedSampler가 데이터를 분배합니다.
-        for _, imu_data, labels, _ in self.train_dataloader:
-            imu_data = imu_data.to(device)
-            labels = labels.to(device)
+            # 2. 정확도 계산 (헝가리안 매칭)
+            print("Computing Hungarian matching...")
+            raw_accuracy, new_mapping = compute_hungarian_matching(
+                all_predicted_labels, all_labels, self.clustering_manager.num_clusters
+            )
 
-            # 모델 순전파
-            scores, features = self(imu_data, return_features=True, labels=labels, step="val")
+            mapped_cluster_labels = np.array([new_mapping.get(c, c) for c in all_predicted_labels])
+            mapped_accuracy = np.mean(mapped_cluster_labels == all_labels)
+            print(f"Val Accuracy (Full Dataset): {mapped_accuracy:.4f}")
+                  
+            if new_mapping is not None:
+                self.clustering_manager.mapping = new_mapping
+                # mapping은 rank 0 (evaluate)에서만 사용됨
 
-            # 클러스터 할당
-            cluster_ids = torch.argmax(scores, dim=1)
-
-            features_list.append(features.detach())
-            labels_list.append(labels.detach())
-            cluster_ids_list.append(cluster_ids.detach())
-
-        # --- 2. 로컬 결과 취합 (모든 Rank에서 실행) ---
-        # 리스트에 담긴 텐서들을 하나의 텐서로 결합
-        if len(features_list) > 0:
-            features_local = torch.cat(features_list, dim=0)
-            labels_local = torch.cat(labels_list, dim=0)
-            cluster_ids_local = torch.cat(cluster_ids_list, dim=0)
-        else:
-            # 이 Rank에 할당된 데이터가 없는 경우 (데이터셋이 매우 작을 때 발생 가능)
-            # 예외 처리가 필요하지만, 여기서는 데이터가 있다고 가정합니다.
-            return None # 또는 적절한 빈 값 반환
-        # if self.rank == 0:
-
-        # --- 3. All Gather (모든 Rank의 결과를 Rank 0으로 모으기) ---
-        # features_gathered = self.clustering_manager._gather(features_local)
-        # labels_gathered = self.clustering_manager._gather(labels_local)
-        # cluster_ids_gathered = self.clustering_manager._gather(cluster_ids_local)
-
-    # --- 4. 최종 계산 및 로깅 (Rank 0에서만 실행) ---
-        print("evaluate_odc: Rank 0 calculating results...")
-
-        # # 모든 Rank의 결과를 하나의 Numpy 배열로 결합
-        all_features = features_local.cpu().numpy()
-        all_labels = labels_local.cpu().numpy()
-        all_cluster_ids = cluster_ids_local.cpu().numpy()
-
-        # 정확도 계산 로직
-        print("Validation Accuracy Calculation")
-        # compute_hungarian_matching 함수가 정의되어 있어야 함
-        raw_accuracy, new_mapping = compute_hungarian_matching(all_cluster_ids, all_labels, self.clustering_manager.num_clusters)
-        self.mapping = new_mapping # 매핑 업데이트
-
-        mapped_cluster_ids = np.array([self.mapping.get(c, c) for c in all_cluster_ids])
-        mapped_accuracy = np.mean(mapped_cluster_ids == all_labels)
-        print(f"Val Accuracy with Existing Mapping: {mapped_accuracy:.4f}")
-
-        wandb.log({
-            "epoch": self.epoch,
-            "val_accuracy_raw": raw_accuracy,
-            "val_accuracy_mapped": mapped_accuracy
-        })
-
-        # 시각화 로직 (t-SNE)
-        if True: # 시각화 플래그
-            prototypes = self.clustering_manager.centroids.detach().cpu().numpy()
-
-            # t-SNE 시각화 (DDP에서는 gather된 전체 데이터를 사용)
-            # visualize_tsne 함수가 정의되어 있어야 함
+            # 3. 로깅 (전달받은 LightningModule의 logger 사용)
+            wandb.log({
+                "val_accuracy_raw": raw_accuracy,
+                "val_accuracy_mapped": mapped_accuracy
+            })
+            
+            # 4. 시각화 (t-SNE)
+            # CPU 과부하 방지를 위해 샘플링 적용
+            num_samples_for_tsne = min(2000, len(all_features))
+            sample_indices = np.random.choice(len(all_features), num_samples_for_tsne, replace=False)
+            
             try:
+                print(f"Running t-SNE on a subset of {num_samples_for_tsne} samples...")
                 fig_2d, fig_3d = visualize_tsne(
-                    all_features, all_labels, mapped_cluster_ids,
-                    prototypes=prototypes,
-                    title=f"ODC Validation at Epoch {self.epoch+1}",
-                    num_classes=self.clustering_manager.num_clusters
+                    all_features[sample_indices], 
+                    all_labels[sample_indices], 
+                    mapped_cluster_labels[sample_indices],
+                    prototypes=self.clustering_manager.centroids.detach().cpu().numpy(),
+                    title=f"ODC Validation at Epoch {self.epoch}",
+                    num_classes=self.clustering_manager.num_clusters,
+                    dataset_name=self.dataset_name
                 )
-
                 wandb.log({
                     "val_tsne_2d": wandb.Image(fig_2d),
                     "val_tsne_3d": wandb.Image(fig_3d)
                 })
-                print("Validation TSNE 2D and 3D saved to wandb.")
-                plt.close(fig_2d)
-                plt.close(fig_3d)
+                plt.close(fig_2d); plt.close(fig_3d)
             except Exception as e:
                 print(f"Error during t-SNE visualization: {e}")
 
-        # 모든 Rank가 평가를 마칠 때까지 대기 (다음 epoch으로 넘어가기 전 동기화)
-        print("evaluate_odc: All ranks have finished evaluation.")
-
-        # Rank 0에서만 결과 반환 (필요시)   
-        return mapped_accuracy # 혹은 필요한 지표
+        self.train()

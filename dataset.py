@@ -219,7 +219,8 @@ class VideoSensorDataset(Dataset):
             # 3. 마지막 두 부분을 다시 '.'으로 연결
             if len(parts) >= 2:
                 last_two_parts = '/'.join(parts[-2:])
-            cache_path=os.path.join(self.cache_dir, last_two_parts)
+            cache_dir = os.path.join(self.cache_dir, "videos")
+            cache_path=os.path.join(cache_dir, last_two_parts)
             cache_path = cache_path.rsplit('.', 1)[0] + '.pt'
 
             cache_dir_for_file = os.path.dirname(cache_path)
@@ -229,7 +230,6 @@ class VideoSensorDataset(Dataset):
                     frames = torch.load(cache_path)
                 # print("cached clip used", cache_path)
             else:
-                print("real clip used", cache_path)
                 cap = cv2.VideoCapture(video_path)
                 if not cap.isOpened():
                     if not os.path.exists(video_path):
@@ -268,10 +268,12 @@ class VideoSensorDataset(Dataset):
                         else:
                             frames.append(Image.new('RGB', (224, 224)))
                 try:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                     temp_cache_path = cache_path + ".tmp"
                     torch.save(frames, temp_cache_path)
                     # 쓰기 성공 시에만 최종 이름으로 변경
                     os.rename(temp_cache_path, cache_path) 
+                    print("clip is cached", cache_path)
                 except Exception as e:
                     print(f"Error during atomic cache write for {cache_path}: {e}")
                     if os.path.exists(temp_cache_path):

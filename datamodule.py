@@ -40,14 +40,14 @@ class MethodDataModule(pl.LightningDataModule):
             self.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
             self.start_index = 194
             self.end_index = 230
-            self.cache_dir = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/video_caches"
+            self.cache_dir = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches"
         elif args.dataset_name == "HWU-USP":
             self.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
             self.json_path = f"/mnt/hdd4tb/junho/HWU-USP_v2/splits_with_trashes"
             self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_11.npy"
             self.start_index = 1
             self.end_index = 11
-            self.cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/video_caches"
+            self.cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/caches"
         else:
             raise ValueError(f"Invalid dataset name: {args.dataset_name}")
         
@@ -68,8 +68,6 @@ class MethodDataModule(pl.LightningDataModule):
         
         else:
             raise ValueError(f"Invalid stage: {stage}. Choose 'pretrain' or 'linear_probe'.")
-            
-        return args
 
     # 이 메서드는 단일 프로세스에서만 실행됩니다.
     # 파일 다운로드나 데이터 전처리 등 한 번만 수행해야 할 작업을 여기에 둡니다.

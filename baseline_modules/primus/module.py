@@ -198,7 +198,7 @@ class PRIMUSLightningModule(BasePretrainModule):
         for i in range(len(batch)):
             videos, sensors, labels, sample_ids = batch
             folder_name = sample_ids[i].split('_')[0]  # "S3-ADL1"
-            cache_path = os.path.join(self.hparams.video_cache_dir, folder_name, sample_ids[i] + '.pt')
+            cache_path = os.path.join(self.hparams.baseline_video_cache_dir, folder_name, sample_ids[i] + '.pt')
 
             if os.path.exists(cache_path):
                 y_video[i] = torch.load(cache_path).to(self.device)

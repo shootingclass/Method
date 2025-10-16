@@ -20,20 +20,20 @@ END_INDEX = 231
 # START_INDEX = 1
 # END_INDEX = 11
 
-# ACTION_MERGE_LABELS = {
-#         0: 'Door 1',
-#         1: 'Door 2',
-#         2: 'Fridge',
-#         3: 'Dishwasher',
-#         4: 'Drawer 1',
-#         5: 'Drawer 2',
-#         6: 'Drawer 3',
-#         7: 'Clean Table',
-#         8: 'Drink from Cup',
-#         9: 'Toggle Switch'
-#     }
+ACTION_MERGE_LABELS_OPPORTUNITY = {
+        0: 'Door 1',
+        1: 'Door 2',
+        2: 'Fridge',
+        3: 'Dishwasher',
+        4: 'Drawer 1',
+        5: 'Drawer 2',
+        6: 'Drawer 3',
+        7: 'Clean Table',
+        8: 'Drink from Cup',
+        9: 'Toggle Switch'
+    }
 
-ACTION_MERGE_LABELS = {
+ACTION_MERGE_LABELS_HWU_USP = {
     0: "Ktch_B1_Drawer",
     1: "Ktch_B4_Cupboard",
     2: "Ktch_Motion_1",
@@ -51,6 +51,7 @@ ACTION_MERGE_LABELS = {
 # --- 헝가리안 매칭을 통한 클러스터-라벨 매핑 ---
 def compute_hungarian_matching(pred_labels, true_labels, num_clusters):
     """클러스터 ID와 실제 레이블 간의 최적 매핑을 찾아 정확도를 계산"""
+    print(f"start Computing Hungarian matching... {len(pred_labels)}")
     cost_matrix = np.zeros((num_clusters, num_clusters), dtype=np.int64)
     for i in range(len(pred_labels)):
         cost_matrix[pred_labels[i], true_labels[i]] += 1
@@ -252,8 +253,14 @@ def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = No
 
 
 # --- 6. t-SNE 시각화 함수 ---
-def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 2D", num_classes=10):
+def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 2D", num_classes=10, dataset_name="Opportunity++"):
     """2D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
+    if dataset_name == "Opportunity++":
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+    elif dataset_name == "HWU-USP":
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
+    else:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
     label_names = [ACTION_MERGE_LABELS.get(i, f"Class_{i}") for i in range(num_classes)]
     
     # t-SNE를 실행하기에 샘플 수가 충분한지 확인
@@ -362,8 +369,14 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
 #################################################################
 
 
-def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 3D", num_classes=10):
+def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 3D", num_classes=10, dataset_name="Opportunity++"):
     """3D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
+    if dataset_name == "Opportunity++":
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+    elif dataset_name == "HWU-USP":
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
+    else:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
     label_names = [ACTION_MERGE_LABELS.get(i, f"Class_{i}") for i in range(num_classes)]
     
     # t-SNE를 실행하기에 샘플 수가 충분한지 확인
@@ -488,13 +501,13 @@ def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, tit
 #################################################################
 
 
-def visualize_tsne(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization", num_classes=10):
+def visualize_tsne(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization", num_classes=10, dataset_name="Opportunity++"):
     """2D와 3D t-SNE 시각화를 모두 수행하고 2D 결과를 반환"""
     # 2D 시각화
-    fig_2d = visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes, title + " (2D)", num_classes)
+    fig_2d = visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes, title + " (2D)", num_classes, dataset_name)
     
     # 3D 시각화
-    fig_3d = visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes, title + " (3D)", num_classes)
+    fig_3d = visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes, title + " (3D)", num_classes, dataset_name)
     
     # 기존 호환성을 위해 2D 그림 반환
     return fig_2d, fig_3d
@@ -503,7 +516,7 @@ def visualize_tsne(embeddings, true_labels, pred_labels, prototypes=None, title=
 #################################################################
 
 
-def get_sensor_name(sensor_index):
+def get_sensor_name(sensor_index, dataset_name="Opportunity++"):
     """
     sensor_index에 해당하는 센서 이름을 반환합니다.
     
@@ -514,9 +527,12 @@ def get_sensor_name(sensor_index):
         str: 센서 이름 문자열, 해당 인덱스가 없으면 "Unknown Sensor"
     """
     # 파일 경로 설정
-    column_names_path = "/mnt/hdd4tb/junho/Opportunity++/data/column_names.txt"
-    # column_names_path = "/home/jaemo/dataset_hwu_usp/extracted/hwu_usp_dataset/HWU-USP_v2/column_names.txt"
-    
+    if dataset_name == "Opportunity++":
+        column_names_path = "/mnt/hdd4tb/junho/Opportunity++/data/column_names.txt"
+    elif dataset_name == "HWU-USP":
+        column_names_path = "/mnt/hdd4tb/junho/dataset_hwu_usp/extracted/hwu_usp_dataset/HWU-USP_v2/column_names.txt"
+    else:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
     try:
         # 파일이 존재하는지 확인
         if not os.path.exists(column_names_path):
@@ -549,7 +565,13 @@ def get_sensor_name(sensor_index):
     except Exception as e:
         return f"Error reading sensor name: {str(e)}"
 
-def visualize_sensor_name(top_indices, labels, id):
+def visualize_sensor_name(top_indices, labels, id, dataset_name="Opportunity++"):
+    if dataset_name == "Opportunity++":
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+    elif dataset_name == "HWU-USP":
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
+    else:
+        raise ValueError(f"Unknown dataset name: {dataset_name}")
     for i in range(top_indices.shape[0]): # 배치 크기만큼 반복
         label = labels[i]
         # Top-K 인덱스들을 순회
