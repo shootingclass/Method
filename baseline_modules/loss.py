@@ -161,3 +161,55 @@ def transpose(x):
 
 def normalize(*xs):
     return [None if x is None else F.normalize(x, dim=-1) for x in xs]
+
+
+class COMODOLoss(nn.Module):
+    def __init__(
+        self,
+        instanceQ_encoded,
+        student_model,
+        teacher_temp=0.1,
+        student_temp=0.05,
+    ):
+        """
+        student_model:    IMU model
+        teacher_model:    Video model
+        teacher_temp:   distillation temperature for teacher model
+        student_temp:   distillation temperature for student model
+        """
+        super(COMODOLoss, self).__init__()
+        self.instanceQ_encoded = instanceQ_encoded
+        self.student_model = student_model
+        self.teacher_temp = teacher_temp
+        self.student_temp = student_temp
+
+    def forward(
+        self,
+        imu_features: torch.Tensor,
+        z_v: torch.Tensor,
+        input_mask: torch.Tensor = None,
+    ):
+        print("shape of imu_features, z_v", imu_features.shape, z_v.shape)
+        batch_size = z_v.shape[0]
+
+        z_x = F.normalize(self.student_model(imu_features, input_mask), p=2, dim=1)
+        device = z_x.device
+        # insert the current batch embedding from T
+        instanceQ_encoded = self.instanceQ_encoded.to(device)
+        Q = torch.cat((instanceQ_encoded, z_v))
+
+        # probability scores distribution for T, S: B X (N + 1)
+        P_v = torch.einsum("nc,ck->nk", z_v, Q.t().clone().detach())
+        P_x = torch.einsum("nc,ck->nk", z_x, Q.t().clone().detach())
+
+        # FKL
+        # Apply temperatures for soft-labels
+        P_v = F.softmax(P_v / self.teacher_temp, dim=1)
+        P_x = P_x / self.student_temp
+        # loss computation, use log_softmax for stable computation
+        loss = -torch.mul(P_v, F.log_softmax(P_x, dim=1)).sum() / batch_size
+
+        # update the random sample queue
+        self.instanceQ_encoded = Q[batch_size:]
+
+        return loss

@@ -33,6 +33,24 @@ ACTION_MERGE_LABELS_OPPORTUNITY = {
         9: 'Toggle Switch'
     }
 
+# ACTION_MERGE_LABELS_OPPORTUNITY = {0: 'Open Door 1',
+#     1: 'Open Door 2',
+#     2: 'Close Door 1',
+#     3: 'Close Door 2',
+#     4: 'Open Fridge',
+#     5: 'Close Fridge',
+#     6: 'Open Dishwasher',
+#     7: 'Close Dishwasher',
+#     8: 'Open Drawer 1',
+#     9: 'Close Drawer 1',
+#     10: 'Open Drawer 2',
+#     11: 'Close Drawer 2',
+#     12: 'Open Drawer 3',
+#     13: 'Close Drawer 3',
+#     14: 'Clean Table',
+#     15: 'Drink from Cup',
+#     16: 'Toggle Switch'}
+
 ACTION_MERGE_LABELS_HWU_USP = {
     0: "Ktch_B1_Drawer",
     1: "Ktch_B4_Cupboard",
@@ -296,7 +314,9 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
     fig.suptitle(title, fontsize=16)
     
     # 일관된 색상 매핑을 위한 색상 정의
-    colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    # colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    cmap = plt.cm.get_cmap('tab20', num_classes)
+    colors = cmap(np.linspace(0, 1, num_classes))
     
     # 실제 레이블 기준 시각화
     scatter1 = None
@@ -410,7 +430,9 @@ def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, tit
     ax2 = fig.add_subplot(122, projection='3d')
     
     # 일관된 색상 매핑을 위한 색상 정의
-    colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    # colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    cmap = plt.cm.get_cmap('tab20', num_classes)
+    colors = cmap(np.linspace(0, 1, num_classes))
     
     # 실제 레이블 기준 시각화
     scatter1 = None

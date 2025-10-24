@@ -2,25 +2,25 @@ import torch
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import MultiStepLR
 
-from model import CAVMAE
-from base import BasePretrainModule
+from .model import CAVMAE
+from baseline_modules import BasePretrainModule
 
 
 class CAVMAELightningModule(BasePretrainModule):
     def __init__(self, args):
         super().__init__(args)
-
+        
         # CAVMAE 모델 인스턴스 생성
         # DataModule에서 채널 수 등을 args에 추가해주면 더 좋습니다.
         self.model = CAVMAE(
-            sensor_in_chans=args.num_sensors, # 예시: 36
-            sensor_input_size=args.sensor_seq_len, # 예시: 128
-            norm_pix_loss=args.norm_pix_loss
+            sensor_in_chans=self.hparams.num_sensors, # 예시: 36
+            # embed_dim=self.hparams.embedding_dim,
+            sensor_seq_len=self.hparams.sensor_seq_len, # 예시: 128
+            norm_pix_loss=self.hparams.norm_pix_loss
         )
 
     def training_step(self, batch, batch_idx):
-        # DataModule에서 (video, sensor), label, id 튜플을 반환한다고 가정
-        (video, sensor), _, _ = batch
+        video, sensor, _, _ = batch
 
         # CAVMAE 모델의 forward 호출
         loss, loss_mae, loss_mae_s, loss_mae_v, loss_c, c_acc = self.model(

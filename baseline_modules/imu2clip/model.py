@@ -345,25 +345,27 @@ class Block(torch.nn.Module):
     def forward(self, batch):
         return self.net(batch)
 
-
 class MW2StackRNNPooling(pl.LightningModule):
-    def __init__(self, input_dim=32, size_embeddings: int = 128):
+    def __init__(self, num_sensors=37, input_dim=32, size_embeddings: int = 128):
         super().__init__()
         self.name = MW2StackRNNPooling
-        self.net = torch.nn.Sequential(
-            torch.nn.GroupNorm(2, 6),
-            Block(6, input_dim, 10),
+        self.conv_net = torch.nn.Sequential(
+            torch.nn.GroupNorm(1, num_sensors),
+            Block(num_sensors, input_dim, 10),
             Block(input_dim, input_dim, 5),
             Block(input_dim, input_dim, 5),
             torch.nn.GroupNorm(4, input_dim),
-            torch.nn.GRU(
-                batch_first=True, input_size=input_dim, hidden_size=size_embeddings
-            ),
+        )
+        self.gru = torch.nn.GRU(
+            batch_first=True, input_size=input_dim, hidden_size=size_embeddings
         )
 
     def forward(self, batch):
-        # return the last hidden state
-        return self.net(batch)[1][0]
+        x = self.conv_net(batch)         # [B, C, L]
+        x = x.transpose(1, 2)            # [B, L, C]  ✅ GRU 입력 형태로 변환
+        _, h_n = self.gru(x)             # h_n: [1, B, H]
+        return h_n[0]                    # [B, H]
+
 
 class ClipPLModel(pl.LightningModule):
 

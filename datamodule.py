@@ -19,7 +19,10 @@ class MethodDataModule(pl.LightningDataModule):
 
         self.set_dataset_params(args, stage)
         self.num_frames = args.num_frames
-        self.threshold_epoch = args.threshold_epoch
+        if args.model_name=="method":
+            self.threshold_epoch = args.threshold_epoch
+        else:
+            self.threshold_epoch = -1
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
 
@@ -36,15 +39,20 @@ class MethodDataModule(pl.LightningDataModule):
     def set_dataset_params(self, args, stage):
         if args.dataset_name == "Opportunity++":
             self.data_root = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-            self.json_path = f"/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject"
+            self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject"
+            # self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action"
             self.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
             self.start_index = 194
             self.end_index = 230
             self.cache_dir = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches"
         elif args.dataset_name == "HWU-USP":
             self.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
-            self.json_path = f"/mnt/hdd4tb/junho/HWU-USP_v2/splits_with_trashes"
-            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_11.npy"
+            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/splits_with_trashes"
+            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_priority" # with trashes
+            self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority" # with trashes
+            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2"
+            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/merging_motion_sensors"
+            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_11_with_trashes.npy" # 다시 만들기
             self.start_index = 1
             self.end_index = 11
             self.cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/caches"
@@ -54,9 +62,9 @@ class MethodDataModule(pl.LightningDataModule):
         # --- stage에 따른 JSON 경로 분기 설정 ---
         if stage == 'pretrain':
             print("INFO: DataModule configured for PRE-TRAINING stage.")
-            self.json_train_path = os.path.join(self.json_path, "pretrain.json")
+            self.json_train_path = os.path.join(self.json_path, "pretrain_cropped.json")
             # Pre-training 시 val/test가 필요 없다면 None으로 설정하거나 train과 동일하게 설정
-            self.json_val_path = os.path.join(self.json_path, "pretrain.json") if args.model_name == "method" else None
+            self.json_val_path = os.path.join(self.json_path, "pretrain_cropped.json") if args.model_name == "method" else None
             # Evaluate 용 data를 pretrain data와 동일하게 설정 (leak 방지)
             self.json_test_path = None
         
@@ -151,7 +159,7 @@ class MethodDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
         )
     def test_dataloader(self):
         return DataLoader(
@@ -160,7 +168,7 @@ class MethodDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
         )
 
     # VideoSensorDataset의 set_epoch를 호출하기 위한 콜백

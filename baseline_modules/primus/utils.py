@@ -100,6 +100,7 @@ def time_segment_permutation_transform_improved(X, num_segments=4): # Modified t
     """
     Randomly scrambling sections of the signal
     """
+    print(X.shape, num_segments)
     segment_points_permuted = np.random.choice(X.shape[-1], size=(X.shape[0], num_segments), replace=False)
     segment_points = np.sort(segment_points_permuted, axis=1)
     X_transformed = np.empty(shape=X.shape)

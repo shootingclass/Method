@@ -56,10 +56,29 @@ class SensorTransform:
         return filtfilt(self.b, self.a, data, axis=1)
 
     def _apply_normalization(self, data):
+        # data_new=[1,1,1,1,0,0,1,1,1,1,0]
+        # print("mean", self.mean, "std", self.std)
+        # print("default", (data_new-self.mean)/(self.std + 1e-8))
         if self.mean is not None and self.std is not None:
             mean = self.mean[:, np.newaxis]
             std = self.std[:, np.newaxis]
-            data = (data - mean) / (std + 1e-8)
+
+            data=(data-mean*data/(data+1e-8) )/(std+1e-8) # Same with below masking 0 code.
+
+            # mask = np.abs(data) >= 1e-8
+            # data[mask]=(data[mask]-self.mean)/self.std
+            # 1. 0이 아닌 값들의 위치를 2D 마스크로 찾음
+
+            # mask = np.abs(data) >= 1e-8 
+
+            # # 2. 전체 데이터에 대해 표준화 계산 (NumPy 브로드캐스팅 활용)
+            # #    (data(10, 11) - mean(11,)) / std(11,) -> 각 행에 mean/std가 적용됨
+            # standardized_data = (data - mean) / (std+1e-8)
+
+            # # 3. 마스크를 사용해서 0이 아니었던 위치의 값들만 표준화된 값으로 업데이트
+            # #    data[mask] = standardized_data[mask]와 동일
+            # np.copyto(data, standardized_data, where=mask)
+
         return data
 
     def _resize_to_target_len(self, data, device):
@@ -120,7 +139,8 @@ class ClipConsistentTransforms:
         # 2. 모든 프레임에 동일한 파라미터로 변환 적용 (루프)
         tensor_frames = []
         for frame in clip:
-            frame = T.Resize(self.size, antialias=True)(frame) # crop 구현 완료 전에 임시로 resize 사용
+            # print("shape", frame.size)
+            frame = T.Resize(self.size, antialias=True)(frame) # HWU-USP는 224*224로 resize (Opportunity++는 224*224 Crop된 비디오 사용)
 
             # if apply_flip:
             #     frame = TF.hflip(frame)
@@ -199,10 +219,9 @@ class VideoSensorDataset(Dataset):
 
     def __getitem__(self, idx: int):
         video_path, sensor_path, label, item_id = self.samples[idx]
-        item_id = idx
         
         ######### 비디오 전처리 #########       
-        if self.current_epoch <= -1:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
+        if self.current_epoch <= self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
             # 1. self.num_frames 개수만큼의 가짜 이미지 '리스트'를 생성합니다.
             dummy_clip = [Image.new('RGB', (224, 224)) for _ in range(self.num_frames)]
 
@@ -268,17 +287,45 @@ class VideoSensorDataset(Dataset):
                         else:
                             frames.append(Image.new('RGB', (224, 224)))
                 try:
-                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                    temp_cache_path = cache_path + ".tmp"
-                    torch.save(frames, temp_cache_path)
                     # 쓰기 성공 시에만 최종 이름으로 변경
-                    os.rename(temp_cache_path, cache_path) 
-                    print("clip is cached", cache_path)
+                    # 2. 캐시 파일이 없음 -> 락을 잡고 캐시 생성 시도
+                    import fcntl
+                    lock_path = cache_path + ".lock"      # 락 파일 경로
+                    # 락 파일을 'w' 모드로 엽니다.
+                    with open(lock_path, 'w') as f_lock:
+                        # 락을 시도 (배타적 락). 다른 프로세스가 락을 잡고 있으면 여기서 대기합니다.
+
+                        fcntl.flock(f_lock, fcntl.LOCK_EX)
+                        # print("clip is cached", cache_path)
+
+                        # 3. 락을 획득한 후, 혹시 그사이에 다른 워커가 캐시를 만들었는지 다시 확인 (Double Check)
+                        #    (우리가 락을 기다리는 동안, 앞선 워커가 캐싱을 완료했을 수 있음)
+                        temp_cache_path = cache_path + ".tmp"
+                        
+                        if os.path.exists(cache_path):
+
+                            frames = torch.load(cache_path, weights_only=False)
+                        else:
+                            # 4. 여기 온 워커가 '최초의' 캐시 생성자임
+                            # print(f"Worker {os.getpid()} creating cache: {cache_path}")
+                            
+                            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        
+                            torch.save(frames, temp_cache_path)
+                            os.rename(temp_cache_path, cache_path) 
+                            print("clip is cached", cache_path)
+                            
+                        # --- 기존 코드 끝 ---
                 except Exception as e:
                     print(f"Error during atomic cache write for {cache_path}: {e}")
                     if os.path.exists(temp_cache_path):
                         os.remove(temp_cache_path)
                     pass
+                finally:
+                    # 5. 모든 작업이 끝나면 (성공하든, 에러가 나든) 락 파일을 삭제
+                    #    (f_lock이 닫히면서 락 자체는 자동으로 해제됨)
+                    if os.path.exists(lock_path):
+                        os.remove(lock_path)
 
                 cap.release()
 
@@ -315,8 +362,7 @@ class VideoSensorDataset(Dataset):
         # 센서 데이터 전처리 적용
         if self.sensor_transform:
             sensor_data = self.sensor_transform(sensor_data)
-
-        return frames_tensor, sensor_data, label, item_id
+        return frames_tensor, sensor_data, label, [idx, item_id]
     
     def set_epoch(self, epoch):
         self.current_epoch = epoch

@@ -16,16 +16,16 @@ from torch.utils.data.distributed import DistributedSampler
 
 # --- 사용자 정의 모듈 임포트 ---
 from model import SensorModel, VisionModel, ClusteringModel
-from baseline_modules.base import BasePretrainModule
 
 ####################################################################
 
 
 
-class MethodLightningModule(BasePretrainModule):
+class MethodLightningModule(pl.LightningModule):
 
-    def __init__(self, args, train_dataloader):
-        super().__init__(args)
+    def __init__(self, args, datamodule=None):
+        super().__init__()
+        self.save_hyperparameters(args)
         # 1. 모델 구성 요소 초기화
 
         self.video_model = VisionModel(image_size=224)
@@ -35,12 +35,12 @@ class MethodLightningModule(BasePretrainModule):
             embedding_dim=self.hparams.embedding_dim,
             num_sensors=self.hparams.num_sensors,
             num_clusters=self.hparams.num_classes,
-            train_dataloader=train_dataloader,
+            datamodule=datamodule,
             top_k=self.hparams.top_k,
             prototype_cache_dir=os.path.join(self.hparams.cache_dir, "prototypes"),
             dataset_name=self.hparams.dataset_name,
+            min_cluster_size=self.hparams.min_cluster_size
         )
-        self.train_dataloader = train_dataloader
         self.epoch = 0
         
         self.appearance_classifier = nn.Linear(256, self.hparams.num_classes) 
@@ -65,6 +65,7 @@ class MethodLightningModule(BasePretrainModule):
     def training_step(self, batch, batch_idx):
         # 0. 데이터 준비 (Lightning이 자동으로 device로 옮겨줍니다)
         videos, sensors, labels, sample_ids = batch
+        idx, sample_id = sample_ids
 
         # 실제 배치 크기를 텐서에서 직접 가져옵니다.
         current_batch_size = videos.size(0)
@@ -82,10 +83,10 @@ class MethodLightningModule(BasePretrainModule):
             imu_data_aug = sensors
         
         # 모델 순전파
-        scores, features = self.clustering_model(imu_data_aug, return_features=True, labels=labels, sample_ids=sample_ids)
-        
+        scores, features = self.clustering_model(imu_data_aug, return_features=True, labels=labels, idx=idx)
+        # print("scores", scores)
         # 메모리 뱅크에서 저장된 pseudo label 가져오기
-        stored_pseudo_labels = self.clustering_model.get_pseudo_labels(sample_ids)
+        stored_pseudo_labels = self.clustering_model.get_pseudo_labels(idx)
         
         # 클러스터 할당 (argmax) - ODC 논문과 유사하게 메모리 뱅크 활용
         with torch.no_grad():
@@ -94,7 +95,7 @@ class MethodLightningModule(BasePretrainModule):
 
             # 2. EMA 방식으로 메모리 뱅크 업데이트 (레이블과 특징 모두)
             #    (이 함수는 내부적으로 old_feature와 new_feature를 섞어줍니다)
-            self.clustering_model.clustering_manager.update_samples_memory(sample_ids, 
+            self.clustering_model.clustering_manager.update_samples_memory(idx, 
                                                     features)
 
             # 손실 계산에 사용할 레이블은 안정적인 '과거'의 레이블을 사용
@@ -123,7 +124,7 @@ class MethodLightningModule(BasePretrainModule):
             output = {
                 'features': features.detach(),
                 'labels': labels.detach(),
-                'predicted_labels': loss_labels.detach()
+                'predicted_labels': current_cluster_ids.detach()
             }
             self.training_steps_outputs.append(output)
             return loss_cluster
@@ -262,126 +263,13 @@ class MethodLightningModule(BasePretrainModule):
             if self.epoch % 1 == 0:
                 print(f"\nEpoch {self.epoch}: Running ODC evaluation on training data...")
                 self.clustering_model.evaluate(outputs)
-        
-        # self.global_rank가 0일 때 (즉, 마스터 프로세스일 때)만 로깅 코드를 실행합니다.
-        # if self.global_rank != 0 :
-        #     self.eval()
-        #     self.clustering_model.evaluate(self.device)
-            # print("go eval with ", self.global_rank)
+    
         print("evaluate called on rank", self.global_rank)
         # 매 2 에폭마다 훈련 데이터셋에 대한 클러스터링 성능 평가
-        
-        if self.global_rank == 0:
-            if self.epoch >= self.hparams.threshold_epoch:  
-                with torch.no_grad():
-                    batch = next(iter(self.train_dataloader()))
 
-                    videos, _, _, _ = batch
-                    videos = videos.to(self.device)
-
-                    # 시각화는 첫 번째 비디오만 사용
-                    video_to_log = videos[0]
-
-                    model_output = self.video_model(videos)
-
-                    # 원본 비디오 준비 
-                    mean = torch.tensor(self.mean, device=self.device).view(1, 3, 1, 1)
-                    std = torch.tensor(self.std, device=self.device).view(1, 3, 1, 1)
-                    
-                    # wandb.Video 형식 (T, C, H, W)에 맞게 차원 변경
-                    original_video_frames = video_to_log
-
-                    # 역정규화 수행 (std 곱하고 mean 더하기)
-                    unnormalized_video = original_video_frames * std + mean
-                    
-                    # 값 범위를 0-1 사이로 안전하게 클리핑
-                    unnormalized_video = torch.clamp(unnormalized_video, 0, 1)
-                    video_original = (unnormalized_video * 255).to(torch.uint8)
-
-                    # final_features (전체) 시각화 
-                    final_features = model_output['final_features'][0]
-                    
-                    # final_features의 shape는 (T, Num_Tokens, Feature_Dim) 형태입니다.
-                    # Num_Tokens 차원(dim=1)에서 첫 번째 토큰(CLS)을 제외하고 나머지를 선택합니다.
-                    features_no_cls = final_features[:, 1:, :]
-                    
-                    # 이제 CLS 토큰이 제외된 피처맵을 사용해 패치 수를 계산합니다.
-                    num_patches = features_no_cls.shape[1]
-                    grid_size = int(math.sqrt(num_patches))
-                    
-                    if grid_size * grid_size == num_patches:
-                        final_features_grid = features_no_cls.reshape(features_no_cls.shape[0], grid_size, grid_size, -1)
-                        final_features_permuted = final_features_grid.permute(0, 3, 1, 2)
-                        heatmap_final = torch.mean(final_features_permuted, dim=1)
-
-                        # 히트맵을 원본 비디오 크기로 업샘플링(확대)합니다.
-                        H, W = video_original.shape[2], video_original.shape[3] # 원본 비디오의 높이(H)와 너비(W)
-                        
-                        # interpolate를 위해 채널 차원(C)을 임시로 추가 (T, 1, 7, 7)
-                        heatmap_unsqueezed = heatmap_final.unsqueeze(1) 
-                        
-                        # 'bilinear' 방식으로 부드럽게 크기를 확대합니다.
-                        heatmap_upsampled = F.interpolate(heatmap_unsqueezed, size=(H, W), mode='bilinear', align_corners=False)
-                        
-                        # 임시로 추가했던 채널 차원을 다시 제거 (T, H, W)
-                        heatmap_upsampled = heatmap_upsampled.squeeze(1)
-
-                        # 업샘플링된 히트맵에 컬러맵을 적용합니다.
-                        normalized_frames = []
-                        for frame in heatmap_upsampled: # 이제 고해상도 히트맵을 사용합니다.
-                            min_val, max_val = torch.min(frame), torch.max(frame)
-                            normalized_frame = (frame - min_val) / (max_val - min_val) if max_val > min_val else torch.zeros_like(frame)
-                            normalized_frames.append(normalized_frame)
-                        heatmap_colored = torch.stack(normalized_frames)
-
-                    cmap = plt.get_cmap('viridis')
-
-                    # (T, H, W, 3) 형태로 변환, 값은 0~1 사이
-                    colored_frames_np = cmap(heatmap_colored.cpu().numpy())[:, :, :, :3] 
-
-                    # (T, 3, H, W) 형태로 변환, 값은 0~255 사이
-                    colored_video_tensor = (torch.from_numpy(colored_frames_np).permute(0, 3, 1, 2) * 255).to(torch.uint8)
-
-                    # 원본 비디오와 컬러 히트맵을 오버레이(겹치기)합니다.
-                    # 연산을 위해 원본 비디오와 히트맵을 float 형태로 변경
-                    original_float = video_original.cpu().to(torch.float32)
-                    heatmap_float = colored_video_tensor.to(torch.float32)
-
-                    # 가중치를 주어 두 비디오를 합칩니다.
-                    alpha = 0.5
-                    overlayed_video = original_float * (1 - alpha) + heatmap_float * alpha
-
-                    # wandb 로깅을 위해 다시 uint8 형태로 변환
-                    video_final_features_overlay = overlayed_video.to(torch.uint8)
-
-                    # transformed_features (부분) 시각화
-                    transformed_features = model_output['transformed_features'][0]
-                    transformed_features_permuted = transformed_features.permute(1, 0, 2, 3)
-                    heatmap_transformed = torch.mean(transformed_features_permuted, dim=1)
-
-                    normalized_frames_transformed = []
-                    for frame in heatmap_transformed:
-                        min_val, max_val = torch.min(frame), torch.max(frame)
-                        normalized_frame = (frame - min_val) / (max_val - min_val) if max_val > min_val else torch.zeros_like(frame)
-                        normalized_frames_transformed.append(normalized_frame)
-                    heatmap_transformed = torch.stack(normalized_frames_transformed)
-
-                    cmap = plt.get_cmap('viridis')
-                    colored_frames_transformed_np = cmap(heatmap_transformed.cpu().numpy())[:, :, :, :3]
-                    colored_video_transformed_tensor = torch.from_numpy(colored_frames_transformed_np).permute(0, 3, 1, 2)
-                    video_transformed_features = (colored_video_transformed_tensor * 255).to(torch.uint8)
-
-                    # Wandb 로깅
-                    log_dict = {
-                        "epoch_visuals/transformed_features": wandb.Video(video_transformed_features.cpu(), fps=4, format="gif")
-                    }
-                    if video_final_features_overlay is not None:
-                        log_dict["epoch_visuals/final_features"] = wandb.Video(video_final_features_overlay.cpu(), fps=4, format="gif")
-
-                    self.logger.experiment.log(log_dict)
-                    print("Feature map visualizations logged to wandb.")
-            
-            print("threshold_epoch not reached, skipping feature visualization.")
-        
-            self.train()  # 모델을 다시 훈련 모드로 설정
+        self.train()  # 모델을 다시 훈련 모드로 설정
         print("Epoch end processing completed on rank", self.global_rank)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        return optimizer

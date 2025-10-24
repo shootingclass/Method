@@ -7,6 +7,7 @@ from transformers import (
     VideoMAEImageProcessor,
     AutoImageProcessor,
     TimesformerModel,
+    TimesformerForVideoClassification
 )
 import torch
 import torch.nn as nn
@@ -25,8 +26,13 @@ def MLP(input_dim, output_dim, hidden_dim, activation_fn=nn.GELU):
 
 
 def resize(X):
+    if not isinstance(X, torch.Tensor):
+        X = torch.tensor(X, dtype=torch.float)
+    else:
+        X = X.detach().clone().float()  # 그래디언트 분리 + dtype 일치
+    X = X.to(device)
     X_scaled = F.interpolate(
-        torch.tensor(X, dtype=torch.float).to(device),
+        X,
         size=512,
         mode="linear",
         align_corners=False,
@@ -96,7 +102,8 @@ class VideoTeacher(nn.Module):
             self.processor = VideoMAEImageProcessor.from_pretrained(model_name)
             self.use_mean_pooling = self.model.config.use_mean_pooling
         elif "timesformer" in model_name.lower():
-            self.model = TimesformerModel.from_pretrained(model_name, **kwargs)
+            # self.model = TimesformerModel.from_pretrained(model_name, **kwargs)
+            self.model = TimesformerForVideoClassification.from_pretrained(model_name, **kwargs)
             self.processor = AutoImageProcessor.from_pretrained(model_name)
             self.use_mean_pooling = True
         self.device = device
@@ -165,6 +172,8 @@ class VideoTeacherMLP(nn.Module):
         )
         self.to(self.device)
         self.eval()
+        for p in self.parameters():
+            p.requires_grad = False
 
     @property
     def image_mean(self):
@@ -309,6 +318,7 @@ class IMUStudentMLP(nn.Module):
         mlp_hidden_dim: int,
         activation_fn=nn.GELU,
         reduction="concat",
+        num_sensors=37
     ):
         super(IMUStudentMLP, self).__init__()
         self.imu_student = imu_student
@@ -316,13 +326,13 @@ class IMUStudentMLP(nn.Module):
             if reduction == "mean":
                 self.student_dimension = self.imu_student.config.d_model
             elif reduction == "concat":
-                self.student_dimension = self.imu_student.config.d_model * 6
+                self.student_dimension = self.imu_student.config.d_model * num_sensors
         elif isinstance(self.imu_student, Mantis8M):
-            self.student_dimension = self.imu_student.hidden_dim * 6
+            self.student_dimension = self.imu_student.hidden_dim * num_sensors
         elif isinstance(self.imu_student, FineTuningNetwork):
-            self.student_dimension = self.imu_student.encoder.hidden_dim * 6
+            self.student_dimension = self.imu_student.encoder.hidden_dim * num_sensors
         elif isinstance(self.imu_student, ChronosBoltPipeline):
-            self.student_dimension = self.imu_student.model.config.d_model * 6
+            self.student_dimension = self.imu_student.model.config.d_model * num_sensors
         self.mlp_output_dim = mlp_output_dim
         self.mlp_hidden_dim = mlp_hidden_dim
         self.activation_fn = activation_fn()
