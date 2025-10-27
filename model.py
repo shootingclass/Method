@@ -22,14 +22,122 @@ from method_utils import time_warp
 
 #################################################################
 
-import torch
-import torch.nn as nn
+
+
+# # Block 클래스는 그대로 둔다고 가정
+# class ChannelAttention(nn.Module):
+#     def __init__(self, channels, reduction=8):
+#         super().__init__()
+#         self.fc = nn.Sequential(
+#             nn.Linear(channels, channels // reduction, bias=False),
+#             nn.ReLU(),
+#             nn.Linear(channels // reduction, channels, bias=False),
+#             nn.Sigmoid(),
+#         )
+
+#     def forward(self, x):
+#         # x: [B, C, L]
+#         w = x.mean(dim=-1)  # Global avg pooling across time
+#         attention = w.clone()
+#         w = self.fc(w)      # [B, C]
+#         w = w.unsqueeze(-1) # [B, C, 1]
+#         return x * (1 + 0.5 * w), attention
+
+
+# class SensorModel(nn.Module):
+#     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
+#         super().__init__()
+#         # 개별 레이어 정의
+#         self.norm1 = torch.nn.GroupNorm(1, sensor_channels)
+#         self.block1 = Block(sensor_channels, input_dim, 5)
+#         self.block2 = Block(input_dim, input_dim * 2, 3)
+#         self.block3 = Block(input_dim * 2, input_dim * 2, 3, 
+#                             pool_type="adaptive", embedding_size=32) # Adaptive 출력 길이는 32
+#         self.norm2 = torch.nn.GroupNorm(4, input_dim * 2)
+#         self.attn = ChannelAttention(sensor_channels)
+        
+#         # ★★★ GRU input_size 수정 ★★★
+#         self.gru = torch.nn.GRU(
+#             batch_first=True, 
+#             input_size=input_dim * 2, # 이전 레이어 출력 채널과 일치
+#             hidden_size=size_embeddings
+#         )
+        
+#         self.ssl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+#         self.mmcl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+# # --- 추가 변수 ---
+#         # ---- Attention 추가 ----
+#         self.attn = ChannelAttention(sensor_channels)
+#         self.ema_decay = 0.9          # EMA smoothing (0.8 → 0.9 추천)
+#         self.attn_scale = 0.5       # attention strength (e.g., 0.5)
+#         self.register_buffer("attn_smooth", torch.zeros(sensor_channels))
+
+#         # ---- GRU + head ----
+#         self.gru = nn.GRU(batch_first=True, input_size=input_dim * 2, hidden_size=size_embeddings)
+#         self.ssl_head = nn.Linear(size_embeddings, size_embeddings)
+#         self.mmcl_head = nn.Linear(size_embeddings, size_embeddings)
+
+#     def forward(self, batch, labels=None):
+#        # 1️⃣ Attention
+#         x, attention = self.attn(batch)  # attention: [B, C]
+#         w_mean = attention.mean(dim=0).detach()
+
+#         # EMA smoothing
+#         self.attn_smooth = self.ema_decay * self.attn_smooth + (1 - self.ema_decay) * w_mean
+
+#         # Door indices (for Opportunity++)
+#         door_idx = [207 - 194, 208 - 194, 209 - 194]
+
+#         # 2️⃣ Regularization factors
+#         door_focus = self.attn_smooth[door_idx].mean()
+#         door_var = torch.var(self.attn_smooth[door_idx])
+#         global_var = torch.var(self.attn_smooth)
+#         change_rate = (attention - w_mean.unsqueeze(0)).abs().mean()
+
+#         # 3️⃣ Regularization loss
+#         attn_reg = (0.05 * (door_focus.abs()) + 0.01 * global_var + 0.05 * door_var)
+#         attn_reg += 0.03 * (1 - door_focus.abs().clamp(max=1))
+
+#         # # 4️⃣ wandb logging
+#         # if labels is not None and hasattr(wandb, "log"):
+#         #     wandb.log({
+#         #         "attention/door1/open_x": self.attn_smooth[door_idx[0]].item(),
+#         #         "attention/door1/open_y": self.attn_smooth[door_idx[1]].item(),
+#         #         "attention/door1/open_z": self.attn_smooth[door_idx[2]].item(),
+#         #         "attention/door_focus_ratio": door_focus.item(),
+#         #         "attention/door1/diff_mean": door_var.item(),
+#         #         "attention/change_rate": change_rate.item(),
+#         #         "attention/global_var": global_var.item(),
+#         #         "loss/attn_reg": attn_reg.item(),
+#         #     })
+
+#         # --- scaled modulation ---
+#         x = x * (1 + self.attn_scale * self.attn_smooth.unsqueeze(0).unsqueeze(-1))
+#         x = self.norm1(x)
+#         x = self.block1(x)
+#         x = self.block2(x)
+#         x = self.block3(x) 
+#         x = self.norm2(x) # shape: (B, C = input_dim*2, L = 32)
+
+#         # ★★★ GRU 입력 전 차원 변경 ★★★
+#         # (B, C, L) -> (B, L, C)
+#         print(x.shape)
+#         x = x.permute(0, 2, 1) # shape: (B, 32, input_dim*2)
+
+#         # ★★★ GRU 호출 및 결과 처리 ★★★
+#         _, hidden_state = self.gru(x) # (output_seq, hidden_state)
+#         emb = hidden_state[0] # 마지막 은닉 상태 (B, hidden_size)
+
+#         ssl_out = self.ssl_head(emb)
+#         mmcl_out = self.mmcl_head(emb)
+#         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
+#         return out
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, pool_type="max", embedding_size=32):
         super().__init__()
         if pool_type == "max":
-            pool_fn = torch.nn.MaxPool1d(kernel_size=3)
+            pool_fn = torch.nn.MaxPool1d(kernel_size=2)
         elif pool_type == "adaptive":
             pool_fn = torch.nn.AdaptiveAvgPool1d(output_size=embedding_size)
         else:
@@ -51,165 +159,62 @@ class Block(torch.nn.Module):
     def forward(self, batch):
         return self.net(batch)
     
+    
+# class SensorModel(nn.Module):
+#     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
+#         super().__init__()
+#         self.backbone = torch.nn.Sequential(
+#             torch.nn.GroupNorm(1, sensor_channels),
+#             Block(sensor_channels, input_dim, 5),
+#             Block(input_dim, input_dim *2, 3),
+#             Block(input_dim *2, input_dim *2, 3, pool_type="adaptive", embedding_size=32),
+#             torch.nn.GroupNorm(4, input_dim *2),
+#             torch.nn.GRU(
+#                 batch_first=True, input_size=input_dim, hidden_size=size_embeddings
+#             ),
+#         )
+#         self.ssl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+#         self.mmcl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+
+#     def forward(self, batch):
+#         emb = self.backbone(batch)[1][0] # Last hidden state
+#         ssl_out = self.ssl_head(emb)
+#         mmcl_out = self.mmcl_head(emb)
+#         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
+#         return out
+
 class SensorModel(nn.Module):
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
         super().__init__()
-        self.backbone = torch.nn.Sequential(
-            torch.nn.GroupNorm(1, sensor_channels),
-            Block(sensor_channels, input_dim, 5),
-            Block(input_dim, input_dim *2, 3),
-            Block(input_dim *2, input_dim *2, 3, pool_type="adaptive", embedding_size=32),
-            torch.nn.GroupNorm(4, input_dim *2),
-            torch.nn.GRU(
-                batch_first=True, input_size=input_dim, hidden_size=size_embeddings
-            ),
+        self.block1 = Block(sensor_channels, input_dim, 5)
+        self.block2 = Block(input_dim, input_dim * 2, 3)
+        self.block3 = Block(input_dim * 2, input_dim * 2, 3, pool_type="adaptive", embedding_size=32)
+        self.norm = torch.nn.GroupNorm(4, input_dim * 2)
+
+        self.gru = torch.nn.GRU(
+            batch_first=True,
+            input_size=input_dim * 2,  # GRU 입력은 feature dimension
+            hidden_size=size_embeddings
         )
         self.ssl_head = torch.nn.Linear(size_embeddings, size_embeddings)
         self.mmcl_head = torch.nn.Linear(size_embeddings, size_embeddings)
 
     def forward(self, batch):
-        emb = self.backbone(batch)[1][0] # Last hidden state
+        x = self.block1(batch)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.norm(x)        # [B, C, L]
+
+        # ✅ GRU가 [B, L, C]를 기대하므로 permute
+        x = x.permute(0, 2, 1)  # [B, L, C]
+
+        _, h = self.gru(x)      # h: [1, B, hidden_size]
+        emb = h[0]              # [B, hidden_size]
+
         ssl_out = self.ssl_head(emb)
         mmcl_out = self.mmcl_head(emb)
-        out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
-        return out
+        return {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 
-# class SensorModel(nn.Module):
-#     """각 센서 채널을 독립적으로 처리한 후, 그 특징들을 GRU로 융합하는 모델"""
-#     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
-#         super().__init__()
-#         self.in_channels = sensor_channels
-#         self.per_channel_dim = input_dim
-
-#         # 1. 각 채널에 독립적으로 적용될 작은 1D CNN
-#         # 모든 채널이 이 동일한 CNN을 공유함
-#         self.channel_encoder = nn.Sequential(
-#             nn.Conv1d(1, 8, kernel_size=5, padding=2),
-#             nn.ReLU(),
-#             nn.Conv1d(8, input_dim, kernel_size=3, padding=1),
-#             nn.ReLU(),
-#             nn.AdaptiveAvgPool1d(1) # 각 채널의 시계열을 하나의 벡터로
-#         )
-        
-#         # 2. 채널별 특징들을 융합(fusion)하기 위한 GRU
-#         self.fusion_gru = nn.GRU(
-#             input_size=input_dim,
-#             hidden_size=size_embeddings,
-#             batch_first=True
-#         )
-
-#     def forward(self, x):
-#         # x shape: (Batch, Channels, SequenceLength)
-#         B, C, L = x.shape
-        
-#         # 1. 각 채널을 독립적으로 처리하기 위해 차원 변경
-#         # (B, C, L) -> (B * C, 1, L)
-#         x_reshaped = x.view(-1, 1, L)
-        
-#         # 2. 채널별 인코딩
-#         channel_features = self.channel_encoder(x_reshaped) # -> (B * C, per_channel_dim, 1)
-#         channel_features = channel_features.squeeze(-1) # -> (B * C, per_channel_dim)
-        
-#         # 3. 다시 배치 형태로 복원
-#         # (B * C, per_channel_dim) -> (B, C, per_channel_dim)
-#         channel_features_batched = channel_features.view(B, C, self.per_channel_dim)
-        
-#         # (여기서 top_k 센서 선택 로직을 적용할 수 있습니다)
-#         # 예를 들어, 특정 규칙으로 k개의 채널 인덱스를 선택하여
-#         # selected_features = channel_features_batched[:, top_k_indices, :] 와 같이 처리한 후 fusion_gru에 넣을 수 있습니다.
-        
-#         # 4. GRU로 채널 간의 관계를 학습하여 최종 특징 추출
-#         _, hidden = self.fusion_gru(channel_features_batched)
-        
-#         out = {"emb": hidden[-1]} # -> (B, feature_dim)
-#         return out
-    
-# # 1. 채널 어텐션 (Squeeze-and-Excitation) 블록 정의
-# # 이 부분은 수정 없이 그대로 사용합니다.
-# class SEBlock(nn.Module):
-#     """
-#     Squeeze-and-Excitation 블록으로, 채널별 중요도를 동적으로 학습합니다.
-#     """
-#     def __init__(self, num_channels, reduction_ratio=16):
-#         super(SEBlock, self).__init__()
-#         # Squeeze 과정: 글로벌 정보를 요약
-#         self.squeeze = nn.AdaptiveAvgPool1d(1)
-#         # Excitation 과정: 어떤 채널이 중요한지 학습
-#         self.excitation = nn.Sequential(
-#             nn.Linear(num_channels, num_channels // reduction_ratio, bias=False),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(num_channels // reduction_ratio, num_channels, bias=False),
-#             nn.Sigmoid()
-#         )
-
-#     def forward(self, x):
-#         batch_size, channels, _ = x.shape
-#         # Squeeze를 통해 (batch, channels, 1) -> (batch, channels)로 변환
-#         y = self.squeeze(x).view(batch_size, channels)
-#         # Excitation을 통해 채널별 중요도(가중치) 계산
-#         y = self.excitation(y).view(batch_size, channels, 1)
-#         # 원래의 입력(x)에 중요도를 곱하여 스케일 조정 (Rescale)
-#         return x * y.expand_as(x)
-
-# # 2. 양방향 풀링이 적용된 최종 센서 인코더
-# class SensorModel(nn.Module):
-#     """
-#     순간적인 행동(positive & negative peaks)을 포착하기 위해 
-#     양방향 풀링(Bi-directional Pooling)과 채널 어텐션을 사용하는 센서 인코더.
-#     """
-#     def __init__(self, sensor_channels, size_embeddings=128):
-#         super(SensorModel, self).__init__()
-        
-#         # 1D CNN 레이어
-#         self.conv1 = nn.Conv1d(in_channels=sensor_channels, out_channels=64, kernel_size=3, padding=1)
-#         self.bn1 = nn.BatchNorm1d(64)
-#         self.conv2 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
-#         self.bn2 = nn.BatchNorm1d(128)
-
-#         # 채널 어텐션 블록
-#         self.se_block = SEBlock(num_channels=128)
-        
-#         # Max Pooling 레이어 (양방향 풀링에 공통으로 사용)
-#         self.temporal_pool = nn.AdaptiveMaxPool1d(1)
-        
-#         # 최종 임베딩을 위한 MLP
-#         # --- 수정된 부분 --- #
-#         # 양방향 풀링으로 max와 min 특징이 결합되므로, 입력 차원이 2배가 됨 (128 -> 256)
-#         self.fc = nn.Sequential(
-#             nn.Linear(128 * 2, 128), # 입력 차원 수정
-#             nn.ReLU(inplace=True),
-#             nn.Linear(128, size_embeddings)
-#         )
-
-#     def forward(self, x):
-#         # 입력 데이터 shape: (batch_size, num_channels, sequence_length)
-        
-#         # CNN으로 특징 추출
-#         x = F.relu(self.bn1(self.conv1(x)))
-#         features = F.relu(self.bn2(self.conv2(x)))
-        
-#         # 채널 어텐션 적용
-#         features = self.se_block(features)
-        
-#         # --- 양방향 풀링 (Bi-directional Pooling) --- #
-#         # 1. 양의 방향으로 가장 큰 순간 포착
-#         max_pool_features = self.temporal_pool(features) 
-        
-#         # 2. 음의 방향으로 가장 큰 순간 포착 (min pooling 효과)
-#         # features에 -를 붙여서 max_pool을 하면 가장 작은 값을 찾는 효과
-#         min_pool_features = self.temporal_pool(-features)
-        
-#         # 3. 두 특징을 채널 차원에서 결합 (concatenate)
-#         # 결합 전에 min_pool_features에 다시 -를 붙여 원래 값으로 복원
-#         pooled_features = torch.cat([max_pool_features, -min_pool_features], dim=1)
-        
-#         # Flatten
-#         pooled_features = pooled_features.view(pooled_features.size(0), -1) 
-        
-#         # MLP로 최종 임베딩 생성
-#         embedding = self.fc(pooled_features)
-        
-#         return {"emb": embedding}
 
 #################################################################
 
@@ -286,700 +291,146 @@ class Clip4ClipVisionModel(nn.Module):
 
 #################################################################
 
-
-class DinoVisionModel(nn.Module):
-    """
-    DINO로 사전 학습된 ViT를 특징 추출기로 사용하는 클래스 (수정본).
-    """
-    def __init__(self): # num_classes는 특징 추출만 하므로 필요 없음
+# ---------------------------------------------------------------------
+# Attention Head (Object branch saliency map)
+# ---------------------------------------------------------------------
+class AttentionHead(nn.Module):
+    """Salient region 강조용 간단한 2D attention head."""
+    def __init__(self, in_channels):
         super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
 
-        # DINO ViT 모델 로드
-        self.video_model = AutoModel.from_pretrained("facebook/dinov2-small")
+    def forward(self, x):
+        # x: [B, C, H, W]
+        return self.sigmoid(self.conv(x))  # [B, 1, H, W]
 
-        # 2. ViTModel 아키텍처에 맞는 LoRA 설정
-        lora_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=[
-                "attention.attention.query",
-                "attention.attention.key",
-                "attention.attention.value",
-                "attention.output.dense",
-                "intermediate.dense",
-                "output.dense",
-            ],
-            lora_dropout=0.05,
-            bias="none"
+
+# ---------------------------------------------------------------------
+# Shared CNN Encoder (Scene/Object 공통)
+# ---------------------------------------------------------------------
+
+class SharedEncoder(nn.Module):
+    """MOSO 스타일의 공유 CNN feature extractor."""
+    def __init__(self, in_channels=3, base_dim=64, out_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, 7, stride=2, padding=3, bias=False),  # 224→112
+            nn.BatchNorm2d(base_dim),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(base_dim, base_dim * 2, 3, stride=2, padding=1, bias=False), # 112→56
+            nn.BatchNorm2d(base_dim * 2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(base_dim * 2, base_dim * 4, 3, stride=2, padding=1, bias=False), # 56→28
+            nn.BatchNorm2d(base_dim * 4),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(base_dim * 4, out_dim, 3, stride=2, padding=1, bias=False), # 28→14
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
         )
 
-        self.video_model = get_peft_model(self.video_model, lora_config)
-        self.video_model.print_trainable_parameters() # 학습 가능한 파라미터 수 확인
+    def forward(self, x):
+        return self.net(x)  # [B, out_dim, H', W']
 
 
-    def forward(self, video: torch.Tensor):
-        if video.dim() == 4:
-            video = video.unsqueeze(1)
+# ---------------------------------------------------------------------
+# Scene Branch (Global context)
+# ---------------------------------------------------------------------
+class SceneBranch(nn.Module):
+    """Global/static appearance representation."""
+    def __init__(self, in_dim=256, latent_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_dim, latent_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(latent_dim),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1)
+        )
 
-        batch_size, n_frames, c, h, w = video.shape
-        video_reshaped = video.view(batch_size * n_frames, c, h, w)
+    def forward(self, x):
+        # [B, C, H, W] → [B, latent_dim]
+        return self.net(x).flatten(1)
 
-        # 1. output_hidden_states=True 옵션 없이 모델 호출
-        visual_output = self.video_model(video_reshaped)
 
-        # 2. .hidden_states 대신 .last_hidden_state를 직접 사용
-        final_features = visual_output.last_hidden_state
+# ---------------------------------------------------------------------
+# Object Branch (Local salient appearance)
+# ---------------------------------------------------------------------
+class ObjectBranch(nn.Module):
+    """Foreground/local salient representation."""
+    def __init__(self, in_dim=256, latent_dim=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_dim, latent_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(latent_dim),
+            nn.ReLU(inplace=True)
+        )
+        self.attn = AttentionHead(latent_dim)
+        self.pool = nn.AdaptiveAvgPool2d(1)
 
-        # 최종 특징 텐서의 형태를 원래 비디오 차원에 맞게 복원
-        seq_len = final_features.shape[1]
-        hidden_size = final_features.shape[2]
-        final_features = final_features.view(batch_size, n_frames, seq_len, hidden_size)
+    def forward(self, x):
+        feat = self.conv(x)                 # [B, latent_dim, H, W]
+        attn = self.attn(feat)              # [B, 1, H, W]
+        obj_feat = self.pool(feat * attn).flatten(1)
+        return obj_feat
 
-        # 최종 특징만 반환하도록 수정
+
+# ---------------------------------------------------------------------
+# VisionModel (MOSO-style Appearance Decomposition)
+# ---------------------------------------------------------------------
+class VisionModel(nn.Module):
+    """
+    MOSO 구조 기반 VisionModel (Motion 제거 버전)
+    - Shared CNN encoder
+    - Scene / Object branch
+    - Combined Appearance vector
+    """
+    def __init__(self, in_channels=3, base_dim=64, latent_dim=256):
+        super().__init__()
+        self.shared_encoder = SharedEncoder(in_channels, base_dim, out_dim=latent_dim)
+        self.scene_branch = SceneBranch(in_dim=latent_dim, latent_dim=latent_dim)
+        self.object_branch = ObjectBranch(in_dim=latent_dim, latent_dim=latent_dim)
+
+        # Scene + Object 결합 projection
+        self.proj = nn.Linear(latent_dim * 2, latent_dim)
+        self.norm = nn.LayerNorm(latent_dim)
+        self.fuse = nn.Sequential(
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+    def forward(self, video):
+        B, T, C, H, W = video.shape
+        video_reshaped = video.view(B*T, C, H, W)
+
+        shared_feat = self.shared_encoder(video_reshaped)
+        _, D, Hf, Wf = shared_feat.shape
+        shared_feat = shared_feat.view(B, T, D, Hf, Wf).mean(dim=1)
+
+        v_scene = self.scene_branch(shared_feat)
+        v_object = self.object_branch(shared_feat)
+
+        # ✅ fuse는 입력 1개만 받으므로 cat 먼저!
+        fused = torch.cat([v_scene, v_object], dim=1)
+        v_appearance = self.fuse(fused)
+
         return {
-            "final_features": final_features
+            "v_scene": v_scene,
+            "v_object": v_object,
+            "v_appearance": v_appearance
         }
 
 
-#################################################################
 
-
-class LocalisationNetwork(nn.Module):
-    """
-    F_A를 입력받아 어파인 변환 행렬 theta를 회귀하는 작은 CNN.
-    """
-    def __init__(self, input_channels: int, patch_grid_size: int):
-        super().__init__()
-        
-        # F_A를 처리하기 위한 CNN 구조
-        self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, stride=2), # H, W -> H/2, W/2
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, stride=2) # H/2, W/2 -> H/4, W/4
-        )
-
-        # CNN 출력 크기를 동적으로 계산
-        final_grid_size = patch_grid_size // 4
-        final_channels = 64
-        flattened_size = final_channels * final_grid_size * final_grid_size
-
-        # 어파인 변환 행렬 theta (2x3)의 6개 파라미터를 회귀
-        self.regressor = nn.Linear(flattened_size, 6)
-
-        # 학습 안정성을 위해 항등 변환(identity transform)으로 초기화
-        self.regressor.bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
-
-    def forward(self, features_2d: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            features_2d (torch.Tensor): (B*T, C, H_patch, W_patch) 형태의 특징 맵
-        Returns:
-            torch.Tensor: (B*T, 2, 3) 형태의 어파인 변환 행렬 theta
-        """
-        x = self.cnn(features_2d)
-        x = x.reshape(x.size(0), -1)
-        theta = self.regressor(x)
-        theta = theta.view(-1, 2, 3) # (B*T, 2, 3) 형태로 변환
-        return theta
-
-
-#################################################################
-
-
-class AttentionBridge(nn.Module):
-    """
-    LocalisationNetwork와 STN을 통합하여 어텐션 브릿지 역할을 수행.
-    (수정 버전: 시간 축으로 평균화된 대표 특징을 사용하여 클립 전체에 적용될 단일 변환 행렬을 계산)
-    """
-
-    def __init__(self, input_hidden_size: int, patch_grid_size: int, target_size: tuple = (96, 96)):
-        super().__init__()
-        self.localisation_net = LocalisationNetwork(input_hidden_size, patch_grid_size)
-        self.target_size = target_size # V'의 목표 해상도 (H_t, W_t)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        (2단계 수정 버전) 특징 맵(F_A)을 직접 변환하여 변환된 특징 맵(F'_A)을 생성합니다.
-        Args:
-            features (torch.Tensor): (B, T, Seq_Len, Hidden_Size) 형태의 ViT 특징 (F_A)
-        Returns:
-            torch.Tensor: (B, T, Hidden_Size, H_t, W_t) 형태의 변환된 특징 맵 클립 (F'_A)
-        """
-        batch_size, n_frames, seq_len, hidden_size = features.shape
-
-        # --- 1. 대표 특징 생성 (Temporal Average Pooling) ---
-        # 시간 축 평균을 통해 단일 변환 행렬 계산에 사용할 안정적인 특징을 만듭니다.
-        # (B, T, Seq_Len, Hidden_Size) -> (B, Seq_Len, Hidden_Size)
-        robust_features = torch.mean(features, dim=1)
-
-        # --- 2. LocalisationNetwork 입력 준비 ---
-        # CLS 토큰을 제외하고 2D 그리드 형태로 변환합니다.
-        patch_features = robust_features[:, 1:, :]
-        num_patches = patch_features.shape[1]
-        patch_grid_h = patch_grid_w = int(num_patches ** 0.5)
-        patch_features_2d = patch_features.permute(0, 2, 1).view(
-            batch_size, hidden_size, patch_grid_h, patch_grid_w
-        )
-
-        # --- 3. LocalisationNetwork를 통해 단일 통합 theta 계산 ---
-        # (B, Hidden_Size, H_patch, W_patch) -> (B, 2, 3)
-        theta = self.localisation_net(patch_features_2d)
-
-        # --- 4. STN을 이용해 F'_A 생성 (Feature-level Cropping) ---
-        # 변환할 대상인 원본 특징맵(features)을 2D 그리드 형태로 준비합니다.
-        # CLS 토큰을 제외하고 (B*T, Hidden_Size, H_patch, W_patch) 형태로 변환합니다.
-        patch_features_all_frames = features[:, :, 1:, :].reshape(batch_size * n_frames, seq_len - 1, hidden_size)
-        features_to_transform = patch_features_all_frames.permute(0, 2, 1).view(
-            batch_size * n_frames, hidden_size, patch_grid_h, patch_grid_w
-        )
-
-        # 단일 theta를 모든 프레임에 적용하기 위해 T 차원으로 반복합니다.
-        theta_repeated = repeat(theta, 'b c h -> (b t) c h', t=n_frames)
-
-        # grid_sample에 사용할 목표 크기를 지정합니다.
-        grid_target_size = torch.Size([batch_size * n_frames, hidden_size, self.target_size[0], self.target_size[1]])
-
-        # 반복된 theta를 이용해 샘플링 그리드를 생성합니다.
-        grid = F.affine_grid(theta_repeated, grid_target_size, align_corners=False)
-
-        # **원본 특징 맵**과 그리드를 이용해 변환된 특징 맵을 샘플링합니다.
-        transformed_features = F.grid_sample(features_to_transform, grid, align_corners=False, padding_mode="border")
-
-        # --- 5. 최종 출력 형태 복원 ---
-        # (B*T, D, H_t, W_t) -> (B, T, D, H_t, W_t)
-        transformed_features = transformed_features.view(batch_size, n_frames, hidden_size, self.target_size[0], self.target_size[1])
-
-        return transformed_features
-            
-
-#################################################################
-
-
-class Conv2Plus1D(nn.Module):
-    def __init__(self, 
-                in_channels: int, 
-                out_channels: int, 
-                kernel_size: tuple, 
-                stride: tuple, 
-                padding: tuple,
-                mid_channels: int = None):
-        """
-        (2+1)D 컨볼루션 블록. 3D 컨볼루션을 2D 공간과 1D 시간 컨볼루션으로 분해합니다.
-
-        Args:
-            in_channels (int): 입력 채널의 수.
-            out_channels (int): 출력 채널의 수.
-            kernel_size (tuple): (temporal, height, width) 형태의 커널 크기 튜플.
-            stride (tuple): (temporal, height, width) 형태의 스트라이드 튜플.
-            padding (tuple): (temporal, height, width) 형태의 패딩 튜플.
-            mid_channels (int, optional): 공간 컨볼루션과 시간 컨볼루션 사이의 중간 채널 수.
-            None이면 out_channels와 동일하게 설정됩니다.
-        """
-        super().__init__()
-
-        if mid_channels is None:
-            mid_channels = out_channels
-
-        # 공간 컨볼루션 (2D)
-        self.spatial_conv = nn.Conv3d(
-            in_channels,
-            mid_channels,
-            kernel_size=(1, kernel_size[1], kernel_size[2]),
-            stride=(1, stride[1], stride[2]),
-            padding=(0, padding[1], padding[2]),
-            bias=False
-        )
-        self.bn1 = nn.BatchNorm3d(mid_channels)
-
-        # 시간 컨볼루션 (1D)
-        self.temporal_conv = nn.Conv3d(
-            mid_channels,
-            out_channels,
-            kernel_size=(kernel_size[0], 1, 1),
-            stride=(stride[0], 1, 1),
-            padding=(padding[0], 0, 0),
-            bias=False
-        )
-        self.bn2 = nn.BatchNorm3d(out_channels)
-
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): 입력 텐서. Shape: (B, C, T, H, W)
-        
-        Returns:
-            torch.Tensor: 출력 텐서.
-        """
-        x = self.spatial_conv(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-
-        x = self.temporal_conv(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-
-        return x
-
-
-#################################################################
-
-
-class AppearanceEncoder(nn.Module):
-    """
-    비디오 특징을 인코딩하여 외형 벡터(v_appearance)를 추출합니다.
-    (2+1)D 컨볼루션 스택과 시간 평균 풀링(temporal average pooling)을 사용합니다.
-    """
-    def __init__(self, in_channels: int, mid_channels: int, out_channels: int):
-        """
-        Args:
-            in_channels (int): 입력 채널의 수 (특징 추출기로부터).
-            mid_channels (int): 중간 레이어의 채널 수.
-            out_channels (int): 최종 외형 벡터의 크기.
-        """
-        super().__init__()
-
-        self.conv_blocks = nn.Sequential(
-            # [수정됨] kernel_size, stride, padding을 튜플로 전달
-            Conv2Plus1D(
-                in_channels=in_channels,
-                out_channels=mid_channels,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),  # 시간(T) stride=1, 공간(H,W) stride=2
-                padding=(1, 1, 1)
-            ),
-            Conv2Plus1D(
-                in_channels=mid_channels,
-                out_channels=out_channels,
-                kernel_size=(3, 3, 3),
-                stride=(1, 1, 1),  # 모든 차원에서 stride=1
-                padding=(1, 1, 1)
-            )
-        )
-
-        # 공간 차원을 풀링하여 채널당 하나의 특징만 남깁니다.
-        self.spatial_pool = nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): (B, T, C, H, W) 형태의 입력 텐서.
-
-        Returns:
-            torch.Tensor: (B, out_channels) 형태의 외형 벡터 v_appearance.
-        """
-
-        # (2+1)D 컨볼루션 블록을 통과시킵니다.
-        x = self.conv_blocks(x)
-
-        # 시간 평균 풀링 (Temporal Average Pooling)
-        # x shape: (B, C_out, T_out, H_out, W_out) -> (B, C_out, H_out, W_out)
-        x = x.mean(dim=2)
-
-        # 공간 풀링 및 flatten
-        # x shape: (B, C_out, H_out, W_out) -> (B, C_out, 1, 1)
-        x = self.spatial_pool(x)
-
-        # x shape: (B, C_out, 1, 1) -> (B, C_out)
-        v_appearance = torch.flatten(x, 1)
-
-        return v_appearance
-    
-    
-#################################################################
-
-
-class MotionEncoder(nn.Module):
-    """
-    비디오 특징을 인코딩하여 동작 벡터(v_motion)를 추출합니다.
-    (2+1)D 컨볼루션 스택과 GRU를 사용하여 시간적 역학을 포착합니다.
-    """
-    def __init__(self, in_channels: int, mid_channels: int, out_channels: int, rnn_hidden_size: int):
-        """
-        Args:
-            in_channels (int): 입력 채널의 수.
-            mid_channels (int): 중간 컨볼루션 레이어의 채널 수.
-            out_channels (int): 컨볼루션 블록의 출력 채널 수. 이는 RNN의 입력 크기가 됩니다.
-            rnn_hidden_size (int): GRU의 은닉 상태 크기. 최종 v_motion 벡터의 차원이 됩니다.
-        """
-        super().__init__()
-
-        self.conv_blocks = nn.Sequential(
-            # [수정됨] kernel_size, stride, padding을 튜플로 전달
-            Conv2Plus1D(
-                in_channels=in_channels,
-                out_channels=mid_channels,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1)
-            ),
-            Conv2Plus1D(
-                in_channels=mid_channels,
-                out_channels=out_channels,
-                kernel_size=(3, 3, 3),
-                stride=(1, 1, 1),
-                padding=(1, 1, 1)
-            )
-        )
-
-        self.spatial_pool = nn.AdaptiveAvgPool2d(1)
-
-        self.rnn = nn.GRU(
-            input_size=out_channels,
-            hidden_size=rnn_hidden_size,
-            num_layers=1,
-            batch_first=True
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): (B, T, C, H, W) 형태의 입력 텐서.
-        Returns:
-            torch.Tensor: (B, rnn_hidden_size) 형태의 동작 벡터 v_motion.
-        """
-        b, c, t, h, w = x.shape 
-
-        x = self.conv_blocks(x)
-        _, c_out, t_out, h_out, w_out = x.shape
-
-        # 공간 풀링을 위해 텐서 reshape
-        x = x.permute(0, 2, 1, 3, 4)      # -> (B, T_out, C_out, H_out, W_out)
-        x = x.reshape(b * t_out, c_out, h_out, w_out)
-        
-        # 공간 풀링 적용
-        x = self.spatial_pool(x)          # -> (B * T_out, C_out, 1, 1)
-        x = torch.flatten(x, 1)           # -> (B * T_out, C_out)
-        
-        # RNN 입력을 위해 시퀀스 형태로 복원
-        x = x.view(b, t_out, c_out)       # -> (B, T_out, C_out)
-        
-        # GRU 통과
-        _, h_n = self.rnn(x)              # h_n shape: (1, B, rnn_hidden_size)
-        
-        # 최종 v_motion 벡터 추출
-        v_motion = h_n.squeeze(0)         # -> (B, rnn_hidden_size)
-
-        return v_motion
-    
-
-#################################################################
-
-
-class VisionModel(nn.Module):
-    def __init__(self, image_size: int, target_size: tuple = (96, 96)):
-        super().__init__()
-
-        # --- 1단계: 특징 추출 및 ROI 지역화 ---
-        self.feature_extractor = Clip4ClipVisionModel() 
-       
-        path_load_pretrained_clip4clip = "/home/jaemo/Multimodal/PRIMUS/saved/i2c/clip_finetuned_opportunity_50_weakly_supervised.pth"
-        self.feature_extractor.load_state_dict(torch.load(path_load_pretrained_clip4clip))
-        hidden_size = self.feature_extractor.video_model.config.hidden_size  # e.g., 384
-
-        self.patch_size = self.feature_extractor.video_model.config.patch_size
-        patch_grid_size = image_size // self.patch_size
-
-        self.crop_size = min(image_size, 224)  # CLIP 모델의 입력 크기와 동일하게 설정
-
-        self.attention_bridge = AttentionBridge(
-            input_hidden_size=hidden_size,
-            patch_grid_size=patch_grid_size,
-            target_size=target_size
-        )
-
-        # --- 2단계: Appearance & Motion 인코딩 ---
-        # 인코더들의 채널 크기를 정의합니다.
-        encoder_mid_channels = 512
-        appearance_out_channels = 256
-        motion_out_channels = 256 # RNN의 입력 크기가 됩니다.
-        motion_rnn_hidden_size = 256
-
-        self.appearance_encoder = AppearanceEncoder(
-            in_channels=hidden_size,
-            mid_channels=encoder_mid_channels,
-            out_channels=appearance_out_channels
-        )
-
-        self.motion_encoder = MotionEncoder(
-            in_channels=hidden_size,
-            mid_channels=encoder_mid_channels,
-            out_channels=motion_out_channels,
-            rnn_hidden_size=motion_rnn_hidden_size
-        )
-
-        self.local_rank = os.environ.get("LOCAL_RANK", "0")
-
-        # feature_extractor의 출력 차원을 받아서 num_classes로 매핑하는 분류 헤드
-        feature_dim = self.feature_extractor.video_model.config.hidden_size # e.g., 768
-        self.classifier = nn.Linear(feature_dim, 7)
-        self.yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-        self.yolo_model.classes = [0]  # 0번 클래스가 'person' 입니다.
-        
-    # forward 함수 예시
-    def forward(self, video_batch):
-        # (B, T, C, H, W) -> (B*T, C, H, W)
-        B, T, C, H, W = video_batch.shape
-        video_reshaped = video_batch.view(B*T, C, H, W)
-        
-        features_output = self.feature_extractor.video_model(pixel_values=video_reshaped)
-        
-        # [CLS] 토큰 특징 사용 (첫 번째 토큰)
-        cls_features = features_output.last_hidden_state[:, 0] # (B*T, hidden_size)
-        
-        # 시간 축으로 평균내어 비디오 전체 특징 계산
-        video_features = cls_features.view(B, T, -1).mean(dim=1) # (B, hidden_size)
-        
-        # 분류 헤드를 통과시켜 로짓 계산
-        logits = self.classifier(video_features)
-        
-        return {'logits': logits}
-        
-    # YourMainModel 클래스 내의 patch_selection 메서드
-    def patch_selection(self, videos_batch: torch.Tensor, labels) -> torch.Tensor:
-    # 1. 입력 텐서 정보 저장
-        # 입력 가정: (B, T, C, H_orig, W_orig) -> (B, T, C, 480, 640)
-        B, T, C, H_orig, W_orig = videos_batch.shape
-
-        print(f"[Rank {self.local_rank}] Patch Selection Input Shape: {videos_batch.shape}")
-        
-        # 모델이 요구하는 입력 크기
-        MODEL_INPUT_SIZE = (224, 224)
-        
-        # (B, T, C, H, W) -> (B*T, C, H, W)
-        video_reshaped_orig = videos_batch.view(B * T, C, H_orig, W_orig)
-
-        # 2. Step 1: 저해상도에서 단서 찾기
-        # 원본 해상도 프레임들을 모델 입력 크기로 리사이즈
-        video_resized_for_model = resize(video_reshaped_orig, size=MODEL_INPUT_SIZE)
-        
-        # 리사이즈된 이미지로 어텐션 맵 계산
-        with torch.no_grad():
-            model_output = self.feature_extractor.video_model(
-                pixel_values=video_resized_for_model,
-                output_attentions=True
-            )
-        
-        # 어텐션 맵을 다시 비디오 단위로 재구성
-        attentions = model_output.attentions[-1]
-        _ , n_heads, seq_len, _ = attentions.shape
-        attentions = attentions.view(B, T, n_heads, seq_len, seq_len)
-
-        cropped_videos_list = []
-        iou_scores_list = [] # 🌟 IoU 점수를 저장할 리스트 추가
-
-        # for i in range(B): 루프 전체를 이 코드로 교체해주세요.
-
-        # for i in range(B): 루프 전체를 이 코드로 교체해주세요.
-
-        for i in range(B):
-            # --- 1. 어텐션으로 Crop 영역 좌표(top, left) 계산 ---
-            # (이 부분은 기존과 동일하므로 생략)
-            attentions_per_video = attentions[i]
-            cls_attentions = attentions_per_video[:, :, 0, 1:]
-            attention_weights = cls_attentions.mean(dim=[0, 1])
-            h_patches = MODEL_INPUT_SIZE[0] // self.patch_size
-            w_patches = MODEL_INPUT_SIZE[1] // self.patch_size
-            attention_map_2d = attention_weights.reshape(h_patches, w_patches)
-            max_idx_flat = torch.argmax(attention_map_2d)
-            max_idx_y_lowres = (max_idx_flat // w_patches).item()
-            max_idx_x_lowres = (max_idx_flat % w_patches).item()
-            center_y_lowres = (max_idx_y_lowres + 0.5) * self.patch_size
-            center_x_lowres = (max_idx_x_lowres + 0.5) * self.patch_size
-            scale_h, scale_w = H_orig / MODEL_INPUT_SIZE[0], W_orig / MODEL_INPUT_SIZE[1]
-            center_y_highres = int(center_y_lowres * scale_h)
-            center_x_highres = int(center_x_lowres * scale_w)
-            top = max(0, min(center_y_highres - self.crop_size // 2, H_orig - self.crop_size))
-            left = max(0, min(center_x_highres - self.crop_size // 2, W_orig - self.crop_size))
-
-            # --- 2. YOLO 및 시각화 준비 ---
-            gt_boxes = []
-            person_found_score = 0.0
-
-            # 2-1. 원본 프레임 역정규화 및 Crop (0~1 float)
-
-            # with torch.no_grad(): 블록 전체를 이 코드로 교체해주세요.
-
-            # with torch.no_grad() 블록 전체를 교체
-
-            with torch.no_grad():
-                # 2-1. 원본 프레임 역정규화 및 Crop (0~1 float)
-                original_frame_tensor = denormalize(videos_batch[i])[T // 2]
-                cropped_frame_float_0_1 = original_frame_tensor[:, top:top + self.crop_size, left:left + self.crop_size]
-                h_cropped_orig, w_cropped_orig = cropped_frame_float_0_1.shape[1:]
-
-                # 2-2. Crop 이미지를 YOLO 입력 크기로 리사이즈
-                YOLO_INPUT_SIZE = 640
-                resized_for_yolo_float_0_1 = resize(cropped_frame_float_0_1.unsqueeze(0), size=(YOLO_INPUT_SIZE, YOLO_INPUT_SIZE)).squeeze(0)
-                input_tensor_for_yolo = resized_for_yolo_float_0_1.mul(255).byte().unsqueeze(0)
-
-                # --- 3. YOLO 실행 및 후처리 ---
-                yolo_results_list = self.yolo_model(input_tensor_for_yolo)
-                
-                # 새로운 후처리 함수는 너비/높이 인자가 필요 없습니다.
-                final_outputs = self.postprocess_yolo_output(yolo_results_list[0])
-                
-                # normalized_boxes는 0~1 범위의 '비율' 좌표를 가집니다.
-                normalized_boxes = final_outputs[0]
-                
-                if normalized_boxes.shape[0] > 0:
-                    person_found_score = 1.0
-                    # print("[DEBUG] Normalized Boxes:", normalized_boxes)
-                    # print("[DEBUG] Cropped Frame Size (HxW):", h_cropped_orig, w_cropped_orig)
-
-                    
-                    # 🌟🌟🌟 단 한번의, 최종 스케일링! 🌟🌟🌟
-                    # '비율' 좌표를 -> '픽셀' 좌표로 변환합니다.
-                    pixel_boxes = normalized_boxes.clone() # 복사해서 사용
-                    pixel_boxes[:, [0, 2]] *= w_cropped_orig # x 좌표에 너비 곱하기
-                    pixel_boxes[:, [1, 3]] *= h_cropped_orig # y 좌표에 높이 곱하기
-
-                    # 이제 gt_boxes는 올바른 픽셀 좌표를 가집니다.
-                    gt_boxes = pixel_boxes[:, :4].cpu().tolist()
-
-            iou_scores_list.append(person_found_score)
-
-            # --- 4. 시각화 ---
-            if self.local_rank == "0":
-                frame_np_for_drawing = cropped_frame_float_0_1.permute(1, 2, 0).mul(255).byte().cpu().numpy()
-                dummy_crop_box = [0, 0, w_cropped_orig - 1, h_cropped_orig - 1]
-                
-                debug_image = self.draw_boxes_on_frame(
-                    frame_np=frame_np_for_drawing,
-                    yolo_boxes=gt_boxes,
-                    crop_box=dummy_crop_box
-                )
-
-                success_str = "✅ Found" if person_found_score > 0 else "❌ Not_Found"
-                log_title = f"{success_str}_Label_{labels[i]}"
-                wandb.log({log_title: wandb.Image(debug_image, file_type="png")})
-
-            # --- 5. 다음 모델로 전달할 Crop 비디오 준비 ---
-            single_video_orig = videos_batch[i].permute(1, 0, 2, 3)
-            cropped_video_for_model = crop(single_video_orig, top, left, self.crop_size, self.crop_size)
-            cropped_video_restored = cropped_video_for_model.permute(1, 0, 2, 3)
-            cropped_videos_list.append(cropped_video_restored)
-
-        # --- 함수 마지막 부분 ... ---
-
-        # --- 함수 마지막 (기존과 동일) ---
-        final_cropped_batch = torch.stack(cropped_videos_list, dim=0)
-        iou_scores = torch.tensor(iou_scores_list, device=videos_batch.device)
-        return final_cropped_batch, iou_scores
-    # YourMainModel 클래스 내부
-
-    @staticmethod
-    def postprocess_yolo_output(prediction, conf_thres=0.1, iou_thres=0.45):
-        """
-        YOLO의 원시 출력을 후처리하여 "정규화된(0~1) 좌표"를 가진
-        최종 바운딩 박스를 반환합니다.
-        """
-        output = [torch.zeros((0, 6), device=prediction.device)] * prediction.shape[0]
-        
-        for xi, x in enumerate(prediction):  # 배치 내 각 이미지에 대해 처리
-            
-            # 🌟🌟🌟 바로 이 한 줄이 모든 것을 해결합니다! 🌟🌟🌟
-            # Logit을 0~1 사이의 비율/확률 값으로 변환합니다.
-            x=x.sigmoid()
-
-            # 이제 0~1로 변환된 값을 기준으로 신뢰도 필터링을 수행합니다.
-            x = x[x[..., 4] > conf_thres]
-            
-            if not x.shape[0]:
-                continue
-            
-            # 클래스 점수 계산
-            box = x[:, :4] # 이제 box는 0~1 사이의 cx,cy,w,h 입니다.
-            x[:, 5:] *= x[:, 4:5]
-            
-            # 박스 좌표를 (cx,cy,w,h) -> (x1,y1,x2,y2)로 변환 (스케일링 없음)
-            box_normalized = torch.empty_like(box)
-            box_normalized[:, 0] = box[:, 0] - box[:, 2] / 2
-            box_normalized[:, 1] = box[:, 1] - box[:, 3] / 2
-            box_normalized[:, 2] = box[:, 0] + box[:, 2] / 2
-            box_normalized[:, 3] = box[:, 1] + box[:, 3] / 2
-            
-            conf, j = x[:, 5:].max(1, keepdim=True)
-            x = torch.cat((box_normalized, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-            x = x[x[:, 5] == 0] # 'person' 클래스 필터링
-            
-            if not x.shape[0]:
-                continue
-
-            # NMS 적용
-            boxes, scores = x[:, :4], x[:, 4]
-            nms_indices = torchvision.ops.nms(boxes, scores, iou_thres)
-            output[xi] = x[nms_indices]
-            
-        return output
-
-    # from PIL import Image, ImageDraw, ImageFont # 파일 상단에 추가해주세요.
-# import cv2 # 이 함수에서는 더 이상 cv2를 사용하지 않습니다.
-
-    @staticmethod
-    def draw_boxes_on_frame(frame_np, yolo_boxes, crop_box):
-        """
-        Pillow(PIL)를 사용하여 원본 프레임에 YOLO 박스와 Crop 박스를 그립니다.
-        """
-        img = Image.fromarray(frame_np)
-        draw = ImageDraw.Draw(img)
-        print(f"Drawing {len(yolo_boxes)} YOLO boxes and crop box {crop_box}")
-        
-        # YOLO 박스 그리기 (초록색)
-        for box in yolo_boxes:
-            x1, y1, x2, y2 = box
-
-            # 🌟🌟🌟 좌표 강제 보정 (안전장치) 🌟🌟🌟
-            # x1이 x2보다 크거나, y1이 y2보다 큰 '뒤집힌' 박스를 방지합니다.
-            # 두 x좌표 중 작은 값을 x1으로, 큰 값을 x2로 강제 지정합니다.
-            corrected_x1 = min(x1, x2)
-            corrected_y1 = min(y1, y2)
-            corrected_x2 = max(x1, x2)
-            corrected_y2 = max(y1, y2)
-            print("Corrected Box:", corrected_x1, corrected_y1, corrected_x2, corrected_y2)
-
-            # 보정된 좌표로 박스를 그립니다.
-            draw.rectangle(
-                [(corrected_x1, corrected_y1), (corrected_x2, corrected_y2)], 
-                outline="green", 
-                width=3
-            )
-            draw.text((corrected_x1, corrected_y1 - 10), "YOLO", fill="green")
-
-        # Crop 영역 테두리 그리기 (빨간색)
-        draw.rectangle(crop_box, outline="red", width=3)
-        
-        return img # Pillow 이미지 객체를 그대로 반환
-    
-    def calculate_iou(self, boxA, boxesB):
-        """한 개의 박스(boxA)와 여러 개의 박스(boxesB) 사이의 IoU를 계산합니다."""
-        # boxA: [x1, y1, x2, y2]
-        # boxesB: torch.Tensor of shape (N, 4)
-        
-        xA = torch.max(boxA[0], boxesB[:, 0])
-        yA = torch.max(boxA[1], boxesB[:, 1])
-        xB = torch.min(boxA[2], boxesB[:, 2])
-        yB = torch.min(boxA[3], boxesB[:, 3])
-
-        interArea = torch.clamp(xB - xA, min=0) * torch.clamp(yB - yA, min=0)
-
-        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-        boxBArea = (boxesB[:, 2] - boxesB[:, 0]) * (boxesB[:, 3] - boxesB[:, 1])
-        
-        iou = interArea / (boxAArea + boxBArea - interArea)
-        return iou
- 
 
 #################################################################
 
 
 # --- 3. 메모리 뱅크 관리자 ---
 class ClusteringManager(nn.Module):
-    def __init__(self, num_clusters, feature_dim, momentum=0.9, temperature=0.1, device='cuda', local_rank=0, min_cluster_size=30):
+    def __init__(self, num_clusters, feature_dim, initial_global_threshold, momentum=0.9, temperature=0.1, device='cuda', local_rank=0, min_cluster_size=30):
         super().__init__()
         self.num_clusters = num_clusters
         self.feature_dim = feature_dim
@@ -997,6 +448,17 @@ class ClusteringManager(nn.Module):
              self.feature_bank = None
         
         self.label_bank = None # 모든 Rank가 None으로 시작, 모든 gpu에서 매 스텝마다 label_bank는 동기화 (update_samples_memory 참조)
+
+        # 각 클러스터별 동적 거리 임계값을 저장할 버퍼
+        # 초기값은 hparams의 전역 임계값(fallback)으로 설정
+        thresholds_tensor = torch.full(
+            (num_clusters,), 
+            float(initial_global_threshold), 
+            device=device,
+            dtype=torch.float32
+        )
+        self.register_buffer('distance_thresholds', thresholds_tensor)
+
         self.initialized = False
         # 클러스터 중심점(centroids) 초기화 - 더 넓게 분포되도록 초기화
         # 각 차원마다 균등 분포를 사용하여 더 잘 분산되도록 함
@@ -1082,7 +544,7 @@ class ClusteringManager(nn.Module):
                               feature: torch.Tensor):
         """Update samples memory."""
         assert self.initialized
-        print(f"[{self.local_rank}] Updating samples memory for {idx.shape[0]} samples.")
+        # print(f"[{self.local_rank}] Updating samples memory for {idx.shape[0]} samples.")
         feature_norm = feature / (feature.norm(dim=1).view(-1, 1) + 1e-10
                                   )  # normalize
 
@@ -1276,7 +738,7 @@ class ClusteringModel(nn.Module):
         self.top_k = top_k
         self.local_rank = os.environ.get("LOCAL_RANK", "0")
         # Clustering 관리자
-        self.clustering_manager = ClusteringManager(num_clusters=num_clusters, feature_dim=embedding_dim, local_rank=self.local_rank, min_cluster_size=min_cluster_size)
+        self.clustering_manager = ClusteringManager(num_clusters=num_clusters, initial_global_threshold=1.5, feature_dim=embedding_dim, local_rank=self.local_rank, min_cluster_size=min_cluster_size)
         self.projection_layer = nn.Linear(num_sensors, embedding_dim)
         self.epoch = 0
         self.datamodule = datamodule
@@ -1349,6 +811,115 @@ class ClusteringModel(nn.Module):
         
         # ⚠️ (중요) Cache 성공 시, 나머지 Rank는 Broadcast를 기다리고 있어야 합니다.
         cache_hit = False
+        # # --- ★★★ 추가된 코드: 전체 학습 데이터 t-SNE 시각화 ★★★ ---
+        # if rank_str == "0": # Rank 0에서만 시각화 수행
+        #     print(f"[{rank}] Generating initial t-SNE plot from the *entire* train dataset...")
+        #     print(f"[{rank}] WARNING: This might take a long time!")
+            
+        #     all_features_list = []
+        #     all_labels_list = []
+            
+        #     # try:
+        #         # 데이터 로더 전체 순회하며 특징 및 레이블 수집 (CPU 사용)
+        #         # (GPU 메모리 부족 방지 위해 CPU 사용 후 t-SNE 시 필요하면 샘플링)
+        #     print(f"[{rank}] Collecting features and labels from train_dataloader...")
+        #     for batch in tqdm(self.train_dataloader, desc=f"[{rank}] Collecting Features"):
+        #         videos, sensors, labels, sample_ids = batch
+                
+        #         sensors = sensors.to(device) 
+                
+        #         # 모델 forward 호출 (특징 추출)
+        #         _, _, features = self(sensors, return_features=True) 
+        #         # features = self.projection_layer(features) # 필요시
+                
+        #         all_features_list.append(features.detach().cpu())
+        #         all_labels_list.append(labels.detach().cpu()) # 레이블도 CPU로
+
+        #     # 리스트를 하나의 텐서/배열로 합치기
+        #     all_features = torch.cat(all_features_list).numpy()
+        #     all_labels = torch.cat(all_labels_list).numpy()
+            
+        #     print(f"[{rank}] Collected {len(all_features)} total samples.")
+            
+        #     # --- ★★★ 레이블 병합 로직 추가 ★★★ ---
+        #     labels_to_plot = all_labels
+        #     # print(f"[{rank}] Merging labels...")
+        #     # merged_labels = np.zeros_like(all_labels) # 결과를 저장할 새 배열
+        #     # for i, l in enumerate(all_labels):
+        #     #     if l == 0 or l == 1:
+        #     #         merged_labels[i] = 0
+        #     #     elif l == 2 or l == 3:
+        #     #         merged_labels[i] = 1
+        #     #     else:
+        #     #         # 정수 나눗셈 // 사용
+        #     #         merged_labels[i] = l % 2 
+            
+        #     # labels_to_plot = merged_labels # 시각화에는 병합된 레이블 사용
+        #     print(f"[{rank}] Labels merged.")
+        #     # --- ★★★ 레이블 병합 끝 ★★★ ---
+
+        #     # (선택) 레이블 병합 로직 (필요하다면 여기에 적용)
+        #     # labels_to_plot = all_labels 
+
+        #     # 샘플링 (데이터가 너무 많을 경우)
+        #     num_samples_for_tsne = min(20000, len(all_features)) # 샘플 수 증가 (시간 더 걸림)
+        #     if num_samples_for_tsne < len(all_features):
+        #         print(f"[{rank}] Sampling {num_samples_for_tsne} for t-SNE...")
+        #         sample_indices = np.random.choice(len(all_features), num_samples_for_tsne, replace=False)
+        #         features_subset = all_features[sample_indices]
+        #         labels_subset = labels_to_plot[sample_indices]
+        #     else:
+        #         features_subset = all_features
+        #         labels_subset = labels_to_plot
+
+        #     # t-SNE 실행
+        #     perplexity_value = min(30, len(features_subset) - 1)
+        #     if perplexity_value <= 0: perplexity_value = 1.0
+        #     from sklearn.manifold import TSNE
+        #     print(f"[{rank}] Running t-SNE (2D) on {len(features_subset)} samples...")
+        #     tsne_2d = TSNE(n_components=2, perplexity=perplexity_value, random_state=42, metric="cosine")
+        #     reduced_features_2d = tsne_2d.fit_transform(features_subset)
+
+        #     print(f"[{rank}] Running t-SNE (3D) on {len(features_subset)} samples...")
+        #     tsne_3d = TSNE(n_components=3, perplexity=perplexity_value, random_state=42, metric="cosine")
+        #     reduced_features_3d = tsne_3d.fit_transform(features_subset)
+
+        #     # 시각화 (간단 버전)
+        #     unique_labels = np.unique(labels_subset)
+        #     num_unique_labels = len(unique_labels)
+        #     if num_unique_labels <= 20: cmap = plt.cm.get_cmap('tab20', num_unique_labels) 
+        #     else: cmap = plt.cm.get_cmap('viridis', num_unique_labels)
+        #     colors = cmap(np.linspace(0, 1, num_unique_labels))
+        #     label_to_color = {label: colors[i] for i, label in enumerate(unique_labels)}
+        #     label_names = {label: f"Class_{label}" for label in unique_labels} # 임시 이름
+
+        #     # 2D
+        #     fig_2d = plt.figure(figsize=(10, 8)); ax_2d = fig_2d.add_subplot(111); handles = []
+        #     for i in unique_labels:
+        #         mask = (labels_subset == i); color=label_to_color[i]; label_name=label_names[i]
+        #         ax_2d.scatter(reduced_features_2d[mask, 0], reduced_features_2d[mask, 1], color=color, label=label_name, alpha=0.7)
+        #         if not any(h.get_label() == label_name for h in handles): handles.append(plt.Line2D([],[],color=color, marker='o', ls='', ms=8, label=label_name))
+        #     ax_2d.set_title("Initial t-SNE (Full Train Set - 2D)"); ax_2d.legend(handles=handles, loc='best')
+            
+        #     # 3D
+        #     fig_3d = plt.figure(figsize=(10, 8)); ax_3d = fig_3d.add_subplot(111, projection='3d'); handles_3d = []
+        #     for i in unique_labels:
+        #         mask = (labels_subset == i); color=label_to_color[i]; label_name=label_names[i]
+        #         ax_3d.scatter(reduced_features_3d[mask, 0], reduced_features_3d[mask, 1], reduced_features_3d[mask, 2], color=color, label=label_name, alpha=0.7)
+        #         if not any(h.get_label() == label_name for h in handles_3d): handles_3d.append(plt.Line2D([],[],color=color, marker='o', ls='', ms=8, label=label_name))
+        #     ax_3d.set_title("Initial t-SNE (Full Train Set - 3D)"); ax_3d.legend(handles=handles_3d, loc='best')
+
+        #     # WandB 로깅
+        #     wandb.log({
+        #         "initial_train_tsne_2d": wandb.Image(fig_2d),
+        #         "initial_train_tsne_3d": wandb.Image(fig_3d)
+        #     })
+        #     plt.close(fig_2d); plt.close(fig_3d) 
+        #     print(f"[{rank}] Initial Train t-SNE logged to WandB.")
+
+        #     # except Exception as e:
+        #     #     print(f"[{rank}] Error during initial full train t-SNE visualization: {e}")
+        # # --- ★★★ 추가된 코드 끝 ★★★ ---
         if rank_str == "0" and os.path.exists(prototype_cache_path):
             try:
                 # 🚨 UnpicklingError 방지: PIL.Image.Image 등이 저장되지 않았다고 가정하거나,
@@ -1464,7 +1035,7 @@ class ClusteringModel(nn.Module):
                     # if labels[i] in [2,3,7]:
                     ranges = representative_feature
                         # ranges = torch.quantile(torch.abs(x[i]), q=0.99, dim=1)
-                    print(f"id: {idx[i]}, labels: {labels[i]}, max_pooling {ranges[i]}")
+                    # print(f"id: {idx[i]}, labels: {labels[i]}, max_pooling {ranges[i]}")
             representative_feature = self.projection_layer(representative_feature)
             # alpha = self.gate(features)
             alpha=1
@@ -1485,7 +1056,7 @@ class ClusteringModel(nn.Module):
         #             print(f"id: {idx[i]}, labels: {labels[i]}, max_pooling {ranges}")
 
         if return_features:
-            return similarity_scores, features
+            return similarity_scores, features, features - alpha * representative_feature
         return similarity_scores
     
     @torch.no_grad()
@@ -1573,72 +1144,74 @@ class ClusteringModel(nn.Module):
     
     def update_epoch(self, epoch):
         self.epoch = epoch
-        
+   
     @torch.no_grad()
     def evaluate(self, outputs):
-        """
-        미리 train step에서 계산된 outputs를 사용하여 평가를 수행합니다 (validation epoch 끝에서 호출하는 것보다 성능 향상이 더딜 수 있음).
-        """
-
         self.eval()
         features_gathered = self.clustering_manager._gather(torch.cat([x['features'] for x in outputs]))
         labels_gathered = self.clustering_manager._gather(torch.cat([x['labels'] for x in outputs]))
         predicted_labels_gathered = self.clustering_manager._gather(torch.cat([x['predicted_labels'] for x in outputs]))
         print(f"evaluate_odc: Gathered {features_gathered.shape[0]} features from all ranks.")
 
+        num_clusters = self.clustering_manager.num_clusters
+
+        # --- [1️⃣ Bad 샘플 수집] ---
+        if "bad" in outputs[0]:
+            bad_gathered = self.clustering_manager._gather(torch.cat([x["bad"] for x in outputs]))
+            bad_np = bad_gathered.cpu().numpy()
+        else:
+            print("⚠️ warning: no bad key found in outputs")
+            bad_np = np.zeros(len(predicted_labels_gathered))
+
+        # --- [2️⃣ Hungarian matching (기존 유지)] ---
         if self.local_rank == "0":
-            # 1. 텐서를 NumPy 배열로 변환
             all_features = features_gathered.cpu().numpy()
             all_labels = labels_gathered.cpu().numpy()
             all_predicted_labels = predicted_labels_gathered.cpu().numpy()
-            
-            # for i, l in enumerate(all_labels):
-            #     print(real_labels, self.clustering_manager.num_clusters)
-            #     l=l.item()
-            #     if l<=3:
-            #         print(l)
-            #         all_labels[i]=l%2
-            #     else:
-            #         all_labels[i]=l//2 
 
-        
             print(f"evaluate_odc: Calculating results on {len(all_features)} total samples.")
-
-            # 2. 정확도 계산 (헝가리안 매칭)
             print("Computing Hungarian matching...")
+
             raw_accuracy, new_mapping = compute_hungarian_matching(
-                all_predicted_labels, all_labels, self.clustering_manager.num_clusters
+                all_predicted_labels, all_labels, num_clusters
             )
 
             mapped_cluster_labels = np.array([new_mapping.get(c, c) for c in all_predicted_labels])
             mapped_accuracy = np.mean(mapped_cluster_labels == all_labels)
             print(f"Val Accuracy (Full Dataset): {mapped_accuracy:.4f}")
-                  
+
             if new_mapping is not None:
                 self.clustering_manager.mapping = new_mapping
-                # mapping은 rank 0 (evaluate)에서만 사용됨
             print("new mapping", new_mapping)
-            # 3. 로깅 (전달받은 LightningModule의 logger 사용)
+
             wandb.log({
                 "val_accuracy_raw": raw_accuracy,
                 "val_accuracy_mapped": mapped_accuracy
             })
-            
-            # 4. 시각화 (t-SNE)
-            # CPU 과부하 방지를 위해 샘플링 적용
+
+            # --- [3️⃣ t-SNE 시각화 전용 라벨 수정] ---
+            all_labels_tsne = all_labels.copy()
+            # all_labels_tsne[bad_np == 1] = num_clusters          # bad → 새 class index
+            mapped_cluster_labels_tsne = mapped_cluster_labels.copy()
+            mapped_cluster_labels_tsne[bad_np == 1] = num_clusters  # pred도 동일하게 표시
+
+            num_classes_for_tsne = num_clusters + 1
+            bad_ratio = bad_np.mean() * 100
+
+            # --- [4️⃣ t-SNE 시각화 호출] ---
             num_samples_for_tsne = min(10000, len(all_features))
             sample_indices = np.random.choice(len(all_features), num_samples_for_tsne, replace=False)
-            
+
             try:
-                print(f"Running t-SNE on a subset of {num_samples_for_tsne} samples...")
+                print(f"Running t-SNE on {num_samples_for_tsne} samples (Bad {bad_ratio:.1f}%)...")
                 fig_2d, fig_3d = visualize_tsne(
-                    all_features[sample_indices], 
-                    all_labels[sample_indices], 
+                    all_features[sample_indices],
+                    all_labels_tsne[sample_indices],
                     mapped_cluster_labels[sample_indices],
                     prototypes=self.clustering_manager.centroids.detach().cpu().numpy(),
-                    title=f"ODC Validation at Epoch {self.epoch}",
-                    num_classes=self.clustering_manager.num_clusters,
-                    dataset_name=self.dataset_name
+                    title=f"ODC Validation at Epoch {self.epoch} (Bad {bad_ratio:.1f}%)",
+                    num_classes=num_clusters,
+                    dataset_name=self.dataset_name,
                 )
                 wandb.log({
                     "val_tsne_2d": wandb.Image(fig_2d),

@@ -117,17 +117,39 @@ def main(args):
     logging_name = f"pretraining_{args.model_name}_{args.dataset_name}"
     logger = WandbLogger(project=args.project_name, name=logging_name) if is_master_process else False
     wandb.init(project=args.project_name, name=logging_name) if is_master_process else None
-    
+    # Define correlation metrics
+    if is_master_process:
+        wandb.define_metric("loss/attn_reg", step_metric="trainer/global_step")
+        wandb.define_metric("attention/door_focus_ratio", step_metric="trainer/global_step")
+        wandb.define_metric("attention/global_var", step_metric="trainer/global_step")
+        wandb.define_metric("attention/door1/diff_mean", step_metric="trainer/global_step")
+
+        # Make a correlation panel artifact (optional but pretty)
+        if wandb.run is not None:
+            panel = wandb.plot.scatter(
+                table=wandb.Table(
+                    columns=["door_focus_ratio", "attn_reg"],
+                    data=[]
+                ),
+                x="door_focus_ratio",
+                y="attn_reg",
+                title="Attention Regularization vs Door Focus",
+            )
+            wandb.log({"dashboard/attn_correlation": panel})
+            
     # 4. 콜백 리스트 생성
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
-        filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
-        save_top_k=1,            # 가장 좋은 모델 1개만 저장
-        monitor="train_loss",      # val_loss를 기준으로 성능을 판단
-        mode="min",              # val_loss는 낮을수록 좋으므로 'min' 모드
-        save_last=True,
-    )
-    callbacks = [DatasetEpochCallback(), checkpoint_callback]
+    if args.model_name != "method":
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
+            filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
+            save_top_k=1,            # 가장 좋은 모델 1개만 저장
+            monitor="train_loss",      # val_loss를 기준으로 성능을 판단
+            mode="min",              # val_loss는 낮을수록 좋으므로 'min' 모드
+            save_last=True,
+        )
+        callbacks = [DatasetEpochCallback(), checkpoint_callback]
+    else:
+        callbacks = [DatasetEpochCallback()]
 
     # 4. 트레이너 설정 및 학습 시작
     trainer = pl.Trainer(
@@ -153,8 +175,8 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_name", type=str, default="Opportunity++", help="Dataset name")
     parser.add_argument("--model_name", type=str, default="method")
     parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
-    parser.add_argument("--project_name", type=str, default="Method_Test_Lightning", help="WandB project name"
-                        )
+    parser.add_argument("--project_name", type=str, default="Method_Test_Lightning", help="WandB project name")
+
     # 학습 인자    
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -163,7 +185,9 @@ if __name__ == '__main__':
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--embedding_dim", type=int, default=256)
     parser.add_argument("--alpha_fixed", type=bool, default=True)
-    parser.add_argument("--threshold_epoch", type=int, default=9)
+    parser.add_argument("--threshold_epoch", type=int, default=5)
+    parser.add_argument("--centroid_threshold", type=float, default=0.75)
+    parser.add_argument("--guide_start_epoch", type=int, default=10)
     
     args = parser.parse_args()
     args.stage = "pretrain"

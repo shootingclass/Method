@@ -64,7 +64,7 @@ class MethodDataModule(pl.LightningDataModule):
             print("INFO: DataModule configured for PRE-TRAINING stage.")
             self.json_train_path = os.path.join(self.json_path, "pretrain_cropped.json")
             # Pre-training 시 val/test가 필요 없다면 None으로 설정하거나 train과 동일하게 설정
-            self.json_val_path = os.path.join(self.json_path, "pretrain_cropped.json") if args.model_name == "method" else None
+            self.json_val_path = os.path.join(self.json_path, "pretrain_cropped.json") if args.model_name == "method" else os.path.join(self.json_path, "linear_val.json")
             # Evaluate 용 data를 pretrain data와 동일하게 설정 (leak 방지)
             self.json_test_path = None
         

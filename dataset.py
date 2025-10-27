@@ -34,6 +34,8 @@ class SensorTransform:
         self.target_len = target_len
         self.interpolation_mode = interpolation_mode
         self.mean = mean
+
+
         self.std = std
         
         # Define Butterworth filter coefficients
@@ -228,7 +230,7 @@ class VideoSensorDataset(Dataset):
             # 2. 이미지 리스트(클립)를 transform에 전달합니다.
             # self.transform은 내부적으로 이 리스트를 올바른 모양의 텐서로 변환해 줄 것입니다.
             frames_tensor = self.transform(dummy_clip)
-            print("fake clip used", self.current_epoch)
+            # print("fake clip used", self.current_epoch)
 
         ######### 비디오 전처리 #########       
         # 1. OpenCV를 사용하여 비디오 캡처 객체 생성

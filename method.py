@@ -28,7 +28,7 @@ class MethodLightningModule(pl.LightningModule):
         self.save_hyperparameters(args)
         # 1. 모델 구성 요소 초기화
 
-        self.video_model = VisionModel(image_size=224)
+        self.video_model = VisionModel(latent_dim=self.hparams.embedding_dim)
         self.sensor_model = SensorModel(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
         self.clustering_model = ClusteringModel(
             encoder=self.sensor_model,
@@ -49,7 +49,42 @@ class MethodLightningModule(pl.LightningModule):
         self.std = [0.26862954, 0.26130258, 0.27577711]
         self.success_labels=[0 for i in range(self.hparams.num_classes)]
         self.fail_labels=[0 for i in range(self.hparams.num_classes)]
+        self.video_classifier = nn.Linear(self.hparams.embedding_dim, self.hparams.num_classes)
         print(self.global_rank, "Model initialized.")
+
+    def _calculate_alignment_loss(self, v_app: torch.Tensor, sensor: torch.Tensor, labels: torch.Tensor, temperature: float = 0.07, symmetric: bool = True):
+        """
+        Cross-modal supervised contrastive (InfoNCE) between appearance and sensor embeddings.
+        v_app:   [N, D]
+        sensor:  [N, D]
+        labels:  [N]  (pseudo labels; same class = positive)
+        """
+        # L2 normalize
+        v_app   = F.normalize(v_app,   dim=1)
+        sensor  = F.normalize(sensor,  dim=1)
+
+        # [N, N] similarity / temperature
+        logits_as = (v_app @ sensor.T) / temperature   # anchor = appearance, samples = sensor
+        logits_sa = (sensor @ v_app.T) / temperature   # anchor = sensor,    samples = appearance
+
+        # positive mask: same class → 1, else 0
+        pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float().to(v_app.device)
+        # 각 anchor마다 최소 1개 양성 보장이 안 될 수도 있으므로 분모 보호
+        pos_cnt = pos_mask.sum(dim=1).clamp(min=1.0)
+
+        # row-wise log-softmax
+        logprob_as = logits_as.log_softmax(dim=1)  # appearance→sensor
+        logprob_sa = logits_sa.log_softmax(dim=1)  # sensor→appearance
+
+        # supervised contrastive: 양성들 평균 negative log-likelihood
+        loss_as = -(logprob_as * pos_mask).sum(dim=1) / pos_cnt
+        if symmetric:
+            loss_sa = -(logprob_sa * pos_mask).sum(dim=1) / pos_cnt
+            loss = 0.5 * (loss_as.mean() + loss_sa.mean())
+        else:
+            loss = loss_as.mean()
+
+        return loss
 
     
     # 에포크 시작 시 clustering_model 상태 업데이트
@@ -63,6 +98,7 @@ class MethodLightningModule(pl.LightningModule):
         self.training_steps_outputs = []  # 에포크 동안의 출력 저장용
 
     def training_step(self, batch, batch_idx):
+  
         # 0. 데이터 준비 (Lightning이 자동으로 device로 옮겨줍니다)
         videos, sensors, labels, sample_ids = batch
         idx, sample_id = sample_ids
@@ -70,9 +106,6 @@ class MethodLightningModule(pl.LightningModule):
         # 실제 배치 크기를 텐서에서 직접 가져옵니다.
         current_batch_size = videos.size(0)
 
-        self.clustering_model.train()
-        self.video_model.train()
-        self.sensor_model.train()
 
         # --- 1. 클러스터링 단계 ---
         
@@ -83,162 +116,182 @@ class MethodLightningModule(pl.LightningModule):
             imu_data_aug = sensors
         
         # 모델 순전파
-        scores, features = self.clustering_model(imu_data_aug, return_features=True, labels=labels, idx=idx)
-        # print("scores", scores)
+        scores, features, _ = self.clustering_model(imu_data_aug, return_features=True, labels=labels, idx=idx)
+        
         # 메모리 뱅크에서 저장된 pseudo label 가져오기
         stored_pseudo_labels = self.clustering_model.get_pseudo_labels(idx)
-        
-        # 클러스터 할당 (argmax) - ODC 논문과 유사하게 메모리 뱅크 활용
+
+        scores_original = scores.clone()
+        # scores = F.normalize(scores, dim=1)
+
+        # --- [수정된 로직 시작: 클러스터별 75% 분위수 기반 Good/Bad 분류] ---
         with torch.no_grad():
-            # 1. 현재 모델의 예측값 계산
-            current_cluster_ids = torch.argmax(scores, dim=1)
+            centroids = self.clustering_model.clustering_manager.centroids  # [K, D]
+            batch_centroids = centroids[stored_pseudo_labels]               # [B, D]
+            centroid_distances = torch.norm(features - batch_centroids, p=2, dim=1)  # [B]
 
-            # 2. EMA 방식으로 메모리 뱅크 업데이트 (레이블과 특징 모두)
-            #    (이 함수는 내부적으로 old_feature와 new_feature를 섞어줍니다)
-            self.clustering_model.clustering_manager.update_samples_memory(idx, 
-                                                    features)
+            good_mask = torch.zeros_like(centroid_distances, dtype=torch.bool)
 
-            # 손실 계산에 사용할 레이블은 안정적인 '과거'의 레이블을 사용
-            # get_pseudo_labels는 업데이트 '전'의 레이블을 반환해야 함
+            # 클러스터별로 거리의 75% 분위수(quantile=0.75)를 기준으로 분류
+            num_clusters = self.clustering_model.clustering_manager.num_clusters
+            for k in range(num_clusters):
+                cluster_mask = stored_pseudo_labels == k
+                if cluster_mask.any():
+                    cluster_dists = centroid_distances[cluster_mask]
+                    threshold = torch.quantile(cluster_dists, 0.75)
+                    good_mask[cluster_mask] = cluster_dists < threshold
+
+            bad_mask = ~good_mask
+            bad_indicator = bad_mask.long()
+
+            # --- 거리 정보 저장 ---
+            distance_info = {
+                'centroid_distances': centroid_distances.cpu(),
+                'pseudo_labels': stored_pseudo_labels.cpu(),
+            }
+
+            # 메모리 업데이트
+            self.clustering_model.clustering_manager.update_samples_memory(idx, features)
+
+            # 손실용 pseudo label 확보
             loss_labels = stored_pseudo_labels.to(self.device)
-            # 만약 첫 방문 샘플(-1)이 있다면, 현재 예측값을 임시로 사용
             mask_new = (loss_labels == -1)
             if mask_new.any():
-                loss_labels[mask_new] = current_cluster_ids[mask_new]
-        # # 클래스 가중치 계산
+                loss_labels[mask_new] = torch.argmax(scores_original[mask_new], dim=1)
+        # --- [수정된 로직 끝] ---
+
+
+        # 클래스 가중치 계산
         class_weights = self.clustering_model.clustering_manager.compute_class_weights()
-        
-        # # ODC 손실 계산 (cross-entropy) - 저장된 pseudo label과 클래스 가중치 사용
-        scores = F.normalize(scores, dim=1)
-        loss_cluster = F.cross_entropy(scores, loss_labels, weight=class_weights.to(self.device))
-        
 
 
-        # print("centroids updated", self.clustering_model.clustering_manager.centroids)
+        # --- [수정된 Loss 로직 시작] ---
+        
+        # [수정 1] 'Live' 텐서로 초기화 (RuntimeError 방지)
+        # scores_original은 clustering_model의 출력이므로 항상 grad_fn을 가짐
+        loss_cluster = (scores_original.sum() * 0.0) 
+        
+        if self.epoch < self.hparams.threshold_epoch:
+            # --- [1A. 웜업(Warm-up) 단계 Loss] ---
+            # 모든 샘플에 대해 ODC Loss를 계산 (Bad 샘플 학습 방치 방지)
+            loss_cluster = F.cross_entropy(
+                scores_original,  # [수정] 원본 로짓 사용, F.normalize 삭제
+                loss_labels,      
+                weight=class_weights.to(self.device)
+            )
+        else:
+            # --- [1B. 교정(Refinement) 단계 Loss] ---
+            # 'Good' 샘플에 대해서만 ODC Loss를 계산 (신호 충돌 방지)
+            if good_mask.any(): # [수정] NaN 방지 (find_unused_parameters=True 가정)
+                loss_cluster = F.cross_entropy(
+                    scores_original[good_mask],  # [수정] 원본 로짓 + Good 샘플
+                    loss_labels[good_mask],
+                    weight=class_weights.to(self.device)
+                )
+        # --- [수정된 Loss 로직 끝] ---
+
+        # ODC 손실 계산 (cross-entropy) - 저장된 pseudo label과 클래스 가중치 사용    
+        # loss_cluster = F.cross_entropy(scores, loss_labels, weight=class_weights.to(self.device))
+
         pseudo_labels_all = self.all_gather(loss_labels).view(-1)
 
-        # 통계 수집
-        # # --- 2. 에포크(Epoch) 기반의 조건부 로직 ---
-        # # self.epoch을 사용하여 현재 에포크를 확인합니다.
-        if self.epoch < self.hparams.threshold_epoch:
-            output = {
+        output = {
                 'features': features.detach(),
                 'labels': labels.detach(),
-                'predicted_labels': current_cluster_ids.detach()
+                'predicted_labels': loss_labels.detach(),
+                'distance_info': distance_info,
+                'bad': bad_indicator.detach()
             }
-            self.training_steps_outputs.append(output)
+        self.training_steps_outputs.append(output)
+        
+        # --- 2. 에포크(Epoch) 기반의 조건부 로직 ---
+        # self.epoch을 사용하여 현재 에포크를 확인합니다.
+        if self.epoch < self.hparams.threshold_epoch:
             return loss_cluster
-            # # 최종 손실을 반환하면 Lightning이 알아서 backward 및 step을 수행합니다.
-            
-            # cropped_videos, iou_scores = self.video_model.patch_selection(videos, labels)
-            # # 모델의 forward pass를 크롭된 비디오로 수행
-            # # 이제부터는 'cropped_videos'를 사용합니다.
-            # logits = self.video_model(cropped_videos)['logits']
-            
-            # # 'iou_scores'를 사용해 yolo_loss를 계산합니다.
-            # yolo_loss = 1.0 - iou_scores.mean()
-            
-            # self.log('avg_iou', iou_scores.mean())
 
-            # # 3. 최종 Loss 계산 및 학습
-            # accuracy = (logits.argmax(dim=1) == labels).float().mean()
-            # loss_patch = F.cross_entropy(logits, labels)
-            # loss = loss_patch + yolo_loss
-            # # loss = loss_patch + loss_cluster
-            # fail_label = (logits.argmax(dim=1) != labels)
-            # success_label = (logits.argmax(dim=1) == labels)
-            # successed_true_labels = labels[success_label].tolist()
-            # for success_label in successed_true_labels:
-            #     self.success_labels[success_label] += 1
-            # # boolean Tensor를 이용해 틀린 예측에 해당하는 실제 정답 레이블을 추출
-            # failed_true_labels = labels[fail_label].tolist()
-            # for fail_label in failed_true_labels:
-            #     self.fail_labels[fail_label] += 1
 
-            # if self.global_rank == 0:
-            #     metrics_to_log = {
-            #         'train_acc': accuracy,
-            #         'train_loss': loss,
-            #     }
-                
-            #     # 틀린 레이블이 있을 경우에만 히스토그램을 로그
-            #     if failed_true_labels:
-            #         print(f"Logging failed labels histogram with {len(failed_true_labels)} entries.")
-            #         # 'failed_labels_dist'라는 이름으로 히스토그램을 생성하여 기록
-            #         print("success labels:", self.success_labels)
-            #         print("failed labels:", self.fail_labels)
-            #         metrics_to_log['failed_labels_dist'] = wandb.Histogram(failed_true_labels)
-                    
-            #     wandb.log(metrics_to_log)
-            
-            return loss
-
-        # --- 3. 분리(Disentanglement) 단계 ---
-        model_output = self.video_model(videos)
-        v_motion = model_output['v_motion']
+       # --- Decompose 단계 ---
+        model_output = self.video_model(videos)  # flows 제거
         v_appearance = model_output['v_appearance']
+        v_scene = model_output['v_scene']
+        v_object = model_output['v_object']
 
         sensor_output = self.sensor_model(sensors)
         sensor_emb = sensor_output['emb']
 
-        # 모든 GPU의 임베딩을 self.all_gather로 수집하고 합칩니다.
-        v_motion_all = self.all_gather(v_motion).view(-1, 256)
-        sensor_emb_all = self.all_gather(sensor_emb).view(-1, 256)
-        v_appearance_all = self.all_gather(v_appearance).view(-1, v_appearance.shape[-1]) # (B, 256)
 
-        # InfoNCE Loss 계산
-        temperature = 0.07
-        v_motion_norm = F.normalize(v_motion_all, p=2, dim=1)
-        sensor_emb_norm = F.normalize(sensor_emb_all, p=2, dim=1)
-        sim_matrix = torch.matmul(v_motion_norm, sensor_emb_norm.T) / temperature # 이제 (12x256) @ (256x12) 연산이 됨
-        nce_labels = torch.arange(sim_matrix.size(0), device=self.device)
-        info_nce_loss = (F.cross_entropy(sim_matrix, nce_labels) + F.cross_entropy(sim_matrix.T, nce_labels)) / 2
+        # --- Cross-Modal Pseudo Label Refinement ---
+        loss_video_supervised = torch.tensor(0.0, device=self.device)
+        loss_sensor_guided = torch.tensor(0.0, device=self.device)
 
-        # 직교성 제약 Loss 계산
-        v_appearance_norm = F.normalize(v_appearance_all, p=2, dim=1)
-        cosine_similarity = (v_motion_norm * v_appearance_norm).sum(dim=1)
-        ortho_loss = (cosine_similarity ** 2).mean()
+        # 1. 좋은 샘플: 센서 → 비디오 (Classification 학습)
+        if good_mask.any(): 
+            video_logits_good = self.video_classifier(v_appearance[good_mask])
+            loss_video_supervised = F.cross_entropy(
+                video_logits_good,
+                loss_labels[good_mask]
+            )
 
-        # Triplet Loss with Hard Negative Mining
-        dist_matrix = torch.cdist(v_motion_all, self.clustering_model.clustering_manager.centroids, p=2)
-        positive_distances = dist_matrix.gather(1, pseudo_labels_all.unsqueeze(1)).squeeze()
-        masked_dist_matrix = dist_matrix.clone()
-        masked_dist_matrix.scatter_(1, pseudo_labels_all.unsqueeze(1), float('inf'))
-        hard_negative_distances = torch.min(masked_dist_matrix, dim=1).values
-        margin = 1.0
-        triplet_loss = torch.relu(positive_distances - hard_negative_distances + margin).mean()
+        # 2. 나쁜 샘플: 비디오 → 센서 (Pseudo-guided refinement)
+        if bad_mask.any() and self.epoch >= self.hparams.threshold_epoch + self.hparams.guide_start_epoch:
+            with torch.no_grad():
+                video_logits_bad = self.video_classifier(v_appearance[bad_mask])
+                video_probs_bad = F.softmax(video_logits_bad, dim=1)
+                video_max_probs, video_pseudo_bad = torch.max(video_probs_bad, dim=1)
+                high_confidence_mask = video_max_probs >= 0.9
 
-        # Appearance-based Classification Loss
-        appearance_logits = self.appearance_classifier(v_appearance_all)
-        loss_appearance_clf = F.cross_entropy(appearance_logits, pseudo_labels_all)
-
-        # 최종 손실 계산
-        lambda_cluster = 0.1
-        lambda_ortho = 0.1
-        lambda_info_nce = 0.1
-        lambda_triplet = 0.1
-        lambda_appearance_clf = 0.6
-
-        final_loss = (lambda_cluster * loss_cluster +
-                    lambda_info_nce * info_nce_loss +
-                    lambda_ortho * ortho_loss +
-                    lambda_triplet * triplet_loss +
-                    lambda_appearance_clf * loss_appearance_clf)
-
-        # final_loss = (lambda_cluster * loss_cluster +
-        #             lambda_info_nce * info_nce_loss +
-        #             lambda_ortho * ortho_loss +
-        #             lambda_triplet * triplet_loss)
+            if high_confidence_mask.any():
+                loss_sensor_guided = F.cross_entropy(
+                    scores_original[bad_mask][high_confidence_mask],
+                    video_pseudo_bad[high_confidence_mask]
+                )
 
 
+        # --- Sensor-guided Alignment ---
+        v_appearance_all = self.all_gather(v_appearance).view(-1, v_appearance.shape[-1])
+        sensor_emb_all = self.all_gather(sensor_emb).view(-1, sensor_emb.shape[-1])
+        pseudo_labels_all = self.all_gather(loss_labels).view(-1)
 
-        # 개별 및 최종 손실을 로깅합니다.
-        self.log('train/loss_cluster', loss_cluster, batch_size=current_batch_size, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log('train/info_nce_loss', info_nce_loss, batch_size=current_batch_size, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log('train/ortho_loss', ortho_loss, batch_size=current_batch_size, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log('train/triplet_loss', triplet_loss, batch_size=current_batch_size, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log('train/loss_appearance_clf', loss_appearance_clf, batch_size=current_batch_size, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log('train/final_loss', final_loss, batch_size=current_batch_size, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        # contrastive loss는 sensor ↔ appearance 간 단일 alignment로 변경
+        loss_align = self._calculate_alignment_loss(v_appearance_all, sensor_emb_all, pseudo_labels_all)
+
+
+        # --- 최종 손실 계산 ---
+        lambda_cluster = 0.0
+        lambda_align = 0.0
+        lambda_video_sup = 1.0
+        lambda_sensor_guide = 1.5
+
+        final_loss = (
+            lambda_cluster * loss_cluster +
+            lambda_align * loss_align +
+            lambda_video_sup * loss_video_supervised +
+            lambda_sensor_guide * loss_sensor_guided
+        )
+
+         # --- [추가] Video classifier 성능 측정 (mapping 기반) ---
+        with torch.no_grad():
+            # 1. video classifier 출력
+            video_logits_all = self.video_classifier(v_appearance)
+            video_preds = torch.argmax(video_logits_all, dim=1)
+
+            # 2. mapping 적용 (cluster_id → real label)
+            mapping = getattr(self.clustering_model.clustering_manager, "mapping", None)
+            if mapping is not None and len(mapping) > 0:
+                mapped_preds = torch.tensor(
+                    [mapping.get(int(p.item()), int(p.item())) for p in video_preds],
+                    device=self.device
+                )
+            else:
+                mapped_preds = video_preds  # mapping이 없을 경우 fallback
+
+            # 3. 실제 라벨과 비교
+            video_labels = labels.to(self.device)
+            acc_video = (mapped_preds == video_labels).float().mean()
+
+            if self.global_rank == 0:
+                # 4. wandb에 로깅
+                wandb.log({"train/video_classifier_acc_mapped": acc_video})
 
         return final_loss
 
