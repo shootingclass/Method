@@ -187,7 +187,7 @@ if __name__ == '__main__':
     parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
-    parser.add_argument("--guide_start_epoch", type=int, default=10)
+    parser.add_argument("--guide_start_epoch", type=int, default=5)
     
     args = parser.parse_args()
     args.stage = "pretrain"

@@ -1155,6 +1155,12 @@ class ClusteringModel(nn.Module):
 
         num_clusters = self.clustering_manager.num_clusters
 
+        if 'video_preds' in outputs[0]:
+                video_preds_gathered = self.clustering_manager._gather(torch.cat([x['video_preds'] for x in outputs]))
+                video_labels_gathered = self.clustering_manager._gather(torch.cat([x['labels'] for x in outputs]))
+        else:
+            video_preds_gathered = None
+
         # --- [1️⃣ Bad 샘플 수집] ---
         if "bad" in outputs[0]:
             bad_gathered = self.clustering_manager._gather(torch.cat([x["bad"] for x in outputs]))
@@ -1165,6 +1171,21 @@ class ClusteringModel(nn.Module):
 
         # --- [2️⃣ Hungarian matching (기존 유지)] ---
         if self.local_rank == "0":
+            # 🔹 추가: video classifier 평가
+            if video_preds_gathered is not None:
+                video_preds_np = video_preds_gathered.cpu().numpy()
+                video_labels_np = video_labels_gathered.cpu().numpy()
+
+                mapping = getattr(self.clustering_manager, "mapping", None)
+                if mapping is not None and len(mapping) > 0:
+                    mapped_preds = np.array([mapping.get(int(p), int(p)) for p in video_preds_np])
+                else:
+                    mapped_preds = video_preds_np
+
+                video_acc = np.mean(mapped_preds == video_labels_np)
+                print(f"Video classifier accuracy (mapped): {video_acc:.4f}")
+                wandb.log({"val/video_classifier_acc_mapped": video_acc})
+
             all_features = features_gathered.cpu().numpy()
             all_labels = labels_gathered.cpu().numpy()
             all_predicted_labels = predicted_labels_gathered.cpu().numpy()

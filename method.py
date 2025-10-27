@@ -268,31 +268,7 @@ class MethodLightningModule(pl.LightningModule):
             lambda_video_sup * loss_video_supervised +
             lambda_sensor_guide * loss_sensor_guided
         )
-
-         # --- [추가] Video classifier 성능 측정 (mapping 기반) ---
-        with torch.no_grad():
-            # 1. video classifier 출력
-            video_logits_all = self.video_classifier(v_appearance)
-            video_preds = torch.argmax(video_logits_all, dim=1)
-
-            # 2. mapping 적용 (cluster_id → real label)
-            mapping = getattr(self.clustering_model.clustering_manager, "mapping", None)
-            if mapping is not None and len(mapping) > 0:
-                mapped_preds = torch.tensor(
-                    [mapping.get(int(p.item()), int(p.item())) for p in video_preds],
-                    device=self.device
-                )
-            else:
-                mapped_preds = video_preds  # mapping이 없을 경우 fallback
-
-            # 3. 실제 라벨과 비교
-            video_labels = labels.to(self.device)
-            acc_video = (mapped_preds == video_labels).float().mean()
-
-            if self.global_rank == 0:
-                # 4. wandb에 로깅
-                wandb.log({"train/video_classifier_acc_mapped": acc_video})
-
+        
         return final_loss
 
 
