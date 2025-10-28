@@ -13,6 +13,7 @@ import torch.distributed as dist
 import os
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from method_utils import log_video_recon_grid, log_video_recon_gif
 
 # --- 사용자 정의 모듈 임포트 ---
 from model import SensorModel, VisionModel, ClusteringModel
@@ -52,6 +53,20 @@ class MethodLightningModule(pl.LightningModule):
         self.video_classifier = nn.Linear(self.hparams.embedding_dim, self.hparams.num_classes)
         print(self.global_rank, "Model initialized.")
 
+    def enable_stage2(self):
+        """appearance는 고정, motion만 학습"""
+        # 1) appearance 관련 모듈 동결 (scene/object/fuse/backbone 등)
+        for n, p in self.video_model.named_parameters():
+            if any(key in n for key in ["shared_encoder", "scene", "object", "fuse", "appearance", "video_classifier"]):
+                p.requires_grad = False
+
+        # 2) 모션 브랜치만 학습
+        for n, p in self.video_model.named_parameters():
+            if "motion_branch" in n:
+                p.requires_grad = True
+
+        self.stage2 = True  # flag
+
     def _calculate_alignment_loss(self, v_app: torch.Tensor, sensor: torch.Tensor, labels: torch.Tensor, temperature: float = 0.07, symmetric: bool = True):
         """
         Cross-modal supervised contrastive (InfoNCE) between appearance and sensor embeddings.
@@ -85,9 +100,8 @@ class MethodLightningModule(pl.LightningModule):
             loss = loss_as.mean()
 
         return loss
-
     
-    # 에포크 시작 시 clustering_model 상태 업데이트
+        # 에포크 시작 시 clustering_model 상태 업데이트
     def on_train_epoch_start(self):
 
         # 첫 에폭에서 메모리 뱅크 초기화 (중요!)
@@ -98,166 +112,118 @@ class MethodLightningModule(pl.LightningModule):
         self.training_steps_outputs = []  # 에포크 동안의 출력 저장용
 
     def training_step(self, batch, batch_idx):
-  
-        # 0. 데이터 준비 (Lightning이 자동으로 device로 옮겨줍니다)
+        # -------------------------------------------------------------
+        # 0) Batch 준비
+        # -------------------------------------------------------------
         videos, sensors, labels, sample_ids = batch
         idx, sample_id = sample_ids
+        B = videos.size(0)
 
-        # 실제 배치 크기를 텐서에서 직접 가져옵니다.
-        current_batch_size = videos.size(0)
+        # -------------------------------------------------------------
+        # 1) 클러스터링 (ODC) 단계
+        # -------------------------------------------------------------
+        imu_data = self.clustering_model.augment_imu_data(sensors) \
+            if self.clustering_model.epoch > 1 else sensors
 
-
-        # --- 1. 클러스터링 단계 ---
-        
-        # 데이터 증강 적용 (선택적)
-        if self.clustering_model.epoch > 1:  # 첫 에폭은 원본 데이터로 클러스터링
-            imu_data_aug = self.clustering_model.augment_imu_data(sensors)
-        else:
-            imu_data_aug = sensors
-        
-        # 모델 순전파
-        scores, features, _ = self.clustering_model(imu_data_aug, return_features=True, labels=labels, idx=idx)
-        
-        # 메모리 뱅크에서 저장된 pseudo label 가져오기
+        scores, features, _ = self.clustering_model(
+            imu_data, return_features=True, labels=labels, idx=idx
+        )
+        scores = scores.clone()
         stored_pseudo_labels = self.clustering_model.get_pseudo_labels(idx)
 
-        scores_original = scores.clone()
-        # scores = F.normalize(scores, dim=1)
-
-        # --- [수정된 로직 시작: 클러스터별 75% 분위수 기반 Good/Bad 분류] ---
+        # --- Good/Bad 분류 (클러스터별 75% 분위수) ---
         with torch.no_grad():
-            centroids = self.clustering_model.clustering_manager.centroids  # [K, D]
-            batch_centroids = centroids[stored_pseudo_labels]               # [B, D]
-            centroid_distances = torch.norm(features - batch_centroids, p=2, dim=1)  # [B]
-
+            centroids = self.clustering_model.clustering_manager.centroids
+            batch_centroids = centroids[stored_pseudo_labels]
+            centroid_distances = torch.norm(features - batch_centroids, p=2, dim=1)
             good_mask = torch.zeros_like(centroid_distances, dtype=torch.bool)
-
-            # 클러스터별로 거리의 75% 분위수(quantile=0.75)를 기준으로 분류
             num_clusters = self.clustering_model.clustering_manager.num_clusters
+
             for k in range(num_clusters):
-                cluster_mask = stored_pseudo_labels == k
-                if cluster_mask.any():
-                    cluster_dists = centroid_distances[cluster_mask]
-                    threshold = torch.quantile(cluster_dists, 0.75)
-                    good_mask[cluster_mask] = cluster_dists < threshold
+                cmask = (stored_pseudo_labels == k)
+                if cmask.any():
+                    dists = centroid_distances[cmask]
+                    thr = torch.quantile(dists, 0.75)
+                    good_mask[cmask] = dists < thr
 
             bad_mask = ~good_mask
             bad_indicator = bad_mask.long()
 
-            # --- 거리 정보 저장 ---
             distance_info = {
-                'centroid_distances': centroid_distances.cpu(),
-                'pseudo_labels': stored_pseudo_labels.cpu(),
+                "centroid_distances": centroid_distances.cpu(),
+                "pseudo_labels": stored_pseudo_labels.cpu(),
             }
-
-            # 메모리 업데이트
             self.clustering_model.clustering_manager.update_samples_memory(idx, features)
 
-            # 손실용 pseudo label 확보
             loss_labels = stored_pseudo_labels.to(self.device)
             mask_new = (loss_labels == -1)
             if mask_new.any():
-                loss_labels[mask_new] = torch.argmax(scores_original[mask_new], dim=1)
-        # --- [수정된 로직 끝] ---
+                loss_labels[mask_new] = torch.argmax(scores[mask_new], dim=1)
 
-
-        # 클래스 가중치 계산
         class_weights = self.clustering_model.clustering_manager.compute_class_weights()
 
-
-        # --- [수정된 Loss 로직 시작] ---
-        
-        # [수정 1] 'Live' 텐서로 초기화 (RuntimeError 방지)
-        # scores_original은 clustering_model의 출력이므로 항상 grad_fn을 가짐
-        loss_cluster = (scores_original.sum() * 0.0) 
-        
+        # --- ODC loss (warm-up: 전체 / refinement: good만) ---
+        loss_cluster = (scores.sum() * 0.0)
         if self.epoch < self.hparams.threshold_epoch:
-            # --- [1A. 웜업(Warm-up) 단계 Loss] ---
-            # 모든 샘플에 대해 ODC Loss를 계산 (Bad 샘플 학습 방치 방지)
-            loss_cluster = F.cross_entropy(
-                scores_original,  # [수정] 원본 로짓 사용, F.normalize 삭제
-                loss_labels,      
-                weight=class_weights.to(self.device)
-            )
+            loss_cluster = F.cross_entropy(scores, loss_labels, weight=class_weights.to(self.device))
         else:
-            # --- [1B. 교정(Refinement) 단계 Loss] ---
-            # 'Good' 샘플에 대해서만 ODC Loss를 계산 (신호 충돌 방지)
-            if good_mask.any(): # [수정] NaN 방지 (find_unused_parameters=True 가정)
+            if good_mask.any():
                 loss_cluster = F.cross_entropy(
-                    scores_original[good_mask],  # [수정] 원본 로짓 + Good 샘플
-                    loss_labels[good_mask],
-                    weight=class_weights.to(self.device)
+                    scores[good_mask], loss_labels[good_mask], weight=class_weights.to(self.device)
                 )
-        # --- [수정된 Loss 로직 끝] ---
 
-        # ODC 손실 계산 (cross-entropy) - 저장된 pseudo label과 클래스 가중치 사용    
-        # loss_cluster = F.cross_entropy(scores, loss_labels, weight=class_weights.to(self.device))
+        self.training_steps_outputs.append({
+            "features": features.detach(),
+            "labels": labels.detach(),
+            "predicted_labels": loss_labels.detach(),
+            "distance_info": distance_info,
+            "bad": bad_indicator.detach(),
+        })
 
-        pseudo_labels_all = self.all_gather(loss_labels).view(-1)
-
-        output = {
-                'features': features.detach(),
-                'labels': labels.detach(),
-                'predicted_labels': loss_labels.detach(),
-                'distance_info': distance_info,
-                'bad': bad_indicator.detach()
-            }
-        self.training_steps_outputs.append(output)
-        
-        # --- 2. 에포크(Epoch) 기반의 조건부 로직 ---
-        # self.epoch을 사용하여 현재 에포크를 확인합니다.
         if self.epoch < self.hparams.threshold_epoch:
             return loss_cluster
 
+        # -------------------------------------------------------------
+        # 2) Decompose 단계 (비디오 & 센서)
+        # -------------------------------------------------------------
+        model_output = self.video_model(videos)
+        v_app = model_output["v_appearance"]
+        v_scene = model_output["v_scene"]
+        v_object = model_output["v_object"]
+        sensor_emb = self.sensor_model(sensors)["emb"]
 
-       # --- Decompose 단계 ---
-        model_output = self.video_model(videos)  # flows 제거
-        v_appearance = model_output['v_appearance']
-        v_scene = model_output['v_scene']
-        v_object = model_output['v_object']
+        # -------------------------------------------------------------
+        # 3) Cross-modal pseudo label refinement
+        # -------------------------------------------------------------
+        loss_video_sup = torch.tensor(0.0, device=self.device)
+        loss_sensor_guide = torch.tensor(0.0, device=self.device)
 
-        sensor_output = self.sensor_model(sensors)
-        sensor_emb = sensor_output['emb']
+        if good_mask.any():
+            video_logits_good = self.video_classifier(v_app[good_mask])
+            loss_video_sup = F.cross_entropy(video_logits_good, loss_labels[good_mask])
 
-
-        # --- Cross-Modal Pseudo Label Refinement ---
-        loss_video_supervised = torch.tensor(0.0, device=self.device)
-        loss_sensor_guided = torch.tensor(0.0, device=self.device)
-
-        # 1. 좋은 샘플: 센서 → 비디오 (Classification 학습)
-        if good_mask.any(): 
-            video_logits_good = self.video_classifier(v_appearance[good_mask])
-            loss_video_supervised = F.cross_entropy(
-                video_logits_good,
-                loss_labels[good_mask]
-            )
-
-        # 2. 나쁜 샘플: 비디오 → 센서 (Pseudo-guided refinement)
         if bad_mask.any() and self.epoch >= self.hparams.threshold_epoch + self.hparams.guide_start_epoch:
             with torch.no_grad():
-                video_logits_bad = self.video_classifier(v_appearance[bad_mask])
-                video_probs_bad = F.softmax(video_logits_bad, dim=1)
-                video_max_probs, video_pseudo_bad = torch.max(video_probs_bad, dim=1)
-                high_confidence_mask = video_max_probs >= 0.9
+                video_logits_bad = self.video_classifier(v_app[bad_mask])
+                prob_bad = F.softmax(video_logits_bad, dim=1)
+                conf_bad, pseudo_bad = prob_bad.max(dim=1)
+                hi_conf = conf_bad >= 0.9
+            if hi_conf.any():
+                loss_sensor_guide = F.cross_entropy(scores[bad_mask][hi_conf], pseudo_bad[hi_conf])
 
-            if high_confidence_mask.any():
-                loss_sensor_guided = F.cross_entropy(
-                    scores_original[bad_mask][high_confidence_mask],
-                    video_pseudo_bad[high_confidence_mask]
-                )
+        # -------------------------------------------------------------
+        # 4) Sensor ↔ Appearance alignment (contrastive 등)
+        # -------------------------------------------------------------
+        v_app_all = self.all_gather(v_app).view(-1, v_app.shape[-1])
+        sensor_all = self.all_gather(sensor_emb).view(-1, sensor_emb.shape[-1])
+        pseudo_all = self.all_gather(loss_labels).view(-1)
 
+        loss_align = self._calculate_alignment_loss(v_app_all, sensor_all, pseudo_all)
 
-        # --- Sensor-guided Alignment ---
-        v_appearance_all = self.all_gather(v_appearance).view(-1, v_appearance.shape[-1])
-        sensor_emb_all = self.all_gather(sensor_emb).view(-1, sensor_emb.shape[-1])
-        pseudo_labels_all = self.all_gather(loss_labels).view(-1)
-
-        # contrastive loss는 sensor ↔ appearance 간 단일 alignment로 변경
-        loss_align = self._calculate_alignment_loss(v_appearance_all, sensor_emb_all, pseudo_labels_all)
-
-
-        # --- 최종 손실 계산 ---
-        lambda_cluster = 0.0
+        # -------------------------------------------------------------
+        # 5) 1차 손실 결합
+        # -------------------------------------------------------------
+        lambda_cluster = 1.0
         lambda_align = 0.0
         lambda_video_sup = 1.0
         lambda_sensor_guide = 1.5
@@ -265,11 +231,93 @@ class MethodLightningModule(pl.LightningModule):
         final_loss = (
             lambda_cluster * loss_cluster +
             lambda_align * loss_align +
-            lambda_video_sup * loss_video_supervised +
-            lambda_sensor_guide * loss_sensor_guided
+            lambda_video_sup * loss_video_sup +
+            lambda_sensor_guide * loss_sensor_guide
         )
-        
+
+        with torch.no_grad():
+            video_logits_all = self.video_classifier(v_app)
+            video_preds = torch.argmax(video_logits_all, dim=1)
+            self.training_steps_outputs[-1]["video_preds"] = video_preds.detach()
+
+        # -------------------------------------------------------------
+        # 6) Stage2: Video Reconstruction + Orthogonal Loss
+        # -------------------------------------------------------------
+        stage2_start = (
+            self.hparams.threshold_epoch +
+            self.hparams.guide_start_epoch +
+            self.hparams.motion_epoch
+        )
+
+        if self.epoch >= stage2_start:
+            if self.epoch == stage2_start:
+                self.enable_stage2()
+
+            out = model_output
+            video_recon = out['video_recon']          # [B, 3, T, H, W]
+            video_target = videos                     # Ground truth
+            
+            # print("video recon shape", video_recon.shape)
+            # print("video target shape", video_target.shape)
+            # --- Before L1 loss ---
+            # [B, 3, T, H, W] → [B, T, C, H, W]로 변환
+            video_recon = video_recon.permute(0, 2, 1, 3, 4)
+
+            # 해상도를 원본과 동일하게 보간
+            video_recon = F.interpolate(
+                video_recon.reshape(-1, 3, 56, 56),  # [B*T, 3, 56, 56]
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False
+            ).reshape(B, 16, 3, 224, 224)
+            # --- Reconstruction loss ---
+            loss_video_recon = F.l1_loss(video_recon, video_target)
+
+            # --- Orthogonal loss ---
+            v_app_n = F.normalize(out['v_appearance'], p=2, dim=1)
+            v_mot_n = F.normalize(out['v_motion'], p=2, dim=1)
+            loss_ortho = (v_app_n * v_mot_n).sum(dim=1).abs().mean()
+
+            # --- Total ---
+            final_loss = final_loss + 1.0 * loss_video_recon + 5.0 * loss_ortho
+
+            # --- Logging ---
+            self.log_dict({
+                'train/loss_video_recon': loss_video_recon,
+                'train/loss_ortho': loss_ortho,
+            }, sync_dist=True)
+
+        if (self.global_step % 200) == 0 and self.global_rank == 0:
+            try:
+                log_video_recon_grid(
+                    videos, 
+                    model_output["video_recon"], 
+                    logger=self.logger, 
+                    step=self.global_step
+                )
+            except Exception as e:
+                print(f"[viz] skip due to error: {e}")
+
+        if (self.global_step % 500) == 0 and self.global_rank == 0:
+            try:
+                log_video_recon_gif(
+                    videos,
+                    model_output["video_recon"],
+                    logger=self.logger,
+                    step=self.global_step,
+                    max_n=2,
+                    fps=4
+                )
+            except Exception as e:
+                print(f"[viz] skip gif log: {e}")
+
+
+        # -------------------------------------------------------------
+        # 7) 종료
+        # -------------------------------------------------------------
         return final_loss
+
+
 
 
     # epoch 종료 시 한번만 호출됨

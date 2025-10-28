@@ -334,36 +334,146 @@ class SharedEncoder(nn.Module):
 
     def forward(self, x):
         return self.net(x)  # [B, out_dim, H', W']
+# ---------------------------------------------------------------------
+# Motion Branch (temporal change encoder)
+# 입력: videos [B, T, C, H, W]
+# 출력: v_motion [B, D],  recon_map [B, 1, Hm, Wm]
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Attention Head (Object branch saliency map)
+# ---------------------------------------------------------------------
+class AttentionHead(nn.Module):
+    """Salient region 강조용 간단한 2D attention head."""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        return self.sigmoid(self.conv(x))  # [B, 1, H, W]
 
 
 # ---------------------------------------------------------------------
-# Scene Branch (Global context)
+# Shared CNN Encoder (Scene/Object 공통)
+# ---------------------------------------------------------------------
+class SharedEncoder(nn.Module):
+    """MOSO 스타일의 공유 CNN feature extractor."""
+    def __init__(self, in_channels=3, base_dim=64, out_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(base_dim),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(base_dim, base_dim * 2, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(base_dim * 2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(base_dim * 2, base_dim * 4, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(base_dim * 4),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(base_dim * 4, out_dim, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)  # [B, out_dim, H', W']
+
+# ---------------------------------------------------------------------
+# Video Decoder (appearance + motion → video reconstruction)
+# ---------------------------------------------------------------------
+class VideoDecoder(nn.Module):
+    def __init__(self, latent_dim=512, out_channels=3, num_frames=16):
+        super().__init__()
+        self.num_frames = num_frames
+        self.fc = nn.Linear(latent_dim, 256 * 2 * 7 * 7)
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose3d(256, 128, 4, 2, 1),   # 2→4
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose3d(128, 64, 4, 2, 1),    # 4→8
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose3d(64, 32, 4, 2, 1),     # 8→16
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose3d(32, out_channels, 3, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, fused_latent):  # [B, 512]
+        B = fused_latent.shape[0]
+        x = self.fc(fused_latent)
+        x = x.view(B, 256, 2, 7, 7)
+        video_recon = self.deconv(x)  # [B, 3, T, H, W]
+        # temporal crop/pad
+        if video_recon.shape[2] != self.num_frames:
+            video_recon = F.interpolate(video_recon, size=(self.num_frames, 224, 224), mode="trilinear", align_corners=False)
+        return video_recon
+
+# ---------------------------------------------------------------------
+# Motion Branch (Conv3D 기반 전체 시퀀스 입력)
+# ---------------------------------------------------------------------
+class MotionBranch(nn.Module):
+    def __init__(self, in_channels=3, base_dim=32, latent_dim=256):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv3d(in_channels, base_dim, kernel_size=(3,7,7), stride=(1,2,2), padding=(1,3,3)),
+            nn.BatchNorm3d(base_dim),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(base_dim, base_dim*2, kernel_size=(3,3,3), stride=(2,2,2), padding=(1,1,1)),
+            nn.BatchNorm3d(base_dim*2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(base_dim*2, latent_dim, kernel_size=(3,3,3), stride=(2,2,2), padding=(1,1,1)),
+            nn.BatchNorm3d(latent_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.projector = nn.Linear(latent_dim, latent_dim)
+
+    def forward(self, videos):  # [B, T, C, H, W]
+        B, T, C, H, W = videos.shape
+
+        # signed diff 유지 (열림/닫힘 방향 포함)
+        with torch.no_grad():
+            diff = (videos[:, 1:] - videos[:, :-1])  # [B,T-1,C,H,W]
+            diff_mag = diff.mean(dim=(1,2))          # [B,H,W]
+            diff_mag = diff_mag.unsqueeze(1)         # [B,1,H,W]
+
+        x_3d = videos.permute(0, 2, 1, 3, 4)         # [B,C,T,H,W]
+        feat_3d = self.backbone(x_3d)                # [B,D,T',H',W']
+        pooled = self.pool(feat_3d).flatten(1)       # [B,D]
+        v_motion = self.projector(pooled)            # [B,D]
+
+        return v_motion, diff_mag
+
+# ---------------------------------------------------------------------
+# Scene Branch
 # ---------------------------------------------------------------------
 class SceneBranch(nn.Module):
-    """Global/static appearance representation."""
     def __init__(self, in_dim=256, latent_dim=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_dim, latent_dim, kernel_size=3, padding=1),
+            nn.Conv2d(in_dim, latent_dim, 3, padding=1),
             nn.BatchNorm2d(latent_dim),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
 
     def forward(self, x):
-        # [B, C, H, W] → [B, latent_dim]
         return self.net(x).flatten(1)
 
 
 # ---------------------------------------------------------------------
-# Object Branch (Local salient appearance)
+# Object Branch
 # ---------------------------------------------------------------------
 class ObjectBranch(nn.Module):
-    """Foreground/local salient representation."""
     def __init__(self, in_dim=256, latent_dim=256):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_dim, latent_dim, kernel_size=3, padding=1),
+            nn.Conv2d(in_dim, latent_dim, 3, padding=1),
             nn.BatchNorm2d(latent_dim),
             nn.ReLU(inplace=True)
         )
@@ -371,57 +481,52 @@ class ObjectBranch(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, x):
-        feat = self.conv(x)                 # [B, latent_dim, H, W]
-        attn = self.attn(feat)              # [B, 1, H, W]
+        feat = self.conv(x)
+        attn = self.attn(feat)
         obj_feat = self.pool(feat * attn).flatten(1)
         return obj_feat
 
 
 # ---------------------------------------------------------------------
-# VisionModel (MOSO-style Appearance Decomposition)
+# VisionModel (Scene + Object + Motion 통합)
 # ---------------------------------------------------------------------
 class VisionModel(nn.Module):
-    """
-    MOSO 구조 기반 VisionModel (Motion 제거 버전)
-    - Shared CNN encoder
-    - Scene / Object branch
-    - Combined Appearance vector
-    """
     def __init__(self, in_channels=3, base_dim=64, latent_dim=256):
         super().__init__()
         self.shared_encoder = SharedEncoder(in_channels, base_dim, out_dim=latent_dim)
-        self.scene_branch = SceneBranch(in_dim=latent_dim, latent_dim=latent_dim)
-        self.object_branch = ObjectBranch(in_dim=latent_dim, latent_dim=latent_dim)
+        self.scene_branch   = SceneBranch(in_dim=latent_dim,  latent_dim=latent_dim)
+        self.object_branch  = ObjectBranch(in_dim=latent_dim, latent_dim=latent_dim)
+        self.motion_branch  = MotionBranch(in_channels=in_channels, base_dim=base_dim, latent_dim=latent_dim)
+        self.fuse = nn.Sequential(nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim))
 
-        # Scene + Object 결합 projection
-        self.proj = nn.Linear(latent_dim * 2, latent_dim)
-        self.norm = nn.LayerNorm(latent_dim)
-        self.fuse = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.LayerNorm(latent_dim)
-        )
+        # Video reconstruction decoder (appearance + motion)
+        self.decoder = VideoDecoder(latent_dim=latent_dim * 2, out_channels=3, num_frames=16)
 
-    def forward(self, video):
+    def forward(self, video):  # [B, T, C, H, W]
         B, T, C, H, W = video.shape
         video_reshaped = video.view(B*T, C, H, W)
-
         shared_feat = self.shared_encoder(video_reshaped)
         _, D, Hf, Wf = shared_feat.shape
         shared_feat = shared_feat.view(B, T, D, Hf, Wf).mean(dim=1)
 
-        v_scene = self.scene_branch(shared_feat)
+        v_scene  = self.scene_branch(shared_feat)
         v_object = self.object_branch(shared_feat)
+        v_app = self.fuse(torch.cat([v_scene, v_object], dim=1))
 
-        # ✅ fuse는 입력 1개만 받으므로 cat 먼저!
-        fused = torch.cat([v_scene, v_object], dim=1)
-        v_appearance = self.fuse(fused)
+        v_motion, diff_mag = self.motion_branch(video)
+        fused = torch.cat([v_app, v_motion], dim=1)
+
+        # Video reconstruction
+        video_recon = self.decoder(fused)
 
         return {
-            "v_scene": v_scene,
-            "v_object": v_object,
-            "v_appearance": v_appearance
+            'v_scene': v_scene,
+            'v_object': v_object,
+            'v_appearance': v_app,
+            'v_motion': v_motion,
+            'motion_target': diff_mag,   # 여전히 학습 시 참고 가능
+            'video_recon': video_recon,  # 최종 복원 영상
         }
-
 
 
 
@@ -640,27 +745,39 @@ class ClusteringManager(nn.Module):
         return 
 
     @torch.no_grad()
-    def _partition_max_cluster(
-            self, max_cluster: np.ndarray):
-        """Partition the largest cluster into two sub-clusters."""
+    def _partition_max_cluster(self, max_cluster: np.ndarray):
+        """Deterministic split: closest 50% stay, farthest 50% go to new cluster."""
         assert self.local_rank == "0"
         max_cluster_idx = np.where(self.label_bank.cpu().numpy() == max_cluster)[0]
-
         assert len(max_cluster_idx) >= 2
-        max_cluster_features = self.feature_bank[max_cluster_idx, :]
+
+        # (1) Extract features
+        max_cluster_features = self.feature_bank[max_cluster_idx, :]  # [N_c, D]
         if np.any(np.isnan(max_cluster_features.cpu().numpy())):
             raise Exception('Has nan in features.')
-        kmeans_ret = self.kmeans.fit(max_cluster_features.cpu())
-        sub_cluster1_idx = max_cluster_idx[kmeans_ret.labels_ == 0]
-        sub_cluster2_idx = max_cluster_idx[kmeans_ret.labels_ == 1]
-        if not (len(sub_cluster1_idx) > 0 and len(sub_cluster2_idx) > 0):
-            print(
-                'Warning: kmeans partition fails, resort to random partition.')
-            sub_cluster1_idx = np.random.choice(
-                max_cluster_idx, len(max_cluster_idx) // 2, replace=False)
-            sub_cluster2_idx = np.setdiff1d(
-                max_cluster_idx, sub_cluster1_idx, assume_unique=True)
+
+        # (2) Compute cluster centroid
+        centroid = max_cluster_features.mean(dim=0, keepdim=True)  # [1, D]
+
+        # (3) Compute distance to centroid (L2 norm)
+        distances = torch.norm(max_cluster_features - centroid, dim=1)  # [N_c]
+
+        # (4) Sort by distance
+        sorted_indices = torch.argsort(distances)  # ascending (near → far)
+
+        # (5) Split deterministically by median (50%)
+        mid = len(sorted_indices) // 2
+        sub_cluster1_idx = max_cluster_idx[sorted_indices[:mid].cpu()]   # near → stay (old cluster)
+        sub_cluster2_idx = max_cluster_idx[sorted_indices[mid:].cpu()]   # far  → new cluster
+
+        # (6) (Optional) check empty safeguard
+        if len(sub_cluster1_idx) == 0 or len(sub_cluster2_idx) == 0:
+            print("Warning: deterministic partition failed (empty subset). Forcing equal split.")
+            sub_cluster1_idx = max_cluster_idx[:len(max_cluster_idx)//2]
+            sub_cluster2_idx = max_cluster_idx[len(max_cluster_idx)//2:]
+
         return sub_cluster1_idx, sub_cluster2_idx
+
 
     @torch.no_grad()
     def _redirect_empty_clusters(self, empty_clusters: np.ndarray):
@@ -1154,12 +1271,25 @@ class ClusteringModel(nn.Module):
         print(f"evaluate_odc: Gathered {features_gathered.shape[0]} features from all ranks.")
 
         num_clusters = self.clustering_manager.num_clusters
+        remap=True
+        if remap:
+            labels_remapped = self._remap_pairwise_7(labels_gathered, num_clusters)
+        else:
+            labels_remapped = labels_gathered
 
         if 'video_preds' in outputs[0]:
                 video_preds_gathered = self.clustering_manager._gather(torch.cat([x['video_preds'] for x in outputs]))
                 video_labels_gathered = self.clustering_manager._gather(torch.cat([x['labels'] for x in outputs]))
         else:
             video_preds_gathered = None
+
+        # --- 새로 추가: v_motion 임베딩 ---
+        if 'v_motion' in outputs[0]:
+            v_motion_gathered = self.clustering_manager._gather(torch.cat([x['v_motion'] for x in outputs]))
+            print(f"evaluate: gathered v_motion {v_motion_gathered.shape}")
+        else:
+            v_motion_gathered = None
+            print("evaluate: no v_motion in outputs")
 
         # --- [1️⃣ Bad 샘플 수집] ---
         if "bad" in outputs[0]:
@@ -1173,6 +1303,8 @@ class ClusteringModel(nn.Module):
         if self.local_rank == "0":
             # 🔹 추가: video classifier 평가
             if video_preds_gathered is not None:
+                if remap:
+                    video_labels_gathered = self._remap_pairwise_7(video_labels_gathered, num_clusters)
                 video_preds_np = video_preds_gathered.cpu().numpy()
                 video_labels_np = video_labels_gathered.cpu().numpy()
 
@@ -1189,16 +1321,17 @@ class ClusteringModel(nn.Module):
             all_features = features_gathered.cpu().numpy()
             all_labels = labels_gathered.cpu().numpy()
             all_predicted_labels = predicted_labels_gathered.cpu().numpy()
+            all_remapped_labels = labels_remapped.cpu().numpy()
 
             print(f"evaluate_odc: Calculating results on {len(all_features)} total samples.")
             print("Computing Hungarian matching...")
 
             raw_accuracy, new_mapping = compute_hungarian_matching(
-                all_predicted_labels, all_labels, num_clusters
+                all_predicted_labels, all_remapped_labels, num_clusters
             )
 
             mapped_cluster_labels = np.array([new_mapping.get(c, c) for c in all_predicted_labels])
-            mapped_accuracy = np.mean(mapped_cluster_labels == all_labels)
+            mapped_accuracy = np.mean(mapped_cluster_labels == all_remapped_labels)
             print(f"Val Accuracy (Full Dataset): {mapped_accuracy:.4f}")
 
             if new_mapping is not None:
@@ -1211,7 +1344,7 @@ class ClusteringModel(nn.Module):
             })
 
             # --- [3️⃣ t-SNE 시각화 전용 라벨 수정] ---
-            all_labels_tsne = all_labels.copy()
+            all_labels_tsne = all_remapped_labels.copy()
             # all_labels_tsne[bad_np == 1] = num_clusters          # bad → 새 class index
             mapped_cluster_labels_tsne = mapped_cluster_labels.copy()
             mapped_cluster_labels_tsne[bad_np == 1] = num_clusters  # pred도 동일하게 표시
@@ -1242,4 +1375,75 @@ class ClusteringModel(nn.Module):
             except Exception as e:
                 print(f"Error during t-SNE visualization: {e}")
 
+            # --- 🔥 추가: Motion t-SNE ---
+            try:
+                if v_motion_gathered is not None:
+                    v_motion_np = v_motion_gathered.cpu().numpy()
+                    num_samples_for_tsne = min(8000, len(v_motion_np))
+                    sample_indices = np.random.choice(len(v_motion_np), num_samples_for_tsne, replace=False)
+
+                    print(f"Running Motion t-SNE on {num_samples_for_tsne} samples...")
+                    fig_motion_2d, fig_motion_3d = visualize_tsne(
+                        v_motion_np[sample_indices],
+                        all_labels[sample_indices],  # 실제 라벨 기준
+                        all_labels[sample_indices],   # ← pred_labels 대신 true_labels 전달
+                        prototypes=None,
+                        title=f"Motion t-SNE (Epoch {self.epoch})",
+                        num_classes=num_clusters*2,
+                        dataset_name=self.dataset_name,
+                    )
+                    wandb.log({
+                        "val_tsne_motion_2d": wandb.Image(fig_motion_2d),
+                        "val_tsne_motion_3d": wandb.Image(fig_motion_3d),
+                    })
+                    plt.close(fig_motion_2d)
+                    plt.close(fig_motion_3d)
+            except Exception as e:
+                print(f"Error during t-SNE visualization: {e}")    
+
         self.train()
+
+    def _remap_pairwise_7(self, labels_any, num_clusters):
+        """
+        0,2 -> 0 / 1,3 -> 1 / others -> // 2
+        -1 (미할당)은 그대로 둠.
+        """
+
+        import numpy as np
+        import torch
+
+        if isinstance(labels_any, torch.Tensor):
+            x = labels_any.clone().to(torch.long)
+            device = x.device
+
+            neg1_mask = (x == -1)
+            m02 = (x == 0) | (x == 2)
+            m13 = (x == 1) | (x == 3)
+            others = ~(neg1_mask | m02 | m13)
+
+            # 기본: 그대로
+            y = x.clone()
+            # 규칙 적용
+            y = torch.where(m02, torch.zeros_like(y), y)
+            y = torch.where(m13, torch.ones_like(y), y)
+            y[others] = torch.div(x[others], 2, rounding_mode='floor')
+            # -1 보존
+            y[neg1_mask] = -1
+            print(y)
+            return y.to(device)
+
+        else:  # numpy
+            x = np.asarray(labels_any).astype(np.int64)
+            y = x.copy()
+
+            neg1_mask = (x == -1)
+            m02 = (x == 0) | (x == 2)
+            m13 = (x == 1) | (x == 3)
+            others = ~(neg1_mask | m02 | m13)
+
+            y[m02] = 0
+            y[m13] = 1
+            y[others] = x[others] // 2
+            y[neg1_mask] = -1
+            print(y)
+            return y

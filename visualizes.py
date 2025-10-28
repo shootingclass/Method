@@ -33,23 +33,23 @@ ACTION_MERGE_LABELS_OPPORTUNITY = {
         9: 'Toggle Switch'
     }
 
-# ACTION_MERGE_LABELS_OPPORTUNITY = {0: 'Open Door 1',
-#     1: 'Open Door 2',
-#     2: 'Close Door 1',
-#     3: 'Close Door 2',
-#     4: 'Open Fridge',
-#     5: 'Close Fridge',
-#     6: 'Open Dishwasher',
-#     7: 'Close Dishwasher',
-#     8: 'Open Drawer 1',
-#     9: 'Close Drawer 1',
-#     10: 'Open Drawer 2',
-#     11: 'Close Drawer 2',
-#     12: 'Open Drawer 3',
-#     13: 'Close Drawer 3',
-#     14: 'Clean Table',
-#     15: 'Drink from Cup',
-#     16: 'Toggle Switch'}
+ACTION_MERGE_LABELS_OPPORTUNITY_ALL = {0: 'Open Door 1',
+    1: 'Open Door 2',
+    2: 'Close Door 1',
+    3: 'Close Door 2',
+    4: 'Open Fridge',
+    5: 'Close Fridge',
+    6: 'Open Dishwasher',
+    7: 'Close Dishwasher',
+    8: 'Open Drawer 1',
+    9: 'Close Drawer 1',
+    10: 'Open Drawer 2',
+    11: 'Close Drawer 2',
+    12: 'Open Drawer 3',
+    13: 'Close Drawer 3',
+    14: 'Clean Table',
+    15: 'Drink from Cup',
+    16: 'Toggle Switch'}
 
 ACTION_MERGE_LABELS_HWU_USP = {
     0: "Ktch_B1_Drawer",
@@ -274,7 +274,10 @@ def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = No
 def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 2D", num_classes=10, dataset_name="Opportunity++"):
     """2D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
     if dataset_name == "Opportunity++":
-        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+        if num_classes<=10:
+            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+        else:
+            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY_ALL
     elif dataset_name == "HWU-USP":
         ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
     else:
@@ -392,7 +395,10 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, tit
 def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 3D", num_classes=10, dataset_name="Opportunity++"):
     """3D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
     if dataset_name == "Opportunity++":
-        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+        if num_classes<=10:
+            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
+        else:
+            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY_ALL
     elif dataset_name == "HWU-USP":
         ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
     else:

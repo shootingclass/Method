@@ -39,8 +39,8 @@ class MethodDataModule(pl.LightningDataModule):
     def set_dataset_params(self, args, stage):
         if args.dataset_name == "Opportunity++":
             self.data_root = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-            self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject"
-            # self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action"
+            # self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject"
+            self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action"
             self.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
             self.start_index = 194
             self.end_index = 230

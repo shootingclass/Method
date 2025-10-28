@@ -2,11 +2,11 @@ import os
 import numpy as np
 import random
 import argparse
-
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import seed_everything
 import wandb
 
 # --- 사용자 정의 모듈 임포트 ---
@@ -16,14 +16,16 @@ from method import MethodLightningModule
 ####################################################################
 
 def set_random_seed(seed):
+    seed_everything(seed, workers=True)  # Lightning + dataloader worker용
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
+    
 def set_model(args, datamodule):
     global caching_callback
     if args.dataset_name == "Opportunity++":
@@ -188,6 +190,7 @@ if __name__ == '__main__':
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
     parser.add_argument("--guide_start_epoch", type=int, default=5)
+    parser.add_argument("--motion_epoch", type=int, default=10)
     
     args = parser.parse_args()
     args.stage = "pretrain"
