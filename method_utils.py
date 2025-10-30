@@ -140,96 +140,163 @@ def show_motion_recon_overlay(video, motion_target, motion_recon, idx=0, title="
     return fig
 
 import torch
-import matplotlib.pyplot as plt
-import wandb
-
-def log_video_recon_grid(videos, video_recon, logger, step, max_n=4):
-    """
-    원본 vs 복원 비디오를 side-by-side로 시각화 (WandB logging용)
-    Args:
-        videos: [B, T, C, H, W]
-        video_recon: [B, 3, T, H, W] or [B, T, 3, H, W]
-    """
-    B, T, C, H, W = videos.shape
-    max_n = min(B, max_n)
-
-    # 복원 비디오 차원 정렬
-    if video_recon.shape[1] == 3 and video_recon.shape[2] == T:
-        recon = video_recon
-    elif video_recon.shape[2] == 3:  # [B, T, C, H, W]
-        recon = video_recon.permute(0, 2, 1, 3, 4)
-    else:
-        raise ValueError(f"Unexpected video_recon shape: {video_recon.shape}")
-
-    fig, axes = plt.subplots(max_n, T, figsize=(T * 2, max_n * 2))
-    if max_n == 1:
-        axes = [axes]
-
-    for i in range(max_n):
-        for t in range(T):
-            orig = videos[i, t].permute(1, 2, 0).cpu().numpy()
-            recn = recon[i, :, t].permute(1, 2, 0).cpu().detach().numpy()
-            concat = torch.tensor(
-                torch.clip(torch.from_numpy(
-                    torch.cat((orig, recn), axis=0)
-                ), 0, 1)
-            )
-            axes[i][t].imshow(concat)
-            axes[i][t].axis("off")
-
-    plt.tight_layout()
-    logger.experiment.log({"video_recon_grid": wandb.Image(plt, caption=f"Step {step}")})
-    plt.close()
-
-import torch
-import wandb
-import torchvision
+import torchvision.utils as vutils
 import numpy as np
-import tempfile
-import os
+import wandb
+import imageio
+import cv2
 
-def log_video_recon_gif(videos, video_recon, logger, step, max_n=2, fps=4):
+@torch.no_grad()
+def log_video_recon_grid(videos, recons, logger, step, max_n=4, title="video_rec"):
     """
-    원본과 복원 비디오를 mp4/GIF 형태로 WandB에 함께 로깅.
-    Args:
-        videos: [B, T, C, H, W]
-        video_recon: [B, C, T, H, W] or [B, T, C, H, W]
+    Log a grid comparing original vs reconstructed videos.
+    Handles numpy/tensor inputs and shape mismatches robustly.
     """
-    B, T, C, H, W = videos.shape
-    max_n = min(B, max_n)
+    try:
+        # --- 타입 보정 ---
+        if isinstance(videos, np.ndarray):
+            videos = torch.from_numpy(videos)
+        if isinstance(recons, np.ndarray):
+            recons = torch.from_numpy(recons)
 
-    # 정렬 (모델에 따라 [B,C,T,H,W] or [B,T,C,H,W])
-    if video_recon.shape[1] == 3 and video_recon.shape[2] == T:
-        recon = video_recon
-    elif video_recon.shape[2] == 3:
-        recon = video_recon.permute(0, 2, 1, 3, 4)
-    else:
-        raise ValueError(f"Unexpected shape: {video_recon.shape}")
+        videos = videos.detach().cpu()
+        recons = recons.detach().cpu()
 
-    # normalize (0~1)
-    videos = torch.clamp(videos, 0, 1)
-    recon = torch.clamp(recon, 0, 1)
+        # --- 배치 크기 제한 ---
+        B = min(videos.size(0), max_n)
+        videos = videos[:B]
+        recons = recons[:B]
 
-    # 각 샘플별로 원본/복원 합치기
-    combined = []
-    for i in range(max_n):
-        orig_seq = videos[i].permute(1, 0, 2, 3)     # [T, C, H, W]
-        recon_seq = recon[i].permute(1, 0, 2, 3)
-        # 위-아래로 concat
-        both = torch.cat([orig_seq, recon_seq], dim=2)  # H doubled
-        combined.append(both)
-    combined = torch.stack(combined)  # [B, T, C, H*2, W]
+        # --- 크기 정렬: [B, T, C, H, W] or [B, C, T, H, W] 지원 ---
+        if videos.dim() == 5 and videos.shape[2] in [1, 3]:
+            pass
+        elif videos.dim() == 5 and videos.shape[1] in [1, 3]:
+            videos = videos.permute(0, 2, 1, 3, 4)
+        else:
+            raise ValueError(f"Unexpected video shape {videos.shape}")
 
-    # WandB Video expects [B, T, C, H, W] in [0,255]
-    combined_np = (combined * 255).cpu().byte().numpy()
+        if recons.dim() == 5 and recons.shape[2] in [1, 3]:
+            pass
+        elif recons.dim() == 5 and recons.shape[1] in [1, 3]:
+            recons = recons.permute(0, 2, 1, 3, 4)
+        else:
+            raise ValueError(f"Unexpected recon shape {recons.shape}")
 
-    tmp_dir = tempfile.mkdtemp()
-    video_path = os.path.join(tmp_dir, f"recon_step{step}.mp4")
+        # --- Flatten time dimension ---
+        videos_flat = videos.reshape(-1, *videos.shape[2:])   # [B*T, C, H, W]
+        recons_flat = recons.reshape(-1, *recons.shape[2:])   # [B*T, C, H, W]
 
-    # torchvision.utils.save_video 로 저장
-    torchvision.io.write_video(video_path, combined_np[0].transpose(0, 2, 3, 1), fps=fps)
+        # --- Channel 보정 ---
+        if videos_flat.dim() == 3:
+            videos_flat = videos_flat.unsqueeze(1)
+        if recons_flat.dim() == 3:
+            recons_flat = recons_flat.unsqueeze(1)
 
-    # wandb video log
-    logger.experiment.log({
-        "video_reconstruction": wandb.Video(video_path, fps=fps, caption=f"Step {step}")
-    })
+        # --- 크기 mismatch → resize recon ---
+        if videos_flat.shape[-2:] != recons_flat.shape[-2:]:
+            H, W = videos_flat.shape[-2:]
+            recons_flat = torch.nn.functional.interpolate(
+                recons_flat, size=(H, W), mode="bilinear", align_corners=False
+            )
+
+        # --- 클램프 (0~1) ---
+        videos_flat = videos_flat.clamp(0, 1)
+        recons_flat = recons_flat.clamp(0, 1)
+
+        # --- Grid 생성 ---
+        grid_real = vutils.make_grid(videos_flat, nrow=videos.shape[1])
+        grid_recon = vutils.make_grid(recons_flat, nrow=recons.shape[1])
+
+        # --- WandB로 업로드 ---
+        logger.experiment.log({
+            f"train/{title}": [
+                wandb.Image(grid_real, mode='RGB', caption=f"Original (step {step})"),
+                wandb.Image(grid_recon, mode='RGB', caption=f"Reconstructed (step {step})")
+            ]
+        })
+        print(f"[viz-grid] logged at step {step}")
+
+    except Exception as e:
+        print(f"[viz-grid] skipped due to error: {e}")
+
+
+@torch.no_grad()
+def log_video_recon_gif(videos, recons, logger, step, max_n=2, fps=4, title="video_recon"):
+    """
+    Log reconstructed video pairs (original vs recon) as side-by-side GIFs.
+    Automatically resizes recon frames to match originals.
+    """
+    try:
+        if isinstance(videos, np.ndarray):
+            videos = torch.from_numpy(videos)
+        if isinstance(recons, np.ndarray):
+            recons = torch.from_numpy(recons)
+
+        videos = videos.detach().cpu().clamp(0, 1)
+        recons = recons.detach().cpu().clamp(0, 1)
+
+        B = min(videos.size(0), max_n)
+        videos = videos[:B]
+        recons = recons[:B]
+
+        # Ensure consistent dim ordering
+        if videos.shape[2] not in [1, 3]:
+            videos = videos.permute(0, 2, 1, 3, 4)
+        if recons.shape[2] not in [1, 3]:
+            recons = recons.permute(0, 2, 1, 3, 4)
+
+        for i in range(B):
+            frames = []
+            for t in range(videos.size(1)):
+                frame_r = (videos[i, t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                frame_g = (recons[i, t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+                # ✅ 해상도 일치
+                if frame_r.shape != frame_g.shape:
+                    frame_g = cv2.resize(frame_g, (frame_r.shape[1], frame_r.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+                combined = np.concatenate([frame_r, frame_g], axis=1)
+                frames.append(combined)
+
+            mp4_path = f"./tmp/{title}_{i}_step{step}.mp4"
+            imageio.mimsave(mp4_path, frames, fps=fps, codec='libx264')
+            wandb.log({
+                f"train/{title}_{i}": wandb.Video(mp4_path, caption=f"Recon #{i}", fps=fps)
+            })
+        print(f"[viz-gif] logged {B} samples at step {step}")
+
+    except Exception as e:
+        print(f"[viz-gif] skipped due to error: {e}")
+
+def match_target_to_recon(video_target, video_recon):
+    """
+    video_target: [B, T, C, Ht, Wt]
+    video_recon : [B, T, C, Hr, Wr]  (decoder 출력 permute 후)
+    -> target을 recon 해상도(Hr,Wr)로 다운샘플해서 반환
+    """
+    B, T, C, Hr, Wr = video_recon.shape
+    _, Tt, Ct, Ht, Wt = video_target.shape
+    assert C == Ct, f"channel mismatch: recon C={C}, target C={Ct}"
+    assert T == Tt, f"T mismatch: recon T={T}, target T={Tt}"
+
+    video_target_ds = F.interpolate(
+        video_target.reshape(-1, C, Ht, Wt),  # [B*T, C, Ht, Wt]
+        size=(Hr, Wr),
+        mode="bilinear",
+        align_corners=False
+    ).reshape(B, T, C, Hr, Wr).to(video_recon.dtype)
+    return video_target_ds
+
+# [B, T, C, H, W] -> 시각화용 [B, T, 3, H, W]
+def to_vis_motion(diff_btchw: torch.Tensor) -> torch.Tensor:
+    # 1) 채널 평균 + 절댓값
+    x = diff_btchw.mean(dim=2).abs()                 # [B, T, H, W]
+    # 2) per-sample min-max (각 B마다)
+    B, T, H, W = x.shape
+    x = x.view(B, -1)
+    x_min = x.min(dim=1, keepdim=True).values
+    x_max = x.max(dim=1, keepdim=True).values
+    x = ((x - x_min) / (x_max - x_min + 1e-6)).view(B, T, H, W)
+    # 3) 1채널 → 3채널 복제
+    x = x.unsqueeze(2).repeat(1, 1, 3, 1, 1)         # [B, T, 3, H, W]
+    return x.clamp(0, 1)

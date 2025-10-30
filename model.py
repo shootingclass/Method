@@ -407,47 +407,85 @@ class VideoDecoder(nn.Module):
         video_recon = self.deconv(x)  # [B, 3, T, H, W]
         # temporal crop/pad
         if video_recon.shape[2] != self.num_frames:
+            print("upsampling into 224*224 !!")
             video_recon = F.interpolate(video_recon, size=(self.num_frames, 224, 224), mode="trilinear", align_corners=False)
         return video_recon
 
 # ---------------------------------------------------------------------
-# Motion Branch (Conv3D 기반 전체 시퀀스 입력)
+# Lightweight Motion Branch (Memory-efficient 3D Conv version)
 # ---------------------------------------------------------------------
 class MotionBranch(nn.Module):
-    def __init__(self, in_channels=3, base_dim=32, latent_dim=256):
+    def __init__(self, in_channels=3, base_dim=16, latent_dim=256, recon_hw=16):
         super().__init__()
+        self.recon_hw = recon_hw
+
+        # Lightweight 3D CNN backbone (Depthwise + Pointwise)
         self.backbone = nn.Sequential(
-            nn.Conv3d(in_channels, base_dim, kernel_size=(3,7,7), stride=(1,2,2), padding=(1,3,3)),
+            nn.Conv3d(in_channels, in_channels, kernel_size=3, stride=(2,2,2),
+                      padding=1, groups=in_channels, bias=False),
+            nn.BatchNorm3d(in_channels),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(in_channels, base_dim, kernel_size=1, bias=False),
             nn.BatchNorm3d(base_dim),
             nn.ReLU(inplace=True),
 
-            nn.Conv3d(base_dim, base_dim*2, kernel_size=(3,3,3), stride=(2,2,2), padding=(1,1,1)),
+            nn.Conv3d(base_dim, base_dim*2, kernel_size=3, stride=(2,2,2), padding=1),
             nn.BatchNorm3d(base_dim*2),
             nn.ReLU(inplace=True),
 
-            nn.Conv3d(base_dim*2, latent_dim, kernel_size=(3,3,3), stride=(2,2,2), padding=(1,1,1)),
+            nn.Conv3d(base_dim*2, latent_dim, kernel_size=3, stride=(2,2,2), padding=1),
             nn.BatchNorm3d(latent_dim),
             nn.ReLU(inplace=True),
         )
 
-        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        # diff projection layer (for direction-aware embedding)
+        self.diff_proj = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.diff_fc = nn.Linear(64, latent_dim)
+
+        # main projector (for feature-level fusion)
         self.projector = nn.Linear(latent_dim, latent_dim)
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
     def forward(self, videos):  # [B, T, C, H, W]
         B, T, C, H, W = videos.shape
 
-        # signed diff 유지 (열림/닫힘 방향 포함)
+        # 1) Normalize brightness per frame
         with torch.no_grad():
-            diff = (videos[:, 1:] - videos[:, :-1])  # [B,T-1,C,H,W]
-            diff_mag = diff.mean(dim=(1,2))          # [B,H,W]
-            diff_mag = diff_mag.unsqueeze(1)         # [B,1,H,W]
+            videos_norm = (videos - videos.mean(dim=[2,3,4], keepdim=True)) / (
+                videos.std(dim=[2,3,4], keepdim=True) + 1e-5
+            )
 
-        x_3d = videos.permute(0, 2, 1, 3, 4)         # [B,C,T,H,W]
-        feat_3d = self.backbone(x_3d)                # [B,D,T',H',W']
-        pooled = self.pool(feat_3d).flatten(1)       # [B,D]
-        v_motion = self.projector(pooled)            # [B,D]
+            # --- multi-frame temporal difference ---
+            # stack of (t+1 - t) preserves full motion sequence
+            diff = videos_norm[:, 1:] - videos_norm[:, :-1]     # [B, T-1, C, H, W]
+            diff_mag = diff.mean(dim=2, keepdim=False)          # [B, T-1, H, W]
 
-        return v_motion, diff_mag
+            # temporal average rather than full collapse (keep average motion intensity)
+            diff_mag_mean = diff_mag.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+
+        # 2) Main 3D motion encoding
+        x_3d = videos_norm.permute(0, 2, 1, 3, 4)               # [B, C, T, H, W]
+        feat_3d = self.backbone(x_3d)                           # [B, D, T', H', W']
+        pooled = self.pool(feat_3d).flatten(1)                  # [B, D]
+        motion_feat = self.projector(pooled)                    # [B, D]
+
+        # 3) Direction-aware diff projection
+        diff_feat = self.diff_proj(diff_mag_mean)               # [B, 64, 1, 1]
+        diff_feat = diff_feat.flatten(1)                        # [B, 64]
+        diff_proj = self.diff_fc(diff_feat)                     # [B, D]
+
+        # 4) Fuse (residual addition)
+        v_motion = motion_feat + diff_proj                      # [B, D]
+
+        return v_motion, diff_mag_mean
+
 
 # ---------------------------------------------------------------------
 # Scene Branch
@@ -513,11 +551,29 @@ class VisionModel(nn.Module):
         v_object = self.object_branch(shared_feat)
         v_app = self.fuse(torch.cat([v_scene, v_object], dim=1))
 
-        v_motion, diff_mag = self.motion_branch(video)
+         # -----------------------------------------------------
+        fused_app = self.decoder(torch.cat([v_app, torch.zeros_like(v_app)], dim=1))
+
+        if getattr(self, "motion_branch_enable", False):  # default: True
+            from method_utils import match_target_to_recon, log_video_recon_gif
+            upsized_fused_app = match_target_to_recon(fused_app.permute(0,2,1,3,4), video)
+            residual_motion = video - upsized_fused_app
+            v_motion, diff_mag = self.motion_branch(residual_motion)
+            print("motion branch is enabled")
+        else:
+            # motion encoder frozen or disabled
+            v_motion, diff_mag = torch.zeros_like(v_app), None
+
         fused = torch.cat([v_app, v_motion], dim=1)
 
         # Video reconstruction
         video_recon = self.decoder(fused)
+        fused_motion = self.decoder(torch.cat([torch.zeros_like(v_app), v_motion], dim=1))
+        fused_object = self.fuse(torch.cat([torch.zeros_like(v_scene), v_object], dim=1))
+        fused_object = self.decoder(torch.cat([fused_object, torch.zeros_like(v_motion)], dim=1))
+        fused_scene = self.fuse(torch.cat([torch.zeros_like(v_scene), v_object], dim=1))
+        fused_scene = self.decoder(torch.cat([fused_scene, torch.zeros_like(v_motion)], dim=1))
+        
 
         return {
             'v_scene': v_scene,
@@ -526,6 +582,12 @@ class VisionModel(nn.Module):
             'v_motion': v_motion,
             'motion_target': diff_mag,   # 여전히 학습 시 참고 가능
             'video_recon': video_recon,  # 최종 복원 영상
+            'fused_app': fused_app,
+            'fused_motion': fused_motion,
+            'fused_object': fused_object,
+            'fused_scene': fused_scene,
+            'residual_motion': residual_motion,
+            'upsized_fused_app':upsized_fused_app
         }
 
 
@@ -1353,7 +1415,7 @@ class ClusteringModel(nn.Module):
             bad_ratio = bad_np.mean() * 100
 
             # --- [4️⃣ t-SNE 시각화 호출] ---
-            num_samples_for_tsne = min(10000, len(all_features))
+            num_samples_for_tsne = min(100, len(all_features))
             sample_indices = np.random.choice(len(all_features), num_samples_for_tsne, replace=False)
 
             try:
@@ -1379,7 +1441,7 @@ class ClusteringModel(nn.Module):
             try:
                 if v_motion_gathered is not None:
                     v_motion_np = v_motion_gathered.cpu().numpy()
-                    num_samples_for_tsne = min(8000, len(v_motion_np))
+                    num_samples_for_tsne = min(700, len(v_motion_np))
                     sample_indices = np.random.choice(len(v_motion_np), num_samples_for_tsne, replace=False)
 
                     print(f"Running Motion t-SNE on {num_samples_for_tsne} samples...")

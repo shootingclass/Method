@@ -610,3 +610,67 @@ def visualize_sensor_name(top_indices, labels, id, dataset_name="Opportunity++")
                 index_val = index_tensor.item()
                 sensor_name = get_sensor_name(index_val + START_INDEX + 1)
                 print(f"  - Index: {index_val}, Name: {sensor_name}, {ACTION_MERGE_LABELS[label.item()]}")
+
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+import torchvision.transforms.functional as TF
+from matplotlib.colors import Normalize
+from matplotlib import cm
+
+def visualize_motion_heatmap(video, diff_mag_mean, labels=None, idx=0, save_path=None, alpha=0.6):
+    """
+    Args:
+        video: [B, T, C, H, W] tensor (original frames)
+        diff_mag_mean: [B, 1, H, W] tensor (motion map)
+        labels: optional [B] tensor or list of labels
+        idx: index in batch to visualize
+        save_path: optional PNG save path
+    """
+    # --------------------------
+    # 1. 데이터 준비
+    # --------------------------
+    frame = video[idx, video.shape[1] // 2]  # 중간 프레임 하나
+    motion_map = diff_mag_mean[idx, 0].detach().cpu().numpy()
+    frame_img = TF.to_pil_image(frame.detach().cpu())
+
+    # --------------------------
+    # 2. 정규화 및 색상 매핑
+    # --------------------------
+    norm = Normalize(vmin=-np.max(np.abs(motion_map)),
+                     vmax=np.max(np.abs(motion_map)))
+    cmap = cm.get_cmap('seismic')
+    motion_color = cmap(norm(motion_map))[..., :3]  # RGB
+    motion_color = (motion_color * 255).astype(np.uint8)
+
+    # --------------------------
+    # 3. 오버레이
+    # --------------------------
+    frame_np = np.array(frame_img)
+    overlay = (alpha * motion_color + (1 - alpha) * frame_np).astype(np.uint8)
+
+    # --------------------------
+    # 4. 시각화
+    # --------------------------
+    plt.figure(figsize=(8, 4))
+    plt.subplot(1, 2, 1)
+    plt.imshow(frame_np)
+    plt.title("Original Frame")
+    plt.axis("off")
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(overlay)
+
+    title = "Motion Heatmap"
+    if labels is not None:
+        label_value = labels[idx].item() if torch.is_tensor(labels) else labels[idx]
+        title += f" (Label: {ACTION_MERGE_LABELS_OPPORTUNITY_ALL[label_value]})"
+    plt.title(title)
+    plt.axis("off")
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200)
+        print(f"✅ saved to {save_path}")
+    else:
+        plt.show()
