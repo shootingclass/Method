@@ -189,8 +189,12 @@ if __name__ == '__main__':
     parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
-    parser.add_argument("--guide_start_epoch", type=int, default=5)
-    parser.add_argument("--motion_epoch", type=int, default=10)
+    parser.add_argument("--guide_start_epoch", type=int, default=10)
+    parser.add_argument("--freeze_epoch", type=int, default=25)
+    parser.add_argument("--momentum_m", type=float, default=0.999)
+    parser.add_argument("--lambda_hard", type=float, default=2.0)
+    parser.add_argument("--motion_damp_temp", type=float, default=0.1)
+    parser.add_argument("--contrastive_temp", type=float, default=0.07) 
     
     args = parser.parse_args()
     args.stage = "pretrain"

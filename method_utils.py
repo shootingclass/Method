@@ -1,6 +1,10 @@
 import numpy as np
 from tqdm import tqdm
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
 
 ####################################################################
 
@@ -93,11 +97,8 @@ def time_warp(x, sigma=0.2, num_knots=4):
     return warped_x
 
 
+#################################################################
 
-# --- viz_motion.py 같은 곳에 두고 import 해도 되고, 그냥 파일 하단에 둬도 OK ---
-import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
 def _norm01(x: torch.Tensor):
     x = x - x.min()
@@ -233,3 +234,34 @@ def log_video_recon_gif(videos, video_recon, logger, step, max_n=2, fps=4):
     logger.experiment.log({
         "video_reconstruction": wandb.Video(video_path, fps=fps, caption=f"Step {step}")
     })
+
+
+class CovarianceAlignmentLoss(nn.Module):
+    """
+    DiCoSA 논문의 Intra-Concept Alignment Loss (L_A) 구현체.
+    [참고: Equation (4), (5), (7)]
+    
+    두 피처(positive pair) 간의 정규화된 공분산(covariance)을 
+    1에 가깝게 만들어 Mutual Information을 최대화합니다.
+    """
+    def __init__(self, epsilon=1e-5):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def _batch_normalize(self, x):
+        mean = x.mean(dim=0)
+        var = x.var(dim=0, unbiased=False) 
+        std = (var + self.epsilon).sqrt()
+        z = (x - mean) / std
+        return z
+
+    def forward(self, feature_a, feature_b):
+        z_a = self._batch_normalize(feature_a)
+        z_s = self._batch_normalize(feature_b)
+        
+        # C_positive = E[(z_a)^T * z_s]
+        C_positive = (z_a * z_s).sum(dim=1).mean()
+        
+        # loss = (1 - C_positive)^2
+        loss = (1.0 - C_positive).pow(2)
+        return loss

@@ -183,7 +183,40 @@ class Block(torch.nn.Module):
 #         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 #         return out
 
-class SensorModel(nn.Module):
+class SensorAppearanceModel(nn.Module):
+    def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
+        super().__init__()
+        self.block1 = Block(sensor_channels, input_dim, 5)
+        self.block2 = Block(input_dim, input_dim * 2, 3)
+        self.block3 = Block(input_dim * 2, input_dim * 2, 3, pool_type="adaptive", embedding_size=32)
+        self.norm = torch.nn.GroupNorm(4, input_dim * 2)
+
+        self.gru = torch.nn.GRU(
+            batch_first=True,
+            input_size=input_dim * 2,  # GRU 입력은 feature dimension
+            hidden_size=size_embeddings
+        )
+        self.ssl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+        self.mmcl_head = torch.nn.Linear(size_embeddings, size_embeddings)
+
+    def forward(self, batch):
+        x = self.block1(batch)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.norm(x)        # [B, C, L]
+
+        # ✅ GRU가 [B, L, C]를 기대하므로 permute
+        x = x.permute(0, 2, 1)  # [B, L, C]
+
+        _, h = self.gru(x)      # h: [1, B, hidden_size]
+        emb = h[0]              # [B, hidden_size]
+
+        ssl_out = self.ssl_head(emb)
+        mmcl_out = self.mmcl_head(emb)
+        return {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
+
+
+class SensorMotionModel(nn.Module):
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
         super().__init__()
         self.block1 = Block(sensor_channels, input_dim, 5)
@@ -500,7 +533,7 @@ class VisionModel(nn.Module):
         self.fuse = nn.Sequential(nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim))
 
         # Video reconstruction decoder (appearance + motion)
-        self.decoder = VideoDecoder(latent_dim=latent_dim * 2, out_channels=3, num_frames=16)
+        # self.decoder = VideoDecoder(latent_dim=latent_dim * 2, out_channels=3, num_frames=16)
 
     def forward(self, video):  # [B, T, C, H, W]
         B, T, C, H, W = video.shape
@@ -514,18 +547,17 @@ class VisionModel(nn.Module):
         v_app = self.fuse(torch.cat([v_scene, v_object], dim=1))
 
         v_motion, diff_mag = self.motion_branch(video)
-        fused = torch.cat([v_app, v_motion], dim=1)
+        # fused = torch.cat([v_app, v_motion], dim=1)
 
         # Video reconstruction
-        video_recon = self.decoder(fused)
+        # video_recon = self.decoder(fused)
 
         return {
             'v_scene': v_scene,
             'v_object': v_object,
             'v_appearance': v_app,
             'v_motion': v_motion,
-            'motion_target': diff_mag,   # 여전히 학습 시 참고 가능
-            'video_recon': video_recon,  # 최종 복원 영상
+            'motion_target': diff_mag   # 여전히 학습 시 참고 가능
         }
 
 
@@ -545,12 +577,12 @@ class ClusteringManager(nn.Module):
         self.local_rank = local_rank
 
         if self.local_rank == "0":
-             # Rank 0에서만 임시 크기로 생성 (KMeans 전까지)
-             self.feature_bank = torch.zeros((10000, feature_dim), dtype=torch.float32) # 모든 gpu에서 매 스텝마다 feature_bank는 동기화 (update_samples_memory 참조)
+            # Rank 0에서만 임시 크기로 생성 (KMeans 전까지)
+            self.feature_bank = torch.zeros((10000, feature_dim), dtype=torch.float32) # 모든 gpu에서 매 스텝마다 feature_bank는 동기화 (update_samples_memory 참조)
         else:
-             # 다른 Rank는 None으로 두는 것이 메모리 절약에 유리하나,
-             # DDP에서 속성이 없으면 문제가 되므로, 명시적으로 None으로 설정합니다.
-             self.feature_bank = None
+            # 다른 Rank는 None으로 두는 것이 메모리 절약에 유리하나,
+            # DDP에서 속성이 없으면 문제가 되므로, 명시적으로 None으로 설정합니다.
+            self.feature_bank = None
         
         self.label_bank = None # 모든 Rank가 None으로 시작, 모든 gpu에서 매 스텝마다 label_bank는 동기화 (update_samples_memory 참조)
 
@@ -645,13 +677,11 @@ class ClusteringManager(nn.Module):
         dist.all_gather_into_tensor(gathered_tensor, tensor)
         return gathered_tensor
 
-    def update_samples_memory(self, idx: torch.Tensor,
-                              feature: torch.Tensor):
+    def update_samples_memory(self, idx: torch.Tensor, feature: torch.Tensor):
         """Update samples memory."""
         assert self.initialized
         # print(f"[{self.local_rank}] Updating samples memory for {idx.shape[0]} samples.")
-        feature_norm = feature / (feature.norm(dim=1).view(-1, 1) + 1e-10
-                                  )  # normalize
+        feature_norm = feature / (feature.norm(dim=1).view(-1, 1) + 1e-10)  # normalize
 
         idx = self._gather(idx)
         feature_norm = self._gather(feature_norm)
@@ -672,8 +702,7 @@ class ClusteringManager(nn.Module):
         # similarity_to_centroids = self.compute_similarity_scores(feature_norm.permute(1, 0))
         feature_norm = feature_norm.permute(1, 0)
         centroids_norm = F.normalize(self.centroids, dim=1)
-        similarity_to_centroids = torch.mm(centroids_norm,
-                                           feature_norm)  # CxN
+        similarity_to_centroids = torch.mm(centroids_norm, feature_norm)  # CxN
         newlabel = similarity_to_centroids.argmax(dim=0)  # cuda tensor
         # self.label_bank = self.label_bank.cuda()
         change_ratio = (newlabel != self.label_bank[idx]
@@ -788,7 +817,7 @@ class ClusteringManager(nn.Module):
             assert (self.label_bank.cpu().numpy() != e).all().item(), \
                 f'Cluster #{e} is not an empty cluster.'
             
-             # 1. 가장 큰 클러스터를 찾습니다.
+            # 1. 가장 큰 클러스터를 찾습니다.
             max_cluster = np.bincount(self.label_bank.cpu().numpy(), minlength=self.num_clusters).argmax().item()
             
             # 2. 가장 큰 클러스터를 둘로 분할합니다.
@@ -846,6 +875,10 @@ class ClusteringManager(nn.Module):
         weights = weights / weights.sum() * self.num_clusters
         return weights
 
+
+#################################################################
+
+
 # --- 4. Clustering 모델 ---
 class ClusteringModel(nn.Module):
     def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, datamodule, top_k=1, prototype_cache_dir="./cache", dataset_name="custom_dataset", min_cluster_size=30):
@@ -872,7 +905,7 @@ class ClusteringModel(nn.Module):
         self.prototype_cache_dir = prototype_cache_dir
         self.dataset_name = dataset_name
 
-   # 🌟🌟🌟 Broadcast 로직을 분리한 헬퍼 함수 🌟🌟🌟
+    # 🌟🌟🌟 Broadcast 로직을 분리한 헬퍼 함수 🌟🌟🌟
     def broadcast_prototypes(self, rank, world_size, device):
         print(f"[{rank}] Broadcasting results from rank 0...", device)
         
@@ -1061,7 +1094,7 @@ class ClusteringModel(nn.Module):
         # Rank 0에서 bool을 tensor로 변환하여 Broadcast
         cache_hit_tensor = torch.tensor([cache_hit], dtype=torch.bool, device=device)
         if world_size > 1:
-             dist.broadcast(cache_hit_tensor, src=0)
+            dist.broadcast(cache_hit_tensor, src=0)
         cache_hit = cache_hit_tensor.item()
         
         # Rank 0이 캐시에 성공했으면, K-Means 루프를 건너뛰고 바로 Broadcast로 이동합니다.
@@ -1261,7 +1294,7 @@ class ClusteringModel(nn.Module):
     
     def update_epoch(self, epoch):
         self.epoch = epoch
-   
+
     @torch.no_grad()
     def evaluate(self, outputs):
         self.eval()
@@ -1408,9 +1441,6 @@ class ClusteringModel(nn.Module):
         0,2 -> 0 / 1,3 -> 1 / others -> // 2
         -1 (미할당)은 그대로 둠.
         """
-
-        import numpy as np
-        import torch
 
         if isinstance(labels_any, torch.Tensor):
             x = labels_any.clone().to(torch.long)
