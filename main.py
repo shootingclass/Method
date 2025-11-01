@@ -140,7 +140,7 @@ def main(args):
             wandb.log({"dashboard/attn_correlation": panel})
             
     # 4. 콜백 리스트 생성
-    if args.model_name != "method":
+    if args.model_name != "methodd":
         checkpoint_callback = ModelCheckpoint(
             dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
             filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
@@ -183,14 +183,19 @@ if __name__ == '__main__':
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_frames", type=int, default=16)
+    parser.add_argument("--num_frames", type=int, default=20)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--embedding_dim", type=int, default=256)
     parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
-    parser.add_argument("--guide_start_epoch", type=int, default=5)
-    parser.add_argument("--motion_epoch", type=int, default=10)
+    parser.add_argument("--video_classifier_epoch", type=int, default=5)
+    parser.add_argument("--bad_correction_epoch", type=int, default=5)
+
+    parser.add_argument("--momentum_m", type=float, default=0.999)
+    parser.add_argument("--lambda_hard", type=float, default=2.0)
+    parser.add_argument("--motion_damp_temp", type=float, default=0.1)
+    parser.add_argument("--contrastive_temp", type=float, default=0.07)
     
     args = parser.parse_args()
     args.stage = "pretrain"

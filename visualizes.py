@@ -271,259 +271,171 @@ def save_video_grid(video_tensor: torch.Tensor, output_path: str, nrow: int = No
 
 
 # --- 6. t-SNE 시각화 함수 ---
-def visualize_tsne_2d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 2D", num_classes=10, dataset_name="Opportunity++"):
-    """2D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
+def visualize_tsne_2d(embeddings, true_labels, pred_labels=None, prototypes=None,
+                      title="t-SNE Visualization 2D", num_classes=10, dataset_name="Opportunity++"):
+    """pred_labels가 None이면 True Labels만 시각화"""
+    
+    # --- label dictionary 선택 ---
     if dataset_name == "Opportunity++":
-        if num_classes<=10:
-            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
-        else:
-            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY_ALL
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY if num_classes <= 10 else ACTION_MERGE_LABELS_OPPORTUNITY_ALL
     elif dataset_name == "HWU-USP":
         ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
     else:
         raise ValueError(f"Unknown dataset name: {dataset_name}")
+
     label_names = [ACTION_MERGE_LABELS.get(i, f"Class_{i}") for i in range(num_classes)]
-    
-    # t-SNE를 실행하기에 샘플 수가 충분한지 확인
+
+    # --- t-SNE 실행 준비 ---
     if len(embeddings) <= 1:
-        print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples. Skipping visualization.")
-        return plt.figure()  # 빈 Figure 객체 반환
+        print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples.")
+        return plt.figure()
 
-    # 프로토타입과 임베딩을 함께 변환
-    if prototypes is not None:
-        combined_data = np.vstack([embeddings, prototypes])
-    else:
-        combined_data = embeddings
-    nan_count = np.isnan(combined_data).sum()
-    print(f"Total number of NaN values: {nan_count}")
-
-    # NaN 값이 있는 행(샘플) 확인
-    rows_with_nan = np.any(np.isnan(combined_data), axis=1)
-    print(f"Rows containing NaN: \n{np.where(rows_with_nan)[0]}")
-    # t-SNE 시각화 (2D와 3D 모두)
-
-    perplexity_value = min(30, len(combined_data) - 1)
-    if perplexity_value <= 0:
-        perplexity_value = 1.0
-        
+    combined_data = np.vstack([embeddings, prototypes]) if prototypes is not None else embeddings
+    perplexity_value = max(1, min(30, len(combined_data) - 1))
     tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=42, metric="cosine")
     reduced_all = tsne.fit_transform(combined_data)
-    
     reduced_embeddings = reduced_all[:len(embeddings)]
-    if prototypes is not None:
-        reduced_prototypes = reduced_all[len(embeddings):]
+    reduced_prototypes = reduced_all[len(embeddings):] if prototypes is not None else None
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 10))
-    fig.suptitle(title, fontsize=16)
-    
-    # 일관된 색상 매핑을 위한 색상 정의
-    # colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+    # --- 컬러맵 설정 ---
     cmap = plt.cm.get_cmap('tab20', num_classes)
     colors = cmap(np.linspace(0, 1, num_classes))
-    
-    # 실제 레이블 기준 시각화
-    scatter1 = None
+
+    # --- pred_labels 존재 여부에 따라 subplot 구성 ---
+    if pred_labels is None:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        fig.suptitle(title + " (True Labels Only)", fontsize=16)
+
+        for i in range(num_classes):
+            mask = (true_labels == i)
+            if mask.any():
+                ax.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1],
+                           color=colors[i], label=label_names[i], alpha=0.7)
+        ax.set_title("True Labels")
+
+        if prototypes is not None:
+            ax.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1],
+                       c='black', marker='X', s=200, edgecolor='white', linewidth=1.5, label='Prototypes')
+            for i in range(len(prototypes)):
+                ax.text(reduced_prototypes[i, 0]+0.1, reduced_prototypes[i, 1]+0.1, f'P{i}', fontsize=10, weight='bold')
+
+        ax.legend()
+        return fig
+
+    # --- pred_labels가 있는 경우: 기존처럼 두 subplot ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 10))
+    fig.suptitle(title, fontsize=16)
+
     for i in range(num_classes):
         mask = (true_labels == i)
         if mask.any():
-            sc = ax1.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], 
-                    color=colors[i], label=label_names[i], alpha=0.7)
-            if scatter1 is None:
-                scatter1 = sc
-    
+            ax1.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1],
+                        color=colors[i], label=label_names[i], alpha=0.7)
     ax1.set_title("True Labels")
 
-    # 예측된 클러스터 기준 시각화
-    scatter2 = None
     for i in range(num_classes):
         mask = (pred_labels == i)
         if mask.any():
-            sc = ax2.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], 
-                    color=colors[i], label=label_names[i], alpha=0.7)
-            if scatter2 is None:
-                scatter2 = sc
-    
-    # 프로토타입 시각화
+            ax2.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1],
+                        color=colors[i], label=label_names[i], alpha=0.7)
+    ax2.set_title("Predicted Clusters")
+
     if prototypes is not None:
-        proto_labels = np.arange(len(prototypes))
-        ax1.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
-        ax2.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5)
-        
-        # 프로토타입에 번호 추가
+        ax1.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1],
+                    c='black', marker='X', s=200, edgecolor='white', linewidth=1.5, label='Prototypes')
+        ax2.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1],
+                    c='black', marker='X', s=200, edgecolor='white', linewidth=1.5, label='Prototypes')
         for i in range(len(prototypes)):
-            ax1.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
-            ax2.text(reduced_prototypes[i, 0] + 0.1, reduced_prototypes[i, 1] + 0.1, f'P{i}', fontsize=12, weight='bold')
-        
-        # 범례 수동 생성
-        handles1 = []
-        for i in range(num_classes):
-            # 각 클래스마다 색상을 일관되게 설정
-            handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
-            handles1.append(handle)
-        
-        proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
-        handles1.append(proto_handle)
-        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1])
-        
-        # 두 번째 그래프도 동일한 방식으로 범례 생성
-        handles2 = []
-        for i in range(num_classes):
-            handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
-            handles2.append(handle)
-        
-        handles2.append(proto_handle)
-        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2])
-    else:
-        # 범례 수동 생성 (프로토타입 없음)
-        handles1 = []
-        handles2 = []
-        for i in range(num_classes):
-            handle1 = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
-            handle2 = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
-            handles1.append(handle1)
-            handles2.append(handle2)
-        
-        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1])
-        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2])
-    
+            ax1.text(reduced_prototypes[i, 0]+0.1, reduced_prototypes[i, 1]+0.1, f'P{i}', fontsize=10, weight='bold')
+            ax2.text(reduced_prototypes[i, 0]+0.1, reduced_prototypes[i, 1]+0.1, f'P{i}', fontsize=10, weight='bold')
+
+    ax1.legend()
+    ax2.legend()
     return fig
 
 
 #################################################################
 
 
-def visualize_tsne_3d(embeddings, true_labels, pred_labels, prototypes=None, title="t-SNE Visualization 3D", num_classes=10, dataset_name="Opportunity++"):
-    """3D t-SNE 결과를 시각화하고 Matplotlib Figure 객체를 반환"""
+def visualize_tsne_3d(embeddings, true_labels, pred_labels=None, prototypes=None,
+                      title="t-SNE Visualization 3D", num_classes=10, dataset_name="Opportunity++"):
+    """pred_labels가 None이면 True Labels만 시각화"""
+    
+    # --- label dictionary 선택 ---
     if dataset_name == "Opportunity++":
-        if num_classes<=10:
-            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY
-        else:
-            ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY_ALL
+        ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_OPPORTUNITY if num_classes <= 10 else ACTION_MERGE_LABELS_OPPORTUNITY_ALL
     elif dataset_name == "HWU-USP":
         ACTION_MERGE_LABELS = ACTION_MERGE_LABELS_HWU_USP
     else:
         raise ValueError(f"Unknown dataset name: {dataset_name}")
+
     label_names = [ACTION_MERGE_LABELS.get(i, f"Class_{i}") for i in range(num_classes)]
-    
-    # t-SNE를 실행하기에 샘플 수가 충분한지 확인
+
     if len(embeddings) <= 1:
-        print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples. Skipping visualization.")
-        return plt.figure()  # 빈 Figure 객체 반환
+        print(f"Warning: Cannot run t-SNE with {len(embeddings)} samples.")
+        return plt.figure()
 
-    # 프로토타입과 임베딩을 함께 변환
-    if prototypes is not None:
-        combined_data = np.vstack([embeddings, prototypes])
-    else:
-        combined_data = embeddings
-
-    perplexity_value = min(30, len(combined_data) - 1)
-    if perplexity_value <= 0:
-        perplexity_value = 1.0
-        
-    # 3차원 t-SNE 실행
+    combined_data = np.vstack([embeddings, prototypes]) if prototypes is not None else embeddings
+    perplexity_value = max(1, min(30, len(combined_data) - 1))
     tsne = TSNE(n_components=3, perplexity=perplexity_value, random_state=42, metric="cosine")
     reduced_all = tsne.fit_transform(combined_data)
-    
     reduced_embeddings = reduced_all[:len(embeddings)]
-    if prototypes is not None:
-        reduced_prototypes = reduced_all[len(embeddings):]
+    reduced_prototypes = reduced_all[len(embeddings):] if prototypes is not None else None
 
-    fig = plt.figure(figsize=(22, 10))
-    fig.suptitle(title, fontsize=16)
-    
-    # 3D 서브플롯 생성
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax2 = fig.add_subplot(122, projection='3d')
-    
-    # 일관된 색상 매핑을 위한 색상 정의
-    # colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
     cmap = plt.cm.get_cmap('tab20', num_classes)
     colors = cmap(np.linspace(0, 1, num_classes))
-    
-    # 실제 레이블 기준 시각화
-    scatter1 = None
+
+    # --- pred_labels가 없는 경우: 단일 3D plot ---
+    if pred_labels is None:
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        fig.suptitle(title + " (True Labels Only)", fontsize=16)
+
+        for i in range(num_classes):
+            mask = (true_labels == i)
+            if mask.any():
+                ax.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
+                           color=colors[i], label=label_names[i], alpha=0.7)
+        if prototypes is not None:
+            ax.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
+                       c='black', marker='X', s=200, edgecolor='white', linewidth=1.5, label='Prototypes')
+
+        ax.legend()
+        ax.set_xlabel('Component 1')
+        ax.set_ylabel('Component 2')
+        ax.set_zlabel('Component 3')
+        return fig
+
+    # --- pred_labels 있는 경우: 기존 2-subplot 버전 ---
+    fig = plt.figure(figsize=(22, 10))
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax2 = fig.add_subplot(122, projection='3d')
+    fig.suptitle(title, fontsize=16)
+
     for i in range(num_classes):
         mask = (true_labels == i)
         if mask.any():
-            sc = ax1.scatter(
-                reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
-                color=colors[i], label=label_names[i], alpha=0.7, s=50
-            )
-            if scatter1 is None:
-                scatter1 = sc
+            ax1.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
+                        color=colors[i], label=label_names[i], alpha=0.7)
     ax1.set_title("True Labels")
-    
-    # 예측된 클러스터 기준 시각화
-    scatter2 = None
+
     for i in range(num_classes):
         mask = (pred_labels == i)
         if mask.any():
-            sc = ax2.scatter(
-                reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
-                color=colors[i], label=label_names[i], alpha=0.7, s=50
-            )
-            if scatter2 is None:
-                scatter2 = sc
+            ax2.scatter(reduced_embeddings[mask, 0], reduced_embeddings[mask, 1], reduced_embeddings[mask, 2],
+                        color=colors[i], label=label_names[i], alpha=0.7)
     ax2.set_title("Predicted Clusters")
-    
-    # 프로토타입 시각화
+
     if prototypes is not None:
-        proto_labels = np.arange(len(prototypes))
-        ax1.scatter(
-            reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
-            c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5
-        )
-        ax2.scatter(
-            reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
-            c=proto_labels, cmap="tab10", marker='X', s=200, edgecolor='black', linewidth=1.5
-        )
-        
-        # 프로토타입에 번호 추가
-        for i in range(len(prototypes)):
-            ax1.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], 
-                    f'P{i}', fontsize=12, weight='bold')
-            ax2.text(reduced_prototypes[i, 0], reduced_prototypes[i, 1], reduced_prototypes[i, 2], 
-                    f'P{i}', fontsize=12, weight='bold')
-    
-    # 범례 수동 생성
-    handles1 = []
-    for i in range(num_classes):
-        # 각 클래스마다 색상을 일관되게 설정
-        handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
-        handles1.append(handle)
-    
-    if prototypes is not None:
-        proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
-        handles1.append(proto_handle)
-        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1], loc='upper left')
-    else:
-        ax1.legend(handles=handles1, labels=[h.get_label() for h in handles1], loc='upper left')
-    
-    # 두 번째 그래프도 동일한 방식으로 범례 생성
-    handles2 = []
-    for i in range(num_classes):
-        handle = plt.Line2D([], [], color=colors[i], marker='o', linestyle='None', markersize=8, label=label_names[i])
-        handles2.append(handle)
-    
-    if prototypes is not None:
-        proto_handle = plt.Line2D([], [], color='gray', marker='X', linestyle='None', markersize=10, label='Prototypes')
-        handles2.append(proto_handle)
-        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2], loc='upper left')
-    else:
-        ax2.legend(handles=handles2, labels=[h.get_label() for h in handles2], loc='upper left')
-    
-    # 축 라벨 설정
-    ax1.set_xlabel('Component 1')
-    ax1.set_ylabel('Component 2')
-    ax1.set_zlabel('Component 3')
-    ax2.set_xlabel('Component 1')
-    ax2.set_ylabel('Component 2')
-    ax2.set_zlabel('Component 3')
-    
-    # 그래프 조절
-    plt.tight_layout()
-    
+        ax1.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
+                    c='black', marker='X', s=200, edgecolor='white', linewidth=1.5, label='Prototypes')
+        ax2.scatter(reduced_prototypes[:, 0], reduced_prototypes[:, 1], reduced_prototypes[:, 2],
+                    c='black', marker='X', s=200, edgecolor='white', linewidth=1.5, label='Prototypes')
+
+    ax1.legend()
+    ax2.legend()
     return fig
+
 
 
 #################################################################

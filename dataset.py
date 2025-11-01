@@ -213,14 +213,19 @@ class VideoSensorDataset(Dataset):
             
             label = item['label']
             item_id = item['video_id']
+            if 'optical_flow_dir' in item:
+                relative_path_optical_flow = item['optical_flow_dir']
+                optical_flow_path = os.path.join(self.data_root, relative_path_optical_flow)
+            else:
+                optical_flow_path = None
             
-            self.samples.append((video_path, sensor_path, label, item_id))
+            self.samples.append((video_path, sensor_path, label, item_id, optical_flow_path))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        video_path, sensor_path, label, item_id = self.samples[idx]
+        video_path, sensor_path, label, item_id, flow_path = self.samples[idx]
         
         ######### 비디오 전처리 #########       
         if self.current_epoch <= self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
@@ -364,7 +369,16 @@ class VideoSensorDataset(Dataset):
         # 센서 데이터 전처리 적용
         if self.sensor_transform:
             sensor_data = self.sensor_transform(sensor_data)
-        return frames_tensor, sensor_data, label, [idx, item_id]
+
+        # Optical flow 전처리
+        if flow_path is not None:
+            flow_path = os.path.join(flow_path, "flow.npy")
+            flow = np.load(flow_path) 
+            flow = torch.from_numpy(flow).float()  # [T, 2, H, W]
+        else:
+            flow = {}
+
+        return frames_tensor, sensor_data, label, [idx, item_id], flow
     
     def set_epoch(self, epoch):
         self.current_epoch = epoch
