@@ -182,15 +182,15 @@ if __name__ == '__main__':
     # 학습 인자    
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_frames", type=int, default=20)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--embedding_dim", type=int, default=256)
     parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
-    parser.add_argument("--video_classifier_epoch", type=int, default=5)
-    parser.add_argument("--bad_correction_epoch", type=int, default=5)
+    parser.add_argument("--video_classifier_epoch", type=int, default=10)
+    parser.add_argument("--bad_correction_epoch", type=int, default=10)
 
     parser.add_argument("--momentum_m", type=float, default=0.999)
     parser.add_argument("--lambda_hard", type=float, default=2.0)

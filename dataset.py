@@ -375,6 +375,8 @@ class VideoSensorDataset(Dataset):
             flow_path = os.path.join(flow_path, "flow.npy")
             flow = np.load(flow_path) 
             flow = torch.from_numpy(flow).float()  # [T, 2, H, W]
+             # 값 정규화
+            # flow = torch.clamp(flow, -20, 20) / 20.0
         else:
             flow = {}
 

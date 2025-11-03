@@ -2,6 +2,8 @@ import numpy as np
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import cv2
+
 
 ####################################################################
 
@@ -140,12 +142,6 @@ def show_motion_recon_overlay(video, motion_target, motion_recon, idx=0, title="
     plt.tight_layout()
     return fig
 
-import torch
-<<<<<<< Updated upstream
-import matplotlib.pyplot as plt
-=======
-import numpy as np
-import cv2
 
 def overlay_motion_heatmap(video, motion_residual, alpha=0.5, colormap=cv2.COLORMAP_JET):
     """
@@ -191,7 +187,6 @@ def overlay_motion_heatmap(video, motion_residual, alpha=0.5, colormap=cv2.COLOR
 import torch
 import torchvision.utils as vutils
 import numpy as np
->>>>>>> Stashed changes
 import wandb
 
 def log_video_recon_grid(videos, video_recon, logger, step, max_n=4):
@@ -246,46 +241,6 @@ def log_video_recon_gif(videos, video_recon, logger, step, max_n=2, fps=4):
         videos: [B, T, C, H, W]
         video_recon: [B, C, T, H, W] or [B, T, C, H, W]
     """
-<<<<<<< Updated upstream
-    B, T, C, H, W = videos.shape
-    max_n = min(B, max_n)
-
-    # 정렬 (모델에 따라 [B,C,T,H,W] or [B,T,C,H,W])
-    if video_recon.shape[1] == 3 and video_recon.shape[2] == T:
-        recon = video_recon
-    elif video_recon.shape[2] == 3:
-        recon = video_recon.permute(0, 2, 1, 3, 4)
-    else:
-        raise ValueError(f"Unexpected shape: {video_recon.shape}")
-
-    # normalize (0~1)
-    videos = torch.clamp(videos, 0, 1)
-    recon = torch.clamp(recon, 0, 1)
-
-    # 각 샘플별로 원본/복원 합치기
-    combined = []
-    for i in range(max_n):
-        orig_seq = videos[i].permute(1, 0, 2, 3)     # [T, C, H, W]
-        recon_seq = recon[i].permute(1, 0, 2, 3)
-        # 위-아래로 concat
-        both = torch.cat([orig_seq, recon_seq], dim=2)  # H doubled
-        combined.append(both)
-    combined = torch.stack(combined)  # [B, T, C, H*2, W]
-
-    # WandB Video expects [B, T, C, H, W] in [0,255]
-    combined_np = (combined * 255).cpu().byte().numpy()
-
-    tmp_dir = tempfile.mkdtemp()
-    video_path = os.path.join(tmp_dir, f"recon_step{step}.mp4")
-
-    # torchvision.utils.save_video 로 저장
-    torchvision.io.write_video(video_path, combined_np[0].transpose(0, 2, 3, 1), fps=fps)
-
-    # wandb video log
-    logger.experiment.log({
-        "video_reconstruction": wandb.Video(video_path, fps=fps, caption=f"Step {step}")
-    })
-=======
     B, T, C, Hr, Wr = video_recon.shape
     _, Tt, Ct, Ht, Wt = video_target.shape
     assert C == Ct, f"channel mismatch: recon C={C}, target C={Ct}"
@@ -397,54 +352,86 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import wandb
-
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-import wandb
-
-def log_optical_flow_overlay_to_wandb(video, flows, wandb_key="optical_flow_overlay", stride=10, scale=5, fps=10):
+def log_optical_flow_overlay_to_wandb(
+    video,
+    flows,
+    wandb_key="Flow_Overlay_FineMotion",
+    stride=6,
+    fps=10,
+    scale=5.0,
+    roi_alpha=0.6,
+):
     """
-    Optical flow를 비디오 프레임 위에 overlay하여 WandB에 mp4로 업로드.
-
-    Args:
-        video (Tensor): [B, T, 3, H, W]
-        flows (Tensor): [B, T, 2, H, W]
+    Optical flow fine-motion 강조 버전:
+    - 작은 움직임(손, 팔, 문 등)을 보기 위해 threshold 낮추고 stride 줄임.
+    - 큰 displacement보다 세밀한 motion vector를 더 보여줌.
     """
-    assert video.dim() == 5 and flows.dim() == 5, "video, flows는 [B, T, C, H, W] 형태여야 합니다."
+    import numpy as np
+    import cv2
+    import wandb
+    import torch
+    from tqdm import tqdm
+
+    assert video.dim() == 5 and flows.dim() == 5, \
+        "video, flows는 [B, T, C, H, W] 형태여야 합니다."
     B, T, _, H, W = video.shape
     assert B == 1, "현재는 batch=1만 지원합니다."
 
-    frames = []
+    # ✅ flow 해상도에 맞춰 영상 크기 조정
+    Hf, Wf = flows.shape[-2], flows.shape[-1]
+    if (Hf, Wf) != (H, W):
+        video = F.interpolate(video, size=(Hf, Wf), mode="bilinear", align_corners=False)
 
-    for t in range(T):
+    frames_out = []
+    for t in tqdm(range(T), desc="[WandB FineMotion Overlay]"):
         frame = video[0, t].permute(1, 2, 0).detach().cpu().numpy()
-        flow = flows[0, min(t, flows.shape[1] - 1)].detach().cpu().numpy()
+        frame = (frame - frame.min()) / (frame.max() - frame.min() + 1e-6)
+        frame = (frame * 255).astype(np.uint8)
 
-        frame_disp = (frame - frame.min()) / (frame.max() - frame.min() + 1e-6)
-        frame_disp = (frame_disp * 255).astype(np.uint8)
+        if t == 0:
+            u = np.zeros((Hf, Wf), dtype=np.float32)
+            v = np.zeros((Hf, Wf), dtype=np.float32)
+        else:
+            flow = flows[0, t - 1].detach().cpu().numpy()
+            u, v = flow[0], flow[1]
 
-        X, Y = np.meshgrid(np.arange(0, W, stride), np.arange(0, H, stride))
-        u = flow[0, ::stride, ::stride]
-        v = flow[1, ::stride, ::stride]
+        mag = np.sqrt(u**2 + v**2)
+        if mag.size == 0:
+            frames_out.append(frame)
+            continue
 
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.imshow(frame_disp)
-        ax.quiver(X, Y, u, -v, color='r', angles='xy', scale_units='xy', scale=scale, width=0.002)
-        ax.axis('off')
-        plt.tight_layout(pad=0)
+        # 🔹 작은 motion 강조 normalization
+        mag95 = np.percentile(mag, 95) + 1e-6
+        u, v = (u / (mag95 * 0.5)) * scale, (v / (mag95 * 0.5)) * scale
+        mag = np.sqrt(u**2 + v**2)
 
-        # ✅ 여기 수정됨 — 최신 matplotlib에서 작동
-        fig.canvas.draw()
-        img = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]  # RGBA → RGB
-        frames.append(img)
-        plt.close(fig)
+        # 🔹 threshold 낮춰 fine motion 포함
+        th = np.percentile(mag, 30)
+        mask = mag >= th
 
-    # numpy → wandb.Video
-    video_tensor = np.stack(frames)
-    video_tensor = np.transpose(video_tensor, (0, 3, 1, 2))  # [T, C, H, W]
-    wandb_video = wandb.Video(video_tensor, fps=fps, format="mp4")
+        # 🔹 stride 샘플링
+        u_s, v_s, m_s = u[::stride, ::stride], v[::stride, ::stride], mask[::stride, ::stride]
+        h_s, w_s = u_s.shape
+        Y, X = np.mgrid[stride//2:Hf:stride, stride//2:Wf:stride]
+        h_eff, w_eff = min(h_s, Y.shape[0]), min(w_s, X.shape[1])
+        u_s, v_s, m_s = u_s[:h_eff, :w_eff], v_s[:h_eff, :w_eff], m_s[:h_eff, :w_eff]
+        Y, X = Y[:h_eff, :w_eff], X[:h_eff, :w_eff]
 
-    wandb.log({wandb_key: wandb_video})
-    print(f"✅ Optical flow overlay video logged to WandB ({wandb_key})")
->>>>>>> Stashed changes
+        # 🔹 overlay
+        overlay = frame.copy()
+        for (x, y, dx, dy, m) in zip(X.ravel(), Y.ravel(), u_s.ravel(), v_s.ravel(), m_s.ravel()):
+            if not m:
+                continue
+            pt1 = (int(x), int(y))
+            pt2 = (int(x + dx * 4), int(y + dy * 4))
+            cv2.arrowedLine(overlay, pt1, pt2, (0, 255, 0), 1, tipLength=0.3)
+
+        blended = cv2.addWeighted(frame, 1 - roi_alpha, overlay, roi_alpha, 0)
+        frames_out.append(blended)
+
+        print(f"[t={t:02d}] fine-motion overlay done | visible={np.count_nonzero(mask)}")
+
+    video_tensor = np.stack(frames_out)
+    video_tensor = np.transpose(video_tensor, (0, 3, 1, 2)).astype(np.uint8)
+    wandb.log({wandb_key: wandb.Video(video_tensor, fps=fps, format="mp4")})
+    print(f"✅ Logged {wandb_key} (Fine-motion optical flow overlay complete)")

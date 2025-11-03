@@ -116,8 +116,8 @@ class LinearProbeLightningModule(pl.LightningModule):
             
         # 4. 새로운 선형 분류기(Linear Classifier)만 추가합니다.
         self.classifier = torch.nn.Linear(
-            # model.hparams.embedding_dim,
-            128,
+            model.hparams.embedding_dim *2,
+            # 128,
             # model.hparams.mlp_output_dim,
             # 768,
             self.hparams.num_classes
@@ -170,20 +170,8 @@ class LinearProbeLightningModule(pl.LightningModule):
         # 백본(인코더)과 분류기를 순서대로 통과시킵니다.
         # Fine-tuning에서는 백본의 그래디언트도 계산해야 하므로 torch.no_grad()를 사용하지 않습니다.
         if self.hparams.model_name == "method":
-            _, features, _ = self.model.clustering_model(sensor_data, return_features = True)
-            sensor_motion_emb = self.model.sensor_motion_model(sensor_data)["emb"]
-            import torch.nn.functional as F
-            # v_app과 features는 그래디언트 차단
-            features_norm = F.normalize(features.detach(), dim=1)
-
-            sensor_motion_norm = F.normalize(sensor_motion_emb.detach(), dim=1)
-            # v_app과 features는 그래디언트 차단
-            z_sensor_online = features_norm + sensor_motion_norm
-            
-            # z_sensor_online = torch.cat([features.detach(), sensor_motion_emb], dim=1)
-            # 정규화 (Cosine Similarity 계산용)
-            # z_sensor_online = F.normalize(z_sensor_online, dim=1)
-            representations = z_sensor_online
+            sensor_encoder = self.model.sensor_model
+            representations = sensor_encoder(sensor_data)
         elif self.hparams.model_name == "imu2clip":
             sensor_encoder = self.model.sensor_model
             sensor_data = self.model.sensor_padding(sensor_data)
