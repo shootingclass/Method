@@ -196,6 +196,9 @@ if __name__ == '__main__':
     parser.add_argument("--lambda_hard", type=float, default=2.0)
     parser.add_argument("--motion_damp_temp", type=float, default=0.1)
     parser.add_argument("--contrastive_temp", type=float, default=0.07)
+
+    parser.add_argument("--damp_warmup_epochs", type=int, default=5)
+
     
     args = parser.parse_args()
     args.stage = "pretrain"

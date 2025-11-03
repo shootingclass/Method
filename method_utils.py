@@ -3,7 +3,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import cv2
-
+import torch.distributed as dist
 
 ####################################################################
 
@@ -95,7 +95,27 @@ def time_warp(x, sigma=0.2, num_knots=4):
     
     return warped_x
 
+def gather(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather tensors from all replicas into a single tensor."""
+    # 현재 분산 그룹의 GPU 개수를 가져옵니다.
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        print("world_size == 1, no gather needed")
+        return tensor
 
+    # 입력 텐서가 반드시 GPU에 있도록 보장합니다.
+
+    # 2. ⭐️ 입력 텐서를 현재 프로세스의 올바른 GPU로 이동시킵니다.
+    # 이렇게 하면 rank 1은 cuda:1로, rank 2는 cuda:2로 텐서를 옮깁니다.
+    
+    tensor = tensor.cuda()
+    # 1. 최종적으로 모일 전체 텐서의 크기를 계산하고, '같은 device'에 빈 텐서를 생성합니다.
+    shape = (world_size * tensor.shape[0], *tensor.shape[1:])
+    gathered_tensor = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
+    
+    # 2. all_gather_into_tensor를 호출하여 빈 텐서를 채웁니다.
+    dist.all_gather_into_tensor(gathered_tensor, tensor)
+    return gathered_tensor
 
 # --- viz_motion.py 같은 곳에 두고 import 해도 되고, 그냥 파일 하단에 둬도 OK ---
 import torch

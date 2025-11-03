@@ -18,6 +18,7 @@ from sklearn.metrics import confusion_matrix
 # --- 사용자 정의 모듈 임포트 ---
 from datamodule import MethodDataModule
 from method import MethodLightningModule
+from method_utils import gather
 
 
 ####################################################################
@@ -229,8 +230,10 @@ class LinearProbeLightningModule(pl.LightningModule):
 
         
     def on_validation_epoch_end(self):
-        y_true = torch.cat(self.val_labels).cpu().numpy()
-        y_pred = torch.cat(self.val_preds).cpu().numpy()
+        val_labels = gather(self.val_labels)
+        val_preds = gather(self.val_preds)
+        y_true = torch.cat(val_labels).cpu().numpy()
+        y_pred = torch.cat(val_preds).cpu().numpy()
 
         cm = confusion_matrix(y_true, y_pred)
         cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-9)  # 정규화 버전 (선택)
@@ -278,8 +281,10 @@ class LinearProbeLightningModule(pl.LightningModule):
         self.log("test_mAP", self.test_ap, on_epoch=True)
 
     def on_test_epoch_end(self):
-        y_true = torch.cat(self.test_labels).cpu().numpy()
-        y_pred = torch.cat(self.test_preds).cpu().numpy()
+        test_labels = gather(self.test_labels)
+        test_preds = gather(self.test_preds)
+        y_true = torch.cat(test_labels).cpu().numpy()
+        y_pred = torch.cat(test_preds).cpu().numpy()
 
           # ✅ DDP 상태에서 모든 GPU의 결과를 모음
         # gathered_true = [torch.zeros_like(y_true) for _ in range(self.trainer.world_size)]

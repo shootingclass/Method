@@ -13,7 +13,7 @@ import torch.distributed as dist
 import os
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from method_utils import log_video_recon_grid, log_video_recon_gif, to_vis_motion, CovarianceAlignmentLoss, overlay_motion_heatmap, log_optical_flow_overlay_to_wandb
+from method_utils import gather, log_video_recon_grid, log_video_recon_gif, to_vis_motion, CovarianceAlignmentLoss, overlay_motion_heatmap, log_optical_flow_overlay_to_wandb
 import copy
 
 # --- 사용자 정의 모듈 임포트 ---
@@ -59,18 +59,18 @@ class MethodLightningModule(pl.LightningModule):
         self.epoch = 0        
         # =================================================================
         
-        # self.momentum_video_model = copy.deepcopy(self.video_model)
-        # for param in self.momentum_video_model.parameters():
-        #     param.requires_grad = False
-        # # =================================================================
+        self.momentum_video_model = copy.deepcopy(self.video_model)
+        for param in self.momentum_video_model.parameters():
+            param.requires_grad = False
+        # =================================================================
 
                                                              
-        # # =================================================================
-        # # [1단계-B] 모멘텀 센서 모션 모델 추가
-        # # =================================================================
-        # self.momentum_sensor_motion_model = copy.deepcopy(self.sensor_motion_encoder)
-        # for param in self.momentum_sensor_motion_model.parameters():
-        #     param.requires_grad = False
+        # =================================================================
+        # [1단계-B] 모멘텀 센서 모션 모델 추가
+        # =================================================================
+        self.momentum_sensor_motion_model = copy.deepcopy(self.sensor_motion_encoder)
+        for param in self.momentum_sensor_motion_model.parameters():
+            param.requires_grad = False
         
         self.train_video_accs = []  # video classifier accuracy 저장용
         self.log_buffer = {}  # ✅ 로그 누적용 버퍼 초기화
@@ -109,19 +109,6 @@ class MethodLightningModule(pl.LightningModule):
             if "motion_encoder" in n:
                 p.requires_grad = True
                 print("motion encoder trainable")
-            
-        self.momentum_video_model = copy.deepcopy(self.video_model)
-        for param in self.momentum_video_model.parameters():
-            param.requires_grad = False
-        # =================================================================
-
-                                                             
-        # =================================================================
-        # [1단계-B] 모멘텀 센서 모션 모델 추가
-        # =================================================================
-        self.momentum_sensor_motion_model = copy.deepcopy(self.sensor_motion_encoder)
-        for param in self.momentum_sensor_motion_model.parameters():
-            param.requires_grad = False
 
         self.stage2_only = True
         print("\n[🔍 Trainable Parameter Overview]\n")
@@ -556,40 +543,78 @@ class MethodLightningModule(pl.LightningModule):
                 sensor_motion_mom = F.normalize(sensor_motion_mom, dim=1)
             # --- 7-C: DDP All-Gather ---
             # 모든 GPU의 특징과 레이블을 수집 (N = B * num_gpus)
-            gathered_z_video = self.all_gather(z_video_online).reshape(-1, z_video_online.shape[-1])
-            gathered_z_sensor = self.all_gather(z_sensor_online).reshape(-1, z_sensor_online.shape[-1])
-            gathered_v_mom = self.all_gather(v_motion_mom).reshape(-1, v_motion_mom.shape[-1])
-            gathered_s_mom = self.all_gather(sensor_motion_mom).reshape(-1, sensor_motion_mom.shape[-1])
-            gathered_v_app = self.all_gather(v_app_norm).reshape(-1, v_app_norm.shape[-1])
-            gathered_features = self.all_gather(features_norm).reshape(-1, features_norm.shape[-1])
-            print("requires_grad z_video:", z_video_online.requires_grad)  
-            print("gathered z gradient", gathered_z_video.requires_grad)
+            # gathered_z_video = self.all_gather(z_video_online).reshape(-1, z_video_online.shape[-1])
+            # gathered_z_sensor = self.all_gather(z_sensor_online).reshape(-1, z_sensor_online.shape[-1])
+            # gathered_v_mom = self.all_gather(v_motion_mom).reshape(-1, v_motion_mom.shape[-1])
+            # gathered_s_mom = self.all_gather(sensor_motion_mom).reshape(-1, sensor_motion_mom.shape[-1])
+            # gathered_v_app = self.all_gather(v_app_norm).reshape(-1, v_app_norm.shape[-1])
+            # gathered_features = self.all_gather(features_norm).reshape(-1, features_norm.shape[-1])
+            gathered_z_video = gather(z_video_online)
+            gathered_z_sensor = gather(z_sensor_online)
+            gathered_v_mom = gather(v_motion_mom)
+            gathered_s_mom = gather(sensor_motion_mom)
+            gathered_v_app = gather(v_app_norm)
+            gathered_features = gather(features_norm)
+            # print("requires_grad z_video:", z_video_online.requires_grad)  
+            # print("gathered z gradient", gathered_z_video.requires_grad)
             N = gathered_z_video.shape[0] # Effective Batch Size
             # --- 7-D: 가중치 행렬 계산 (W = W_app * W_motion_damp) ---
-            # 1. W_app (Appearance 가중치) [수정됨]
-            # Intra-modal 유사도 (Video-Video, Sensor-Sensor)를 계산
+
+            # 1️⃣ Appearance 가중치 (기존 동일)
             sim_app_vid = gathered_v_app @ gathered_v_app.T
             sim_app_sen = gathered_features @ gathered_features.T
-            # 두 유사도를 평균내어 'Appearance 유사도'로 사용
-            # (유사도가 음수일 수 있으므로 F.relu로 0 이상 값만 사용)
+
+            # 유사도가 음수일 수 있으므로 ReLU 적용
             sim_app_max = torch.max(F.relu(sim_app_vid), F.relu(sim_app_sen))
-            # 연속적인 유사도(0~1)를 가중치(1.0 ~ lambda_hard)로 변환
+
             # sim=0 -> W=1.0, sim=1 -> W=lambda_hard
             W_app = 1.0 + (self.hparams.lambda_hard - 1.0) * sim_app_max
-            # 2. W_motion_damp (모션 감쇠 가중치) [기존과 동일]
+
+            # 2️⃣ Motion 감쇠 가중치 (Warm-up 통합)
             sim_vid_mom = gathered_v_mom @ gathered_v_mom.T
             sim_sen_mom = gathered_s_mom @ gathered_s_mom.T
             sim_stable = (sim_vid_mom + sim_sen_mom) / 2.0
+
             motion_damp_factor = torch.tanh(
                 F.relu(sim_stable) / self.hparams.motion_damp_temp
             )
-            W_conditional_damp = 1.0 - (sim_app_max * motion_damp_factor)
-            # 3. W_final (최종 가중치) 및 대각선 마스킹 [기존과 동일]
+
+            # 감쇠 효과 최대치 (학습이 진행되면 증가)
+            damping_effect_max = 1.0 - (sim_app_max * motion_damp_factor)
+
+            # --- ✅ Warm-up 스케줄링 추가 ---
+            # 현재 epoch 기준으로 진행률 (0.0 ~ 1.0)
+            current_progress = max(0, self.epoch - self.hparams.threshold_epoch)
+            schedule_factor = min(
+                1.0, current_progress / self.hparams.damp_warmup_epochs
+            )
+
+            # 감쇠 효과 점진적 반영
+            # 초기엔 완전 damping 비활성화(W=1.0), 이후 선형적으로 활성화
+            W_conditional_damp = (
+                1.0 * (1.0 - schedule_factor)
+                + damping_effect_max * schedule_factor
+            )
+
+            # --- 3️⃣ 최종 결합 ---
             W_final = W_app * W_conditional_damp
             identity = torch.eye(N, device=self.device, dtype=torch.bool)
             W_final = W_final.masked_fill(identity, 0.0)
+
             # --- 7-E: InfoNCE 손실 계산 (양방향) ---
             # 1. 유사도 행렬 (Logits)
+            D = z_video_online.shape[1] // 2
+            # 1. z_video_online = concat([vid_app, vid_mot])
+            ## motion 가중치 similarity 계산
+            # gathered_vid_app, gathered_vid_mot = torch.split(gathered_z_video, gathered_z_video.shape[1] // 2, dim=1)
+            # gathered_sen_app, gathered_sen_mot = torch.split(gathered_z_sensor, gathered_z_sensor.shape[1] // 2, dim=1)
+
+            # # 3. 최종 sim 계산 (alpha, beta 가중치)
+            # alpha, beta = 0.15, 1.00
+            # sim_v2s = beta * (gathered_vid_mot @ gathered_sen_mot.T) + \
+            #         alpha * (gathered_vid_app @ gathered_sen_app.T)
+
+
             sim_v2s = gathered_z_video @ gathered_z_sensor.T
             sim_s2v = sim_v2s.T
             logits_v2s = sim_v2s / self.hparams.contrastive_temp # (e.g., 0.07)

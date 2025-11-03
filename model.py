@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw
 
 from visualizes import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX, visualize_cropped_tensor, denormalize, compute_hungarian_matching
 from tqdm import tqdm
-from method_utils import time_warp, log_optical_flow_overlay_to_wandb
+from method_utils import gather, time_warp, log_optical_flow_overlay_to_wandb
 
 
 #################################################################
@@ -232,7 +232,7 @@ class SensorModel(nn.Module):
         # features는 그래디언트 차단
         z_sensor_online = torch.cat((s_app_norm.detach(), s_mot_norm), dim=1)
         # z_sensor_online = torch.cat((features.detach(), sensor_motion_emb), dim=1)
-        # z_sensor_online = self.norm(z_sensor_online)
+        z_sensor_online = self.norm(z_sensor_online)
         return z_sensor_online
 
     def encoding_appearance(self, batch, labels, return_features, idx):
@@ -574,15 +574,6 @@ class ObjectEncoder(nn.Module):
         obj_feat = self.pool(feat * attn).flatten(1)
         return obj_feat
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class LearnableWeightedFusion(nn.Module):
     """
@@ -689,7 +680,7 @@ class VisionModel(nn.Module):
         v_mot_norm = F.normalize(v_motion, dim=1)
         z_video_online = torch.cat([v_app_norm.detach()/5, v_mot_norm*10], dim=1)
         # z_video_online = torch.cat([v_app_norm.detach()*0.5, v_mot_norm*1.5], dim=1)
-        # z_video_online = self.norm(z_video_online)
+        z_video_online = self.norm(z_video_online)
         # Forward
         # z_video_online = self.fusion(v_appearance.detach(), v_motion)
         return {
@@ -791,28 +782,6 @@ class ClusteringManager(nn.Module):
             centroids[i, :] = self.feature_bank[argl[st:ed], :].mean(dim=0)
         return centroids
 
-    def _gather(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Gather tensors from all replicas into a single tensor."""
-        # 현재 분산 그룹의 GPU 개수를 가져옵니다.
-        world_size = dist.get_world_size()
-        if world_size == 1:
-            print("world_size == 1, no gather needed")
-            return tensor
-
-        # 입력 텐서가 반드시 GPU에 있도록 보장합니다.
-
-        # 2. ⭐️ 입력 텐서를 현재 프로세스의 올바른 GPU로 이동시킵니다.
-        # 이렇게 하면 rank 1은 cuda:1로, rank 2는 cuda:2로 텐서를 옮깁니다.
-        
-        tensor = tensor.cuda()
-        # 1. 최종적으로 모일 전체 텐서의 크기를 계산하고, '같은 device'에 빈 텐서를 생성합니다.
-        shape = (world_size * tensor.shape[0], *tensor.shape[1:])
-        gathered_tensor = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
-        
-        # 2. all_gather_into_tensor를 호출하여 빈 텐서를 채웁니다.
-        dist.all_gather_into_tensor(gathered_tensor, tensor)
-        return gathered_tensor
-
     def update_samples_memory(self, idx: torch.Tensor,
                               feature: torch.Tensor):
         """Update samples memory."""
@@ -826,8 +795,8 @@ class ClusteringManager(nn.Module):
 
         if idx.numel() == 0:
             return torch.tensor(0.0, device=feature.device)
-        idx = self._gather(idx)
-        feature_norm = self._gather(feature_norm)
+        idx = gather(idx)
+        feature_norm = gather(feature_norm)
         
         idx = idx.cpu()
         if self.local_rank == "0":
@@ -1314,8 +1283,8 @@ class ClusteringModule(nn.Module):
             local_idx_tensor = torch.cat(local_idx, dim=0)
 
             # --- 2-3. All-Gather로 전체 특징과 ID 복제 ---
-            all_features_gpu = self.clustering_manager._gather(local_features_tensor)
-            all_idx_gpu = self.clustering_manager._gather(local_idx_tensor)
+            all_features_gpu = gather(local_features_tensor)
+            all_idx_gpu = gather(local_idx_tensor)
             
             # --- 3. Rank 0에서만 K-Means 실행 및 초기화 ---
             if rank_str == "0":
@@ -1489,9 +1458,9 @@ class ClusteringModule(nn.Module):
     @torch.no_grad()
     def evaluate(self, outputs):
         self.eval()
-        features_gathered = self.clustering_manager._gather(torch.cat([x['features'] for x in outputs]))
-        labels_gathered = self.clustering_manager._gather(torch.cat([x['labels'] for x in outputs]))
-        predicted_labels_gathered = self.clustering_manager._gather(torch.cat([x['predicted_labels'] for x in outputs]))
+        features_gathered = gather(torch.cat([x['features'] for x in outputs]))
+        labels_gathered = gather(torch.cat([x['labels'] for x in outputs]))
+        predicted_labels_gathered = gather(torch.cat([x['predicted_labels'] for x in outputs]))
         print(f"evaluate_odc: Gathered {features_gathered.shape[0]} features from all ranks.")
 
         num_clusters = self.clustering_manager.num_clusters
@@ -1502,14 +1471,14 @@ class ClusteringModule(nn.Module):
             labels_remapped = labels_gathered
 
         if 'video_preds' in outputs[0]:
-                video_preds_gathered = self.clustering_manager._gather(torch.cat([x['video_preds'] for x in outputs]))
-                video_labels_gathered = self.clustering_manager._gather(torch.cat([x['labels'] for x in outputs]))
+                video_preds_gathered = gather(torch.cat([x['video_preds'] for x in outputs]))
+                video_labels_gathered = gather(torch.cat([x['labels'] for x in outputs]))
         else:
             video_preds_gathered = None
 
         # --- v_appearance 추가 ---
         # if "v_appearance" in outputs[0]:
-        #     v_appearance_gathered = self.clustering_manager._gather(torch.cat([x["v_appearance"] for x in outputs]))
+        #     v_appearance_gathered = gather(torch.cat([x["v_appearance"] for x in outputs]))
         #     v_appearance_np = v_appearance_gathered.cpu().numpy()
         # else:
         #     print("⚠️ warning: no v app key found in outputs")
@@ -1517,7 +1486,7 @@ class ClusteringModule(nn.Module):
 
         # --- 새로 추가: v_motion 임베딩 ---
         if 'v_motion' in outputs[0]:
-            v_motion_gathered = self.clustering_manager._gather(torch.cat([x['v_motion'] for x in outputs]))
+            v_motion_gathered = gather(torch.cat([x['v_motion'] for x in outputs]))
             v_motion_np = v_motion_gathered.cpu().numpy()
             print(f"evaluate: gathered v_motion {v_motion_gathered.shape}")
         else:
@@ -1526,7 +1495,7 @@ class ClusteringModule(nn.Module):
 
         # --- [1️⃣ Bad 샘플 수집] ---
         if "bad" in outputs[0]:
-            bad_gathered = self.clustering_manager._gather(torch.cat([x["bad"] for x in outputs]))
+            bad_gathered = gather(torch.cat([x["bad"] for x in outputs]))
             bad_np = bad_gathered.cpu().numpy()
         else:
             print("⚠️ warning: no bad key found in outputs")
@@ -1534,7 +1503,7 @@ class ClusteringModule(nn.Module):
 
         # --- sensor_motion 추가 ---
         if "s_motion" in outputs[0]:
-            s_motion_gathered = self.clustering_manager._gather(torch.cat([x["s_motion"] for x in outputs]))
+            s_motion_gathered = gather(torch.cat([x["s_motion"] for x in outputs]))
             s_motion_np = s_motion_gathered.cpu().numpy()
         else:
             print("⚠️ warning: no s motion key found in outputs")
@@ -1542,7 +1511,7 @@ class ClusteringModule(nn.Module):
         
         # --- z_sensor 추가 ---
         if "z_sensor" in outputs[0]:
-            z_sensor_gathered = self.clustering_manager._gather(torch.cat([x["z_sensor"] for x in outputs]))
+            z_sensor_gathered = gather(torch.cat([x["z_sensor"] for x in outputs]))
             z_sensor_np = z_sensor_gathered.cpu().numpy()
         else:
             print("⚠️ warning: no z sensor key found in outputs")
@@ -1550,7 +1519,7 @@ class ClusteringModule(nn.Module):
         
         # --- z_video 추가 ---
         if "z_video" in outputs[0]:
-            z_video_gathered = self.clustering_manager._gather(torch.cat([x["z_video"] for x in outputs]))
+            z_video_gathered = gather(torch.cat([x["z_video"] for x in outputs]))
             z_video_np = z_video_gathered.cpu().numpy()
         else:
             print("⚠️ warning: no z video key found in outputs")
@@ -1637,10 +1606,10 @@ class ClusteringModule(nn.Module):
                 self.visualize_embedding(v_motion_np, all_labels, title="V_Motion")
             except Exception as e:
                 print(f"Error during v motion t-SNE visualization: {e}")  
-            try:
-                self.visualize_embedding(v_appearance_np, all_labels, title="V_Appearance")
-            except Exception as e:
-                print(f"Error during v motion t-SNE visualization: {e}")  
+            # try:
+                # self.visualize_embedding(v_appearance_np, all_labels, title="V_Appearance")
+            # except Exception as e:
+                # print(f"Error during v motion t-SNE visualization: {e}")  
             try:
                 self.visualize_embedding(s_motion_np, all_labels, title="S_Motion")
             except Exception as e:
