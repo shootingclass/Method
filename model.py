@@ -232,7 +232,9 @@ class SensorModel(nn.Module):
         # features는 그래디언트 차단
         z_sensor_online = torch.cat((s_app_norm.detach(), s_mot_norm), dim=1)
         # z_sensor_online = torch.cat((features.detach(), sensor_motion_emb), dim=1)
-        z_sensor_online = self.norm(z_sensor_online)
+
+        z_sensor_online = F.normalize(z_sensor_online, dim=1) * (z_sensor_online.shape[1] ** 0.5 * 0.2)
+        # z_sensor_online = self.norm(z_sensor_online)
         return z_sensor_online
 
     def encoding_appearance(self, batch, labels, return_features, idx):
@@ -463,18 +465,19 @@ class SharedEncoder(nn.Module):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class MotionEncoder(nn.Module):
     """
     Temporal difference + optical flow 기반 Motion Encoder.
-    입력:
-        videos: [B, T, 3, H, W]
-        flows : [B, T, 2, H, W]
-    출력:
-        v_motion: [B, latent_dim]
+    flows=None일 경우 optical flow 없이 video difference만 사용.
     """
     def __init__(self, in_channels=5, base_dim=32, latent_dim=256):
         super().__init__()
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
 
         self.backbone = nn.Sequential(
             nn.Conv3d(in_channels, base_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
@@ -490,48 +493,59 @@ class MotionEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 시간축 유지한 채 spatial 평균
         self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
         self.proj = nn.Linear(latent_dim, latent_dim)
 
-    def forward(self, videos, flows):
+    def forward(self, videos, flows=None):
         """
         Args:
             videos: [B, T, 3, H, W]
-            flows : [B, T, 2, H, W]
+            flows : [B, T, 2, H, W] or None
         Returns:
             v_motion: [B, latent_dim]
         """
         B, T, _, H, W = videos.shape
 
-        # ✅ 비디오 temporal difference 계산 (1프레임 감소)
+        # ✅ 비디오 temporal difference 계산
         video_diff = videos[:, 1:] - videos[:, :-1]  # [B, T-1, 3, H, W]
 
-        # ✅ optical flow도 동일한 길이로 맞춤
-        if flows.shape[1] > video_diff.shape[1]:
-            flows = flows[:, : video_diff.shape[1]]
-        elif flows.shape[1] < video_diff.shape[1]:
-            pad = flows[:, -1:, :, :, :]
-            flows = torch.cat([flows, pad], dim=1)
+        # ✅ optical flow optional 처리
+        if isinstance(flows, torch.Tensor):
+            # flow 길이 맞춤
+            if flows.shape[1] > video_diff.shape[1]:
+                flows = flows[:, : video_diff.shape[1]]
+            elif flows.shape[1] < video_diff.shape[1]:
+                pad = flows[:, -1:, :, :, :]
+                flows = torch.cat([flows, pad], dim=1)
 
-        # ✅ concat along channel → [B, T-1, 5, H, W]
-        x = torch.cat([video_diff, flows], dim=2)
-        x = x.permute(0, 2, 1, 3, 4)  # [B, 5, T-1, H, W]
+            # ✅ concat along channel → [B, T-1, 5, H, W]
+            x = torch.cat([video_diff, flows], dim=2)
+        else:
+            # ✅ flow가 없으면 video_diff만 사용 → channel=3으로 맞춤
+            x = video_diff
+            # 3D conv 입력 채널수를 runtime에 맞추기 위해 padding
+            # (flow 없는 경우라도 backbone은 in_channels=5이므로 2채널 zero-pad)
+            pad = torch.zeros(B, T - 1, 2, H, W, device=videos.device, dtype=videos.dtype)
+            x = torch.cat([x, pad], dim=2)
 
-        # ✅ 3D Conv feature 추출
+        # ✅ channel-first 변환
+        x = x.permute(0, 2, 1, 3, 4)  # [B, C=5, T-1, H, W]
+
+        # ✅ feature 추출
         feat = self.backbone(x)  # [B, D, T', H', W']
         feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)  # [B, D, T']
 
-        # ✅ Temporal difference (2차 차분) + 평균
+        # ✅ temporal difference (2차 차분)
         if feat.shape[2] > 1:
             motion_diff = feat[:, :, 1:] - feat[:, :, :-1]
             v_motion = motion_diff.mean(dim=2)
         else:
-            v_motion = feat.mean(dim=2)  # T'=1일 때 fallback
+            v_motion = feat.mean(dim=2)
 
-        # ✅ Projection
+        # ✅ projection
         v_motion = self.proj(v_motion)
         return v_motion
+
 
 
 # ---------------------------------------------------------------------
@@ -650,7 +664,6 @@ class VisionModel(nn.Module):
         flows: [B, T, 2, H, W]
         returns: dict with v_appearance, v_motion, z_video_online, vis_v
         """
-        print("flows stat", flows.mean(), flows.std(), flows.abs().max())
 
         B, T, C, H, W = video.shape
 
@@ -678,9 +691,11 @@ class VisionModel(nn.Module):
         # detach appearance for z_video_online
         v_app_norm = F.normalize(v_appearance, dim=1)
         v_mot_norm = F.normalize(v_motion, dim=1)
-        z_video_online = torch.cat([v_app_norm.detach()/5, v_mot_norm*10], dim=1)
+        z_video_online = torch.cat([v_app_norm.detach()/5, v_mot_norm*5], dim=1) # motion var 균형을 위해 스케일링 반영
         # z_video_online = torch.cat([v_app_norm.detach()*0.5, v_mot_norm*1.5], dim=1)
-        z_video_online = self.norm(z_video_online)
+        # z_video_online = self.norm(z_video_online)
+        z_video_online = F.normalize(z_video_online, dim=1) * (z_video_online.shape[1] ** 0.5 * 0.2)
+
         # Forward
         # z_video_online = self.fusion(v_appearance.detach(), v_motion)
         return {
@@ -1041,7 +1056,7 @@ class ClusteringManager(nn.Module):
 
 # --- 4. Clustering 모델 ---
 class ClusteringModule(nn.Module):
-    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, datamodule, top_k=1, prototype_cache_dir="./cache", dataset_name="custom_dataset", min_cluster_size=30):
+    def __init__(self, encoder, embedding_dim, num_sensors, num_clusters, datamodule, top_k=1, prototype_cache_dir="./cache", dataset_name="custom_dataset", min_cluster_size=30, mid_label=True):
         super().__init__()
         # 딥러닝 백본 선택
         self.encoder = encoder
@@ -1064,6 +1079,7 @@ class ClusteringModule(nn.Module):
         )
         self.prototype_cache_dir = prototype_cache_dir
         self.dataset_name = dataset_name
+        self.mid_label = mid_label
 
    # 🌟🌟🌟 Broadcast 로직을 분리한 헬퍼 함수 🌟🌟🌟
     def broadcast_prototypes(self, rank, world_size, device):
@@ -1266,13 +1282,13 @@ class ClusteringModule(nn.Module):
             local_features = []
             local_idx = []
             
-            for i, (videos, sensors, labels, sample_ids) in enumerate(self.train_dataloader):
+            for i, (videos, sensors, labels, sample_ids, _) in enumerate(self.train_dataloader):
                 # print("initializing prototypes - processing batch", i, "on rank", rank)
                 sensors = sensors.to(device)
                 idx, _ = sample_ids
                 idx = idx.clone().to(dtype=torch.long, device=device)
                 
-                _, features = self(sensors, return_features=True)
+                _, features, _ = self(sensors, return_features=True)
                 # ... (get_representative_sensor_feature 및 projection_layer 로직) ...
                 
                 local_features.append(features) # GPU 상태로 유지
@@ -1464,7 +1480,7 @@ class ClusteringModule(nn.Module):
         print(f"evaluate_odc: Gathered {features_gathered.shape[0]} features from all ranks.")
 
         num_clusters = self.clustering_manager.num_clusters
-        remap=True
+        remap = not self.mid_label
         if remap:
             labels_remapped = self._remap_pairwise_7(labels_gathered)
         else:
@@ -1477,12 +1493,12 @@ class ClusteringModule(nn.Module):
             video_preds_gathered = None
 
         # --- v_appearance 추가 ---
-        # if "v_appearance" in outputs[0]:
-        #     v_appearance_gathered = gather(torch.cat([x["v_appearance"] for x in outputs]))
-        #     v_appearance_np = v_appearance_gathered.cpu().numpy()
-        # else:
-        #     print("⚠️ warning: no v app key found in outputs")
-        #     v_appearance_np = None
+        if "v_appearance" in outputs[0]:
+            v_appearance_gathered = gather(torch.cat([x["v_appearance"] for x in outputs]))
+            v_appearance_np = v_appearance_gathered.cpu().numpy()
+        else:
+            print("⚠️ warning: no v app key found in outputs")
+            v_appearance_np = None
 
         # --- 새로 추가: v_motion 임베딩 ---
         if 'v_motion' in outputs[0]:
@@ -1606,10 +1622,10 @@ class ClusteringModule(nn.Module):
                 self.visualize_embedding(v_motion_np, all_labels, title="V_Motion")
             except Exception as e:
                 print(f"Error during v motion t-SNE visualization: {e}")  
-            # try:
-                # self.visualize_embedding(v_appearance_np, all_labels, title="V_Appearance")
-            # except Exception as e:
-                # print(f"Error during v motion t-SNE visualization: {e}")  
+            try:
+                self.visualize_embedding(v_appearance_np, all_labels, title="V_Appearance")
+            except Exception as e:
+                print(f"Error during v appearance t-SNE visualization: {e}")  
             try:
                 self.visualize_embedding(s_motion_np, all_labels, title="S_Motion")
             except Exception as e:
@@ -1641,8 +1657,8 @@ class ClusteringModule(nn.Module):
             dataset_name=self.dataset_name,
         )
         wandb.log({
-            f"{title}_val_tsne_motion_2d": wandb.Image(fig_motion_2d),
-            f"{title}_val_tsne_motion_3d": wandb.Image(fig_motion_3d),
+            f"{title}_val_tsne_2d": wandb.Image(fig_motion_2d),
+            f"{title}_val_tsne_3d": wandb.Image(fig_motion_3d),
         })
         plt.close(fig_motion_2d)
         plt.close(fig_motion_3d)
@@ -1688,5 +1704,44 @@ class ClusteringModule(nn.Module):
             y[m02] = 0
             y[m13] = 1
             y[others] = x[others] // 2
+            y[neg1_mask] = -1
+            return y
+        
+    def _remap_pairwise_2(self, labels_any):
+        """
+        0,1 -> 0 / 2,3 -> 1 / others -> x % 2
+        -1 (미할당)은 그대로 둠.
+        """
+        import numpy as np
+        import torch
+
+        if isinstance(labels_any, torch.Tensor):
+            x = labels_any.clone().to(torch.long)
+            device = x.device
+
+            neg1_mask = (x == -1)
+            m01 = (x == 0) | (x == 1)
+            m23 = (x == 2) | (x == 3)
+            others = ~(neg1_mask | m01 | m23)
+
+            y = x.clone()
+            y = torch.where(m01, torch.zeros_like(y), y)  # 0,1 -> 0
+            y = torch.where(m23, torch.ones_like(y), y)   # 2,3 -> 1
+            y[others] = x[others] % 2                     # others -> %2
+            y[neg1_mask] = -1                             # -1 보존
+            return y.to(device)
+
+        else:  # numpy
+            x = np.asarray(labels_any).astype(np.int64)
+            y = x.copy()
+
+            neg1_mask = (x == -1)
+            m01 = (x == 0) | (x == 1)
+            m23 = (x == 2) | (x == 3)
+            others = ~(neg1_mask | m01 | m23)
+
+            y[m01] = 0            # 0,1 -> 0
+            y[m23] = 1            # 2,3 -> 1
+            y[others] = x[others] % 2
             y[neg1_mask] = -1
             return y

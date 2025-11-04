@@ -42,7 +42,8 @@ class MethodLightningModule(pl.LightningModule):
             top_k=self.hparams.top_k,
             prototype_cache_dir=os.path.join(self.hparams.cache_dir, "prototypes"),
             dataset_name=self.hparams.dataset_name,
-            min_cluster_size=self.hparams.min_cluster_size
+            min_cluster_size=self.hparams.min_cluster_size,
+            mid_label=self.hparams.mid_label
         )
         self.sensor_model = SensorModel(self.sensor_appearance_encoder, self.sensor_motion_encoder, self.clustering_module)
 
@@ -140,7 +141,7 @@ class MethodLightningModule(pl.LightningModule):
             self.clustering_module.init_prototypes_with_data(self.device, self.hparams.num_classes)
             self.stage2_only = False
             if self.hparams.threshold_epoch == -1:
-                ckpt_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches/clustering_module_stage1_epoch=5.pt"
+                ckpt_path = os.path.join(self.hparams.cache_dir, f"clustering_module_stage1_epoch=5.pt")
                 state = torch.load(ckpt_path, map_location="cpu")
                 self.clustering_module.load_state_dict(state["cluster_model"])
                 self.clustering_module.clustering_manager.feature_bank = state["memory"].to(self.device)
@@ -153,7 +154,7 @@ class MethodLightningModule(pl.LightningModule):
                 print(f"[✔] Loaded pretrained clustering model from {ckpt_path}")
 
             elif self.hparams.threshold_epoch == -2 and self.hparams.video_classifier_epoch == 2:
-                ckpt_path = f"/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches/vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch=9.pt"
+                ckpt_path = os.path.join(self.hparams.cache_dir, f"vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch=9.pt")
                 print(f"[Classifier Cached Mode] Loading pretrained models from {ckpt_path}")
                 state = torch.load(ckpt_path, map_location="cpu")
                 self.clustering_module.load_state_dict(state["cluster_model"])
@@ -179,7 +180,7 @@ class MethodLightningModule(pl.LightningModule):
 
             # ✅ Stage2-only 모드 (캐시 로드)
             elif self.hparams.threshold_epoch == 0 and self.hparams.video_classifier_epoch == 0:
-                ckpt_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches/vision_model_stage1_epoch=15.pt"
+                ckpt_path = os.path.join(self.hparams.cache_dir, f"vision_model_stage1_epoch=15.pt")
                 print(f"[Stage2-Only Mode] Loading pretrained models from {ckpt_path}")
                 state = torch.load(ckpt_path, map_location="cpu")
                 self.clustering_module.load_state_dict(state["cluster_model"])
@@ -210,7 +211,7 @@ class MethodLightningModule(pl.LightningModule):
 
         else:
             if self.epoch == self.hparams.threshold_epoch - 1 and self.epoch > 5 and self.global_rank == 0:
-                ckpt_path = os.path.join("/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches", f"clustering_module_stage1_epoch={self.hparams.threshold_epoch}.pt")
+                ckpt_path = os.path.join(self.hparams.cache_dir, f"clustering_module_stage1_epoch={self.hparams.threshold_epoch}.pt")
                 torch.save({
                     "cluster_model": self.clustering_module.state_dict(),
                     "memory": self.clustering_module.clustering_manager.feature_bank,
@@ -530,8 +531,8 @@ class MethodLightningModule(pl.LightningModule):
             # 정규화 (Cosine Similarity 계산용)
             # z_video_online = F.normalize(z_video_online, dim=1)
             # z_sensor_online = F.normalize(z_sensor_online, dim=1)
-            self.training_steps_outputs[-1]["z_video"] = z_video_online
-            self.training_steps_outputs[-1]["z_sensor"] = z_sensor_online
+            self.training_steps_outputs[-1]["z_video"] = F.normalize(z_video_online)
+            self.training_steps_outputs[-1]["z_sensor"] = F.normalize(z_sensor_online)
 
             # --- 7-B: 모멘텀 특징 (False Negative 감지용) ---
             with torch.no_grad():
@@ -560,46 +561,63 @@ class MethodLightningModule(pl.LightningModule):
             N = gathered_z_video.shape[0] # Effective Batch Size
             # --- 7-D: 가중치 행렬 계산 (W = W_app * W_motion_damp) ---
 
-            # 1️⃣ Appearance 가중치 (기존 동일)
+            # # 1️⃣ Appearance 가중치 (기존 동일)
             sim_app_vid = gathered_v_app @ gathered_v_app.T
             sim_app_sen = gathered_features @ gathered_features.T
 
-            # 유사도가 음수일 수 있으므로 ReLU 적용
+            # # 유사도가 음수일 수 있으므로 ReLU 적용
             sim_app_max = torch.max(F.relu(sim_app_vid), F.relu(sim_app_sen))
 
-            # sim=0 -> W=1.0, sim=1 -> W=lambda_hard
+            # # sim=0 -> W=1.0, sim=1 -> W=lambda_hard
             W_app = 1.0 + (self.hparams.lambda_hard - 1.0) * sim_app_max
 
-            # 2️⃣ Motion 감쇠 가중치 (Warm-up 통합)
-            sim_vid_mom = gathered_v_mom @ gathered_v_mom.T
-            sim_sen_mom = gathered_s_mom @ gathered_s_mom.T
-            sim_stable = (sim_vid_mom + sim_sen_mom) / 2.0
+            # # 2️⃣ Motion 감쇠 가중치 (Warm-up 통합)
+            # sim_vid_mom = gathered_v_mom @ gathered_v_mom.T
+            # sim_sen_mom = gathered_s_mom @ gathered_s_mom.T
+            # sim_stable = (sim_vid_mom + sim_sen_mom) / 2.0
 
-            motion_damp_factor = torch.tanh(
-                F.relu(sim_stable) / self.hparams.motion_damp_temp
-            )
+            # motion_damp_factor = torch.tanh(
+            #     F.relu(sim_stable) / self.hparams.motion_damp_temp
+            # )
 
-            # 감쇠 효과 최대치 (학습이 진행되면 증가)
-            damping_effect_max = 1.0 - (sim_app_max * motion_damp_factor)
+            # # 감쇠 효과 최대치 (학습이 진행되면 증가)
+            # damping_effect_max = 1.0 - (sim_app_max * motion_damp_factor)
 
-            # --- ✅ Warm-up 스케줄링 추가 ---
-            # 현재 epoch 기준으로 진행률 (0.0 ~ 1.0)
-            current_progress = max(0, self.epoch - self.hparams.threshold_epoch)
-            schedule_factor = min(
-                1.0, current_progress / self.hparams.damp_warmup_epochs
-            )
+            # # --- ✅ Warm-up 스케줄링 추가 ---
+            # # 현재 epoch 기준으로 진행률 (0.0 ~ 1.0)
+            # current_progress = max(0, self.epoch - stage2_start)
+            # schedule_factor = min(
+            #     1.0, current_progress / self.hparams.damp_warmup_epochs
+            # )
 
-            # 감쇠 효과 점진적 반영
-            # 초기엔 완전 damping 비활성화(W=1.0), 이후 선형적으로 활성화
-            W_conditional_damp = (
-                1.0 * (1.0 - schedule_factor)
-                + damping_effect_max * schedule_factor
-            )
+            # # 감쇠 효과 점진적 반영
+            # # 초기엔 완전 damping 비활성화(W=1.0), 이후 선형적으로 활성화
+            # W_conditional_damp = (
+            #     1.0 * (1.0 - schedule_factor)
+            #     + damping_effect_max * schedule_factor
+            # )
+
+                        # ==============================================================
+            # ✅ [Sanity Check] sim_stable 대신 "정답 레이블"로 FN 마스크 대체
+            # ==============================================================
+            # (1) 레이블 all_gather
+            gathered_labels = gather(labels)
+
+            # (2) 같은 클래스인지 비교 -> True/False mask
+            fn_mask = (gathered_labels.unsqueeze(0) == gathered_labels.unsqueeze(1))  # [N, N]
+
+            # (3) motion_damp_factor 대신 ground-truth 기반 mask 사용
+            # 같은 클래스면 False Negative로 간주 → 0으로 마스킹
+            W_conditional_damp = torch.ones_like(W_app, device=self.device)
+            W_conditional_damp = W_conditional_damp.masked_fill(fn_mask, 0.0)
+
 
             # --- 3️⃣ 최종 결합 ---
             W_final = W_app * W_conditional_damp
             identity = torch.eye(N, device=self.device, dtype=torch.bool)
+            # W_final = W_app
             W_final = W_final.masked_fill(identity, 0.0)
+            # W_final = W_app
 
             # --- 7-E: InfoNCE 손실 계산 (양방향) ---
             # 1. 유사도 행렬 (Logits)
@@ -635,11 +653,13 @@ class MethodLightningModule(pl.LightningModule):
             loss_v2s = -torch.log(torch.exp(pos_v2s) / denominator_v2s).mean()
             loss_s2v = -torch.log(torch.exp(pos_s2v) / denominator_s2v).mean()
             custom_contrastive_loss = (loss_v2s + loss_s2v) / 2.0
-            lambda_align = 1.0
+            # lambda_align = 1.0
+            lambda_align = 0.0
             lambda_contrastive = 1.0
             if self.global_rank == 0:
                 wandb.log({"train/algin loss": align_loss,
                           "train/contrastive loss": custom_contrastive_loss})
+                # self.log("train/contrastive loss", custom_contrastive_loss)
                 # ✅ Debugging hook
                 self.debug_contrastive_step(
                     z_video_online,
@@ -661,6 +681,7 @@ class MethodLightningModule(pl.LightningModule):
             # -------------------------------------------------------------
             # 6) 종료
             # -------------------------------------------------------------
+            self.debug_types(sim_v2s, labels)
             
 
         if (self.global_step % 200) == 0 and self.global_rank == 0:
@@ -824,94 +845,103 @@ class MethodLightningModule(pl.LightningModule):
             print(f"\nEpoch {self.epoch}: Running ODC evaluation on training data...")
             self.clustering_module.evaluate(outputs)
         
-        if self.global_rank == 0 and len(self.train_video_accs) > 0:
-            mean_acc = torch.stack(self.train_video_accs).mean().item()
-            wandb.log({"train/video_classifier_acc_mapped": mean_acc, "epoch": self.epoch})
-            print(f"[Epoch {self.epoch}] Video classifier acc (avg): {mean_acc:.4f}")
-            self.train_video_accs.clear()
+        try:
+            if self.global_rank == 0 and len(self.train_video_accs) > 0:
+                mean_acc = torch.stack(self.train_video_accs).mean().item()
+                wandb.log({"train/video_classifier_acc_mapped": mean_acc, "epoch": self.epoch})
+                print(f"[Epoch {self.epoch}] Video classifier acc (avg): {mean_acc:.4f}")
+                self.train_video_accs.clear()
+        except Exception as e:
+            print(e)
         
-        if self.global_rank == 0 and hasattr(self, "cm_data"):
-            preds_list = self.cm_data.get("preds", [])
-            labels_list = self.cm_data.get("labels", [])
-            if len(preds_list) > 0 and len(labels_list) > 0:
-                preds_all = torch.cat(preds_list).numpy()
-                labels_all = torch.cat(labels_list).numpy()
+        try:
+            if self.global_rank == 0 and hasattr(self, "cm_data"):
+                preds_list = self.cm_data.get("preds", [])
+                labels_list = self.cm_data.get("labels", [])
+                if len(preds_list) > 0 and len(labels_list) > 0:
+                    preds_all = torch.cat(preds_list).numpy()
+                    labels_all = torch.cat(labels_list).numpy()
 
-                from sklearn.metrics import confusion_matrix
-                import seaborn as sns
-                import matplotlib.pyplot as plt
+                    from sklearn.metrics import confusion_matrix
+                    import seaborn as sns
+                    import matplotlib.pyplot as plt
 
-                cm = confusion_matrix(labels_all, preds_all)
-                fig, ax = plt.subplots(figsize=(6, 6))
-                sns.heatmap(cm, annot=False, cmap="Blues", fmt="d", ax=ax)
-                ax.set_xlabel("Predicted")
-                ax.set_ylabel("True")
-                ax.set_title(f"Confusion Matrix")
+                    cm = confusion_matrix(labels_all, preds_all)
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    sns.heatmap(cm, annot=False, cmap="Blues", fmt="d", ax=ax)
+                    ax.set_xlabel("Predicted")
+                    ax.set_ylabel("True")
+                    ax.set_title(f"Confusion Matrix")
 
-                wandb.log({
-                    f"video_classifier/confusion_matrix": wandb.Image(fig)
-                })
-                plt.close(fig)
-            else:
-                print(f"[Warn] Skipping confusion matrix log — no predictions in cm_data (len={len(preds_list)})")
+                    wandb.log({
+                        f"video_classifier/confusion_matrix": wandb.Image(fig)
+                    })
+                    plt.close(fig)
+                else:
+                    print(f"[Warn] Skipping confusion matrix log — no predictions in cm_data (len={len(preds_list)})")
 
-            # 초기화
-            self.cm_data = {"preds": [], "labels": []}
+                # 초기화
+                self.cm_data = {"preds": [], "labels": []}
+        except Exception as e:
+            print(e)
          
          # ✅ confidence 시각화
-        if self.global_rank == 0 and hasattr(self, "video_confidence_log"):
-            import matplotlib.pyplot as plt
-            import numpy as np
-            import seaborn as sns
-
-            confs = torch.cat(self.video_confidence_log).numpy()
-            plt.figure(figsize=(6, 4))
-            sns.histplot(confs, bins=20, kde=True, color='steelblue')
-            plt.title(f"Video Classifier Confidence")
-            plt.xlabel("Max Probability")
-            plt.ylabel("Frequency")
-            plt.grid(alpha=0.3)
-
-            wandb.log({
-                f"video_classifier/confidence_hist": wandb.Image(plt)
-            })
-            plt.close()
-            self.video_confidence_log = []  # 초기화
-        
-        if self.global_rank == 0 and hasattr(self, "log_buffer"):
-            acc_all = torch.stack(self.log_buffer["classifier_all"]).mean().item()
-            acc_good = torch.stack(self.log_buffer["acc_good"]).mean().item()
-            acc_bad = torch.stack(self.log_buffer["acc_bad"]).mean().item()
-            good_ratio = torch.stack(self.log_buffer["good_ratio"]).mean().item()
-
-            wandb.log({
-                "video_classifier/train_classifier_all": acc_all,
-                "video_classifier/train_acc_good": acc_good,
-                "video_classifier/train_acc_bad": acc_bad,
-                "video_classifier/train_good_ratio": good_ratio,
-                "epoch": self.current_epoch,
-            })
-
-            print(f"[Epoch {self.current_epoch}] acc_all={acc_all:.3f}, acc_good={acc_good:.3f}, acc_bad={acc_bad:.3f}, good_ratio={good_ratio:.2f}")
-
-            # confusion matrix logging (옵션)
-            try:
-                from sklearn.metrics import confusion_matrix
-                import seaborn as sns
+        try:
+            if self.global_rank == 0 and hasattr(self, "video_confidence_log"):
                 import matplotlib.pyplot as plt
-                preds = torch.cat(self.cm_data["preds"]).numpy()
-                labels = torch.cat(self.cm_data["labels"]).numpy()
-                cm = confusion_matrix(labels, preds)
-                fig, ax = plt.subplots(figsize=(5,5))
-                sns.heatmap(cm, ax=ax, cmap="Blues", annot=False)
-                wandb.log({"epoch/confusion_matrix": wandb.Image(fig)}, step=self.global_step)
-                plt.close(fig)
-            except Exception as e:
-                print(f"[Warn] Confusion matrix logging failed: {e}")
+                import numpy as np
+                import seaborn as sns
 
-            # 버퍼 초기화
-            self.log_buffer = {}
-            self.cm_data = {"preds": [], "labels": []}
+                confs = torch.cat(self.video_confidence_log).numpy()
+                plt.figure(figsize=(6, 4))
+                sns.histplot(confs, bins=20, kde=True, color='steelblue')
+                plt.title(f"Video Classifier Confidence")
+                plt.xlabel("Max Probability")
+                plt.ylabel("Frequency")
+                plt.grid(alpha=0.3)
+
+                wandb.log({
+                    f"video_classifier/confidence_hist": wandb.Image(plt)
+                })
+                plt.close()
+                self.video_confidence_log = []  # 초기화
+            
+            if self.global_rank == 0 and hasattr(self, "log_buffer"):
+                acc_all = torch.stack(self.log_buffer["classifier_all"]).mean().item()
+                acc_good = torch.stack(self.log_buffer["acc_good"]).mean().item()
+                acc_bad = torch.stack(self.log_buffer["acc_bad"]).mean().item()
+                good_ratio = torch.stack(self.log_buffer["good_ratio"]).mean().item()
+
+                wandb.log({
+                    "video_classifier/train_classifier_all": acc_all,
+                    "video_classifier/train_acc_good": acc_good,
+                    "video_classifier/train_acc_bad": acc_bad,
+                    "video_classifier/train_good_ratio": good_ratio,
+                    "epoch": self.current_epoch,
+                })
+
+                print(f"[Epoch {self.current_epoch}] acc_all={acc_all:.3f}, acc_good={acc_good:.3f}, acc_bad={acc_bad:.3f}, good_ratio={good_ratio:.2f}")
+
+                # confusion matrix logging (옵션)
+                try:
+                    from sklearn.metrics import confusion_matrix
+                    import seaborn as sns
+                    import matplotlib.pyplot as plt
+                    preds = torch.cat(self.cm_data["preds"]).numpy()
+                    labels = torch.cat(self.cm_data["labels"]).numpy()
+                    cm = confusion_matrix(labels, preds)
+                    fig, ax = plt.subplots(figsize=(5,5))
+                    sns.heatmap(cm, ax=ax, cmap="Blues", annot=False)
+                    wandb.log({"epoch/confusion_matrix": wandb.Image(fig)}, step=self.global_step)
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"[Warn] Confusion matrix logging failed: {e}")
+
+                # 버퍼 초기화
+                self.log_buffer = {}
+                self.cm_data = {"preds": [], "labels": []}
+        except Exception as e:
+            print(e)
 
         print("evaluate called on rank", self.global_rank)
         # 매 2 에폭마다 훈련 데이터셋에 대한 클러스터링 성능 평가
@@ -996,3 +1026,83 @@ class MethodLightningModule(pl.LightningModule):
 
         wandb.log({f"{step_tag}/{k}": v for k, v in stats.items()})
         print(f"🧩 Contrastive Debug @ {step_tag} | " + " | ".join([f"{k}: {v:.3f}" for k, v in stats.items()]))
+
+    def debug_types(self, sim_v2s, labels):
+        """
+        4가지 관계 유형(A,B,C,D)에 대한 모델 유사도 기반 분류 정확도 평가.
+        - A: same object & same motion
+        - B: same object & diff motion
+        - C: diff object & same motion
+        - D: diff object & diff motion
+        """
+        import torch
+
+        with torch.no_grad():
+            # 1️⃣ 라벨 remap (object, motion)
+            obj_labels = self.clustering_module._remap_pairwise_7(labels)
+            mot_labels = self.clustering_module._remap_pairwise_2(labels)
+
+            gathered_obj_labels = gather(obj_labels)
+            gathered_mot_labels = gather(mot_labels)
+
+            # 2️⃣ GT 관계 유형 (A~D)
+            same_object = gathered_obj_labels.unsqueeze(0) == gathered_obj_labels.unsqueeze(1)
+            same_motion = gathered_mot_labels.unsqueeze(0) == gathered_mot_labels.unsqueeze(1)
+
+            gt_type = torch.full_like(same_object, -1, dtype=torch.long)
+            gt_type[same_object & same_motion] = 0  # A
+            gt_type[same_object & (~same_motion)] = 1  # B
+            gt_type[(~same_object) & same_motion] = 2  # C
+            gt_type[(~same_object) & (~same_motion)] = 3  # D
+
+            # 3️⃣ 모델 예측된 관계 유형 (유사도 기반)
+            sim_values = sim_v2s.flatten()
+            q25, q50, q75 = torch.quantile(
+                sim_values, torch.tensor([0.25, 0.5, 0.75], device=sim_v2s.device)
+            )
+
+            pred_type = torch.zeros_like(sim_v2s, dtype=torch.long)
+            pred_type[sim_v2s < q25] = 3
+            pred_type[(sim_v2s >= q25) & (sim_v2s < q50)] = 2
+            pred_type[(sim_v2s >= q50) & (sim_v2s < q75)] = 1
+            pred_type[sim_v2s >= q75] = 0
+
+            # 4️⃣ 전체 및 유형별 정확도 계산
+            eye = torch.eye(sim_v2s.size(0), device=sim_v2s.device, dtype=torch.bool)
+            valid_mask = ~eye & (gt_type >= 0)
+            correct = (pred_type == gt_type) & valid_mask
+
+            overall_acc = correct.sum().float() / valid_mask.sum().float()
+
+            # 유형별 정확도 (0=A, 1=B, 2=C, 3=D)
+            type_accs = {}
+            for t, name in zip(range(4), ["A_same_obj_same_mot", "B_same_obj_diff_mot", "C_diff_obj_same_mot", "D_diff_obj_diff_mot"]):
+                mask = valid_mask & (gt_type == t)
+                if mask.sum() > 0:
+                    type_accs[name] = (correct & mask).sum().float() / mask.sum().float()
+                else:
+                    type_accs[name] = torch.tensor(0.0, device=sim_v2s.device)
+
+            # 5️⃣ 각 유형 평균 유사도 (분포 확인용)
+            sim_means = {
+                "A_same_obj_same_mot": sim_v2s[same_object & same_motion].mean().item(),
+                "B_same_obj_diff_mot": sim_v2s[same_object & (~same_motion)].mean().item(),
+                "C_diff_obj_same_mot": sim_v2s[(~same_object) & same_motion].mean().item(),
+                "D_diff_obj_diff_mot": sim_v2s[(~same_object) & (~same_motion)].mean().item(),
+            }
+
+            # 6️⃣ WandB 로깅
+            if self.global_rank == 0:
+                wandb.log({
+                    "debug/four_type_accuracy": overall_acc.item(),
+                    "debug/typeA_acc": type_accs["A_same_obj_same_mot"].item(),
+                    "debug/typeB_acc": type_accs["B_same_obj_diff_mot"].item(),
+                    "debug/typeC_acc": type_accs["C_diff_obj_same_mot"].item(),
+                    "debug/typeD_acc": type_accs["D_diff_obj_diff_mot"].item(),
+                    "debug/sim_A": sim_means["A_same_obj_same_mot"],
+                    "debug/sim_B": sim_means["B_same_obj_diff_mot"],
+                    "debug/sim_C": sim_means["C_diff_obj_same_mot"],
+                    "debug/sim_D": sim_means["D_diff_obj_diff_mot"],
+                })
+
+            return overall_acc.item(), type_accs, sim_means

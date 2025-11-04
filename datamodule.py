@@ -52,9 +52,9 @@ class MethodDataModule(pl.LightningDataModule):
             self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority" # with trashes
             # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2"
             # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/merging_motion_sensors"
-            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_11_with_trashes.npy" # 다시 만들기
-            self.start_index = 1
-            self.end_index = 11
+            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_6_with_trashes.npy" # 다시 만들기
+            self.start_index = 4
+            self.end_index = 9
             self.cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/caches"
         else:
             raise ValueError(f"Invalid dataset name: {args.dataset_name}")

@@ -34,12 +34,14 @@ def set_model(args, datamodule):
         args.top_k = 4
         args.sensor_seq_len = 128
         args.min_cluster_size = 100
+        args.mid_label = False
     elif args.dataset_name == "HWU-USP":
-        args.num_sensors = 11
-        args.num_classes = 9
+        args.num_sensors = 6
+        args.num_classes = 7
         args.top_k = 1
         args.sensor_seq_len = 128
         args.min_cluster_size = 30
+        args.mid_label = True
 
     args.baseline_video_cache_dir = f"./video_caches/{args.model_name}/{args.dataset_name}"
     args.seed = 42
@@ -145,7 +147,7 @@ def main(args):
             dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
             filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
             save_top_k=1,            # 가장 좋은 모델 1개만 저장
-            monitor="train_loss",      # val_loss를 기준으로 성능을 판단
+            # monitor="train/contrastive loss",      # val_loss를 기준으로 성능을 판단
             mode="min",              # val_loss는 낮을수록 좋으므로 'min' 모드
             save_last=True,
         )
@@ -166,7 +168,17 @@ def main(args):
     print("--- Starting Training with PyTorch Lightning ---")
     trainer.fit(model, datamodule)
     print("--- Training Complete ---")
+    
 
+    # ✅ rank 0에서만 수동 저장
+    if trainer.global_rank == 0:
+        ckpt_dir = f"./checkpoints/{args.model_name}/{args.dataset_name}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        save_path = os.path.join(ckpt_dir, f"final_model_epoch{trainer.current_epoch}.ckpt")
+
+        # LightningModule 전체 저장
+        torch.save(model.state_dict(), save_path)
+        print(f"✅ Final checkpoint saved at: {save_path}")
 
 ####################################################################
 

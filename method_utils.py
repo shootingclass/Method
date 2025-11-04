@@ -16,10 +16,12 @@ def calculate_sensor_stats(dataset):
     print("Calculating sensor statistics...")
     
     for i in tqdm(range(len(dataset)), desc="Collecting sensor data"):
-        _, sensor_data, _, _ = dataset[i]        
+        _, sensor_data, _, _, _ = dataset[i]     
+        # numpy array로 강제 변환 (리스트 방지)
+        sensor_data = np.asarray(sensor_data, dtype=float)   
         all_sensor_data.append(sensor_data)
     
-    concatenated_data = np.concatenate(all_sensor_data, axis=1)
+    concatenated_data = np.concatenate(all_sensor_data, axis=1).astype(float)
     
     mean = np.mean(concatenated_data, axis=1)
     std = np.std(concatenated_data, axis=1)

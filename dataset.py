@@ -58,9 +58,6 @@ class SensorTransform:
         return filtfilt(self.b, self.a, data, axis=1)
 
     def _apply_normalization(self, data):
-        # data_new=[1,1,1,1,0,0,1,1,1,1,0]
-        # print("mean", self.mean, "std", self.std)
-        # print("default", (data_new-self.mean)/(self.std + 1e-8))
         if self.mean is not None and self.std is not None:
             mean = self.mean[:, np.newaxis]
             std = self.std[:, np.newaxis]
