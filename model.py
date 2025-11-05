@@ -699,7 +699,7 @@ class VisionModel(nn.Module):
         # Forward
         # z_video_online = self.fusion(v_appearance.detach(), v_motion)
         return {
-            "v_appearance": v_appearance.detach(),
+            "v_appearance": v_appearance,
             "v_motion": v_motion,
             "vis_v": video_centered - video.mean(dim=1, keepdim=True),
             "z_video_online": z_video_online,
@@ -1021,6 +1021,7 @@ class ClusteringManager(nn.Module):
                         "q75": q75,
                     }
                 else:
+                    assert False
                     cluster_stats[k] = {
                         "size": 0,
                         "mean": None,
@@ -1671,6 +1672,9 @@ class ClusteringModule(nn.Module):
 
         import numpy as np
         import torch
+
+        if self.mid_label:
+            return None
 
         if isinstance(labels_any, torch.Tensor):
             x = labels_any.clone().to(torch.long)

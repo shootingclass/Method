@@ -25,7 +25,7 @@ class IMU2CLIPLightningModule(BasePretrainModule):
 
         out = {}
 
-        videos, sensors, labels, sample_ids = batch
+        videos, sensors, labels, sample_ids, _ = batch
         x_sensor = self.sensor_padding(sensors)
         y_sensor = self.sensor_model(x_sensor)
         out["sensor"] = y_sensor

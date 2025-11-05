@@ -164,7 +164,7 @@ class PRIMUSLightningModule(BasePretrainModule):
 
         if train_time:
             for i in range(self.hparams.num_views):
-                videos, sensors, labels, sample_ids = batch
+                videos, sensors, labels, sample_ids, _ = batch
                 if i == 0:
                     x_sensor = sensors
                 else:

@@ -52,7 +52,7 @@ class COMODOLightningModule(BasePretrainModule):
         return self.sensor_model(imu_data, input_mask)
 
     def training_step(self, batch, batch_idx):
-        videos, sensors, labels, sample_ids = batch
+        videos, sensors, labels, sample_ids, _ = batch
         idx, video_id = sample_ids
         input_mask = None # None when Mantis
          # 4. 캐시 확인 및 로드

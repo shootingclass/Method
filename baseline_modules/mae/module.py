@@ -20,7 +20,7 @@ class CAVMAELightningModule(BasePretrainModule):
         )
 
     def training_step(self, batch, batch_idx):
-        video, sensor, _, _ = batch
+        video, sensor, _, _, _ = batch
 
         # CAVMAE 모델의 forward 호출
         loss, loss_mae, loss_mae_s, loss_mae_v, loss_c, c_acc = self.model(

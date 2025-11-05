@@ -1,30 +1,21 @@
 import os
 import argparse
-import torch
-import random
 import numpy as np
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
-import torchmetrics
-import seaborn as sns
-import matplotlib.pyplot as plt
-import wandb
-from sklearn.metrics import confusion_matrix
+import torch
 import torch.nn as nn
+import torchmetrics
+import pytorch_lightning as pl
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+import wandb
 
-# --- 사용자 정의 모듈 임포트 ---
-from datamodule import MethodDataModule
-from method import MethodLightningModule
 from method_utils import gather
 from linear_probe_lstm import LinearProbeLSTMDatamodule
 
 
-####################################################################
-#                         Utility Functions
-####################################################################
-
-def set_random_seed(seed):
+def set_random_seed(seed=42):
+    import random
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -37,12 +28,13 @@ def set_random_seed(seed):
 def set_module_params(args):
     parts = args.checkpoint_path.split('/')
     if len(parts) >= 3:
-        args.dataset_name = parts[-2]
-        args.model_name = parts[-3]
+        args.dataset_name = parts[-2]  # 예: HWU-USP
+        args.model_name = parts[-3]    # 예: method/comodo/primus/imu2clip/mae
         args.ckpt_name = parts[-1].split('.')[0]
         print(f"Dataset: {args.dataset_name}, Model: {args.model_name}")
     else:
-        print("경로 구조가 예상과 다릅니다.")
+        print("경고: checkpoint_path 구조가 예상과 다릅니다. (…/MODEL/DATASET/xxx.ckpt)")
+    args.mid_label = True
     return args
 
 
@@ -70,84 +62,8 @@ def load_pretrained_model(args):
         model = CAVMAELightningModule.load_from_checkpoint(ckpt, map_location='cpu').to('cuda')
     else:
         raise ValueError(f"Unknown model_name: {args.model_name}")
+
     return model
-
-
-####################################################################
-#                        Linear Probe Module
-####################################################################
-
-class LinearProbeLightningModule(pl.LightningModule):
-    def __init__(self, args, model):
-        super().__init__()
-        self.save_hyperparameters(args)
-        self.model = model
-
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        self.classifier = torch.nn.Linear(model.hparams.embedding_dim * 2, self.hparams.num_classes)
-        self.criterion = torch.nn.CrossEntropyLoss()
-        self.val_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=self.hparams.num_classes)
-        self.test_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=self.hparams.num_classes)
-
-        # Confusion matrix용 클래스 이름
-        self.class_dic = {
-            0: 'Open Door 1', 1: 'Open Door 2', 2: 'Close Door 1', 3: 'Close Door 2',
-            4: 'Open Fridge', 5: 'Close Fridge', 6: 'Open Dishwasher', 7: 'Close Dishwasher',
-            8: 'Open Drawer 1', 9: 'Close Drawer 1', 10: 'Open Drawer 2',
-            11: 'Close Drawer 2', 12: 'Open Drawer 3', 13: 'Close Drawer 3'
-        }
-        self.class_names = [v for v in self.class_dic.values()]
-
-    def forward(self, sensor_data):
-        if self.hparams.model_name == "method":
-            sensor_encoder = self.model.sensor_model
-            representations = sensor_encoder(sensor_data)
-        elif self.hparams.model_name == "imu2clip":
-            sensor_encoder = self.model.sensor_model
-            sensor_data = self.model.sensor_padding(sensor_data)
-            representations = sensor_encoder(sensor_data)
-        elif self.hparams.model_name == "primus":
-            sensor_encoder = self.model.sensor_model
-            representations = sensor_encoder(sensor_data)['mmcl']
-        elif self.hparams.model_name == "mae":
-            representations = self.model.model.forward_sensor_only(sensor_data)
-        elif self.hparams.model_name == "comodo":
-            sensor_encoder = self.model.sensor_model
-            representations = sensor_encoder(sensor_data)
-        else:
-            raise ValueError(f"Unknown model_name for loading: {self.hparams.model_name}")
-        logits = self.classifier(representations)
-        return logits
-
-    def _shared_step(self, batch, batch_idx):
-        _, sensor_data, y, _, _ = batch
-        logits = self(sensor_data)
-        loss = self.criterion(logits, y)
-        preds = torch.argmax(logits, dim=1)
-        return loss, preds, y
-
-    def training_step(self, batch, batch_idx):
-        loss, _, _ = self._shared_step(batch, batch_idx)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss, preds, y = self._shared_step(batch, batch_idx)
-        self.val_accuracy.update(preds, y)
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val_acc", self.val_accuracy, on_epoch=True, prog_bar=True)
-
-    def test_step(self, batch, batch_idx):
-        loss, preds, y = self._shared_step(batch, batch_idx)
-        self.test_accuracy.update(preds, y)
-        self.log("test_loss", loss, on_epoch=True)
-        self.log("test_acc", self.test_accuracy, on_epoch=True)
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.classifier.parameters(), lr=self.hparams.lr)
-        return optimizer
 
 
 class LinearProbeLSTM(pl.LightningModule):
@@ -174,7 +90,7 @@ class LinearProbeLSTM(pl.LightningModule):
             bidirectional=False
         )
 
-        self.classifier = nn.Linear(self.emb_dim, self.backbone.hparams.num_classes)
+        self.classifier = nn.Linear(self.emb_dim, self.hparams.num_classes)
 
         # Metrics
         self.criterion = nn.CrossEntropyLoss()
@@ -360,50 +276,83 @@ class LinearProbeLSTM(pl.LightningModule):
         return optimizer
 
 
-def main(args):
+def main():
+    parser = argparse.ArgumentParser()
+
+    # 필수
+    parser.add_argument('--checkpoint_path', type=str, required=True)
+
+    # 데이터
+    parser.add_argument('--data_root', type=str, default='/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window')
+    parser.add_argument('--train_json', type=str, default= '/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority/linear_probe_train.json')
+    parser.add_argument('--test_json', type=str, default= '/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority/linear_probe_test.json')
+
+    # 학습
+    parser.add_argument('--num_classes', type=int, default=5)  # HWU-USP 기준
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--linear_epochs', type=int, default=50)
+    parser.add_argument('--lr', type=float, default=1e-3)
+
+    # 기타
+    parser.add_argument('--devices', type=int, default=-1)
+    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_true')
+    parser.add_argument('--project', type=str, default='Method_Linear_Probe')
+    parser.add_argument('--run_name', type=str, default=None)
+
+    args = parser.parse_args()
     set_random_seed(42)
     args = set_module_params(args)
 
-    # HWU-USP 분기
-    if args.dataset_name == "HWU-USP":
-        args.num_classes = 5
-        datamodule = LinearProbeLSTMDatamodule(batch_size=args.batch_size, num_workers=args.num_workers)
-        backbone = load_pretrained_model(args)
-        model = LinearProbeLSTM(args, backbone)
+    # Data
+    dm = LinearProbeLSTMDatamodule(
+        data_root=args.data_root,
+        train_json=args.train_json,
+        test_json=args.test_json,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers
+    )
+    dm.setup()
 
-    else:
-        args.num_classes = 14
-        args.threshold_epoch = 100 # need only sensor data
-        datamodule = MethodDataModule(args, stage='linear_probe')
-        model = load_pretrained_model(args)
-        model = LinearProbeLightningModule(args, model)
+    # Backbone + Probe
+    backbone = load_pretrained_model(args)
+    model = LinearProbeLSTM(args, backbone)
 
-    logger = WandbLogger(project="Method_Linear_Probe", name=f"{args.model_name}_{args.dataset_name}_probe")
-    ckpt_cb = ModelCheckpoint(monitor='val_acc', mode='max',
-                              dirpath=f'checkpoints_linear/{args.model_name}_{args.dataset_name}',
-                              filename='best-{epoch:02d}-{val_acc:.3f}', save_top_k=1)
+    # Logger & Trainer
+    is_master = os.environ.get("LOCAL_RANK", "0") == "0"
+    if args.run_name == None:
+        args.run_name = f"{args.model_name}_{args.dataset_name}_{args.ckpt_name}_last_{args.batch_size*4}_epoch={backbone.hparams.epochs}_linearEpoch={args.linear_epochs}"
+    logger = wandb.init(project=args.project, name=args.run_name) if is_master else None
+    wb_logger = pl.loggers.WandbLogger(experiment=logger) if logger else False
+
+    ckpt_dir = os.path.join("checkpoints_linear_lstm",
+                            f"{args.model_name}_{args.dataset_name}_{args.ckpt_name}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_cb = pl.callbacks.ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename='best-{epoch:02d}-{val_acc:.3f}',
+        monitor='val_acc',
+        mode='max',
+        save_top_k=1
+    )
 
     trainer = pl.Trainer(
         max_epochs=args.linear_epochs,
         accelerator='gpu',
-        devices=-1,
-        strategy='ddp_find_unused_parameters_true',
-        logger=logger,
+        devices=args.devices,
+        strategy=args.strategy,
+        logger=wb_logger,
         callbacks=[ckpt_cb]
     )
 
-    print("--- Starting Linear Probing ---")
-    trainer.fit(model, datamodule)
-    print("--- Testing ---")
-    trainer.test(datamodule=datamodule, ckpt_path='best')
+    print("--- Start Linear Probe (LSTM) ---")
+    trainer.fit(model, datamodule=dm)
+    print("--- Testing on best checkpoint ---")
+    trainer.test(model=None, datamodule=dm, ckpt_path='best')
+
+    if logger:
+        wandb.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint_path', type=str, required=True)
-    parser.add_argument('--linear_epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_workers', type=int, default=8)
-    args = parser.parse_args()
-    main(args)
+    main()

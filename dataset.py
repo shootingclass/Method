@@ -171,7 +171,8 @@ class ClipConsistentTransforms:
         clip_tensor = torch.stack(tensor_frames, dim=0)
 
         # Normalize
-        clip_tensor = TF.normalize(clip_tensor, mean=self.mean, std=self.std)
+        clip_tensor /= 255.0
+        # clip_tensor = TF.normalize(clip_tensor, mean=self.mean, std=self.std)
 
         return clip_tensor
 
@@ -374,6 +375,14 @@ class VideoSensorDataset(Dataset):
             flow = torch.from_numpy(flow).float()  # [T, 2, H, W]
              # 값 정규화
             # flow = torch.clamp(flow, -20, 20) / 20.0
+                # ✅ Optical flow 크기 확인 및 resize
+            T, C, H, W = flow.shape
+            if H > 224 or W > 224:
+                # bilinear resize (flow는 벡터이므로 interpolation 모드 주의)
+                flow = F.interpolate(
+                    flow, size=(224, 224),
+                    mode="bilinear", align_corners=False
+                )
         else:
             flow = {}
 

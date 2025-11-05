@@ -52,15 +52,13 @@ ACTION_MERGE_LABELS_OPPORTUNITY_ALL = {0: 'Open Door 1',
     16: 'Toggle Switch'}
 
 ACTION_MERGE_LABELS_HWU_USP = {
-    0: "Ktch_B1_Drawer",
-    1: "Ktch_B4_Cupboard",
-    2: "Ktch_Motion_1",
-    3: "Ktch_Motion_2",
-    4: "Ktch_T1_Cupboard",
-    5: "Ktch_T2_Cupboard",
-    6: "Ktch_T3_Cupboard",
-    7: "None Behavior",
-    8: "TP_L_Power"
+    0: "Ktch_B4_Cupboard",
+    1: "Ktch_Motion_1",
+    2: "Ktch_Motion_2",
+    3: "Ktch_T1_Cupboard",
+    4: "Ktch_T2_Cupboard",
+    5: "Ktch_T3_Cupboard",
+    6: "None Behavior"
 }
 
 #################################################################

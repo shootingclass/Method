@@ -457,3 +457,90 @@ def log_optical_flow_overlay_to_wandb(
     video_tensor = np.transpose(video_tensor, (0, 3, 1, 2)).astype(np.uint8)
     wandb.log({wandb_key: wandb.Video(video_tensor, fps=fps, format="mp4")})
     print(f"✅ Logged {wandb_key} (Fine-motion optical flow overlay complete)")
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import cv2
+import os
+import wandb
+import imageio_ffmpeg  # ffmpeg backend 확실히 등록
+import imageio.v3 as iio
+
+@torch.no_grad()
+def log_shared_feat_overlay_to_wandb(video, shared_encoder, label, wandb_key="SharedFeat_Overlay", fps=8):
+    """
+    좌: 원본 비디오, 우: heatmap overlay (2분할 비교용)
+    + Temporal mean heatmap 추가
+    """
+    import os, cv2, torch, wandb, numpy as np, imageio.v3 as iio
+    import torch.nn.functional as F
+
+    B, T, C, H, W = video.shape
+    assert B == 1, "현재는 batch=1만 지원합니다."
+    os.makedirs("debug_viz", exist_ok=True)
+
+    # 1️⃣ Feature map 추출
+    video_flat = video.view(B * T, C, H, W)
+    feat_flat = shared_encoder(video_flat)  # [B*T, D, Hf, Wf]
+    D, Hf, Wf = feat_flat.shape[1:]
+    feat = feat_flat.view(B, T, D, Hf, Wf)
+    feat_map = feat.mean(dim=2)  # [B, T, Hf, Wf]
+    feat_map_up = F.interpolate(feat_map, size=(H, W), mode='bilinear', align_corners=False)[0].cpu().numpy()
+
+    # 2️⃣ 원본 비디오 처리 (float → gamma corrected uint8)
+    video_np = video[0].permute(0, 2, 3, 1).cpu().numpy()
+    if video_np.max() <= 1.0:
+        video_np = np.power(video_np, 1 / 2.2)  # 🔥 gamma correction
+        video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
+    else:
+        video_np = video_np.astype(np.uint8)
+
+    # 3️⃣ 프레임별 overlay 생성
+    frames = []
+    for t in range(T):
+        frame = video_np[t]
+
+        heat = feat_map_up[t]
+        heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-6)
+        heat_color = cv2.applyColorMap((heat * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        heat_color = cv2.cvtColor(heat_color, cv2.COLOR_BGR2RGB)
+
+        overlay = cv2.addWeighted(frame, 0.65, heat_color, 0.35, 0)
+        concat = np.concatenate([frame, overlay], axis=1)
+        frames.append(concat)
+
+    frames = np.stack(frames).astype(np.uint8)
+
+    # 4️⃣ 프레임별 overlay → 비디오로 저장
+    save_path = "debug_viz/shared_feat_split.mp4"
+    iio.imwrite(save_path, frames, fps=fps, codec="libx264", quality=8)
+    wandb.log({wandb_key: wandb.Video(save_path, fps=fps, format="mp4")})
+    print(f"[wandb] ✅ Logged {wandb_key} (framewise split view) → {save_path}")
+
+    # 5️⃣ Temporal mean heatmap (shared_feat.mean(dim=1))
+    feat_mean = feat.mean(dim=1).mean(dim=1)  # [B, Hf, Wf]
+    feat_mean_up = F.interpolate(
+        feat_mean.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False
+    )[0, 0].cpu().numpy()
+    feat_mean_up = (feat_mean_up - feat_mean_up.min()) / (feat_mean_up.max() - feat_mean_up.min() + 1e-6)
+    heat_color = cv2.applyColorMap((feat_mean_up * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    heat_color = cv2.cvtColor(heat_color, cv2.COLOR_BGR2RGB)
+
+    frame_mean = video_np.mean(axis=0).astype(np.uint8)
+    overlay = cv2.addWeighted(frame_mean, 0.65, heat_color, 0.35, 0)
+
+    ACTION_MERGE_LABELS_HWU_USP = {
+        0: "Ktch_B4_Cupboard",
+        1: "Ktch_Motion_1",
+        2: "Ktch_Motion_2",
+        3: "Ktch_T1_Cupboard",
+        4: "Ktch_T2_Cupboard",
+        5: "Ktch_T3_Cupboard",
+        6: "None Behavior"
+    }
+
+    mean_save_path = f"debug_viz/shared_feat_temporal_mean{ACTION_MERGE_LABELS_HWU_USP[label]}.png"
+    cv2.imwrite(mean_save_path, overlay)
+    wandb.log({f"{wandb_key}_TemporalMean": wandb.Image(overlay)})
+    print(f"[wandb] ✅ Logged {wandb_key}_TemporalMean → {mean_save_path}")

@@ -18,7 +18,7 @@ class MethodDataModule(pl.LightningDataModule):
         super().__init__()
 
         self.set_dataset_params(args, stage)
-        self.num_frames = args.num_frames
+        self.num_frames = args.num_frames if hasattr(args, "num_frames") else 20
         if args.model_name=="method":
             self.threshold_epoch = args.threshold_epoch
         else:
@@ -26,14 +26,20 @@ class MethodDataModule(pl.LightningDataModule):
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
 
-        # 프레임 전처리(Transform) 정의
-        clip_mean = [0.48145466, 0.4578275, 0.40821073]
-        clip_std = [0.26862954, 0.26130258, 0.27577711]
+        # 프레임 전처리(Transform) 정의 
+        # CLIP
+        # mean = [0.48145466, 0.4578275, 0.40821073]
+        # std = [0.26862954, 0.26130258, 0.27577711]
+
+        # Conv 기반 model 전처리
+        mean = [0.485, 0.456, 0.406]
+        std  = [0.229, 0.224, 0.225]
+
         
         self.train_transform = ClipConsistentTransforms(
             size=(224, 224),
-            mean=clip_mean,
-            std=clip_std
+            mean=mean,
+            std=std
         )
     
     def set_dataset_params(self, args, stage):
@@ -48,8 +54,8 @@ class MethodDataModule(pl.LightningDataModule):
         elif args.dataset_name == "HWU-USP":
             self.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
             # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/splits_with_trashes"
-            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_priority" # with trashes
-            self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority" # with trashes
+            self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_priority" # without trashes
+            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority" # without trashes
             # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2"
             # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/merging_motion_sensors"
             self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_6_with_trashes.npy" # 다시 만들기
@@ -63,8 +69,10 @@ class MethodDataModule(pl.LightningDataModule):
         if stage == 'pretrain':
             print("INFO: DataModule configured for PRE-TRAINING stage.")
             self.json_train_path = os.path.join(self.json_path, "pretrain_cropped_with_flow.json")
+            self.json_train_path = os.path.join(self.json_path, "pretrain.json")
             # Pre-training 시 val/test가 필요 없다면 None으로 설정하거나 train과 동일하게 설정
-            self.json_val_path = os.path.join(self.json_path, "pretrain_cropped_with_flow.json") if args.model_name == "method" else os.path.join(self.json_path, "linear_val.json")
+            self.json_val_path = os.path.join(self.json_path, "pretrain_cropped_with_flow.json") if args.model_name == "method" else None
+            # self.json_val_path = os.path.join(self.json_path, "pretrain.json") if args.model_name == "method" else None
             # Evaluate 용 data를 pretrain data와 동일하게 설정 (leak 방지)
             self.json_test_path = None
         
