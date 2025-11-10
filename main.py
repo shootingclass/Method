@@ -257,9 +257,10 @@ if __name__ == '__main__':
     parser.add_argument("--bad_correction_epoch", type=int, default=10)
 
     parser.add_argument("--momentum_m", type=float, default=0.999)
-    parser.add_argument("--lambda_hard", type=float, default=3.0)
+    parser.add_argument("--lambda_hard", type=float, default=4.0)
     parser.add_argument("--motion_damp_temp", type=float, default=0.1)
     parser.add_argument("--contrastive_temp", type=float, default=0.07)
+    parser.add_argument("--ablation_study", type=str, default=None)
 
     parser.add_argument("--damp_warmup_epochs", type=int, default=5)
 

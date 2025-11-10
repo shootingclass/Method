@@ -50,7 +50,10 @@ class MethodDataModule(pl.LightningDataModule):
             self.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
             self.start_index, self.end_index = 194, 230
             embedding_dim = args.embedding_dim if hasattr(args, "embedding_dim") else None
-            if embedding_dim is not None and embedding_dim != 512:
+            ablation_study = args.ablation_study if hasattr(args, "ablation_study") else None
+            if ablation_study is not None:
+                self.cache_dir = os.path.join(self.data_root, f"abulations\caches\{ablation_study}")
+            elif embedding_dim is not None and embedding_dim != 512:
                 self.cache_dir = os.path.join(self.data_root, f"{embedding_dim}\caches")
             else:
                 self.cache_dir = os.path.join(self.data_root, "caches")

@@ -1732,10 +1732,10 @@ class ClusteringModule(nn.Module):
                 self.visualize_embedding(v_motion_np, all_labels, title="V_Motion")
             except Exception as e:
                 print(f"Error during v motion t-SNE visualization: {e}")  
-            try:
-                self.visualize_embedding(v_appearance_np, all_labels, title="V_Appearance")
-            except Exception as e:
-                print(f"Error during v appearance t-SNE visualization: {e}")  
+            # try:
+            #     self.visualize_embedding(v_appearance_np, all_labels, title="V_Appearance")
+            # except Exception as e:
+            #     print(f"Error during v appearance t-SNE visualization: {e}")  
             try:
                 self.visualize_embedding(s_motion_np, all_labels, title="S_Motion")
             except Exception as e:

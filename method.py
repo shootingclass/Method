@@ -18,6 +18,7 @@ import torch.distributed as dist
 
 # --- 사용자 정의 모듈 임포트 ---
 from model import SensorEncoder, SensorMotionEncoder, SensorModel, VisionModel, ClusteringModule
+from visualizes import visualize_Wfinal_differences
 
 ####################################################################
 
@@ -32,10 +33,10 @@ class MethodLightningModule(pl.LightningModule):
 
         self.video_model = VisionModel(latent_dim=self.hparams.embedding_dim)
         self.sensor_appearance_encoder= SensorEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
-        self.sensor_motion_encoder = SensorEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
+        self.sensor_motion_encoder = SensorMotionEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
         self.clustering_module = ClusteringModule(
             encoder=self.sensor_appearance_encoder,
-            embedding_dim=self.hparams.embedding_dim,
+            embedding_dim=self.hparams.embedding_dim,   
             num_sensors=self.hparams.num_sensors,
             num_clusters=self.hparams.num_classes,
             datamodule=datamodule,
@@ -496,7 +497,7 @@ class MethodLightningModule(pl.LightningModule):
         final_loss = (
             lambda_cluster * loss_cluster +
             lambda_video_sup * loss_video_supervised +
-            lambda_sensor_guide * loss_sensor_guided
+            lambda_sensor_guide * loss_sensor_guided # no refinement
         )
 
         if self.global_rank == 0:
@@ -705,10 +706,10 @@ class MethodLightningModule(pl.LightningModule):
             sim_stable = (sim_vid_mom + sim_sen_mom) / 2.0
 
             # 🔹 Global Softmax Normalization (short, symmetric, stable)
-            tau = 0.7
-            sim_exp = torch.exp((sim_app_max*sim_stable - sim_app_max*sim_stable.max()) / tau)
-            sim_stable = sim_exp / (sim_exp.sum() + 1e-6)
-            sim_stable = (sim_stable - sim_stable.min()) / (sim_stable.max() - sim_stable.min() + 1e-6)
+            # tau = 0.7
+            # sim_exp = torch.exp((sim_app_max*sim_stable - sim_app_max*sim_stable.max()) / tau)
+            # sim_stable = sim_exp / (sim_exp.sum() + 1e-6)
+            # sim_stable = (sim_stable - sim_stable.min()) / (sim_stable.max() - sim_stable.min() + 1e-6)
 
             motion_damp_factor = sim_stable
             # [버그 1 수정] sim_app_avg -> sim_app_max
@@ -748,9 +749,9 @@ class MethodLightningModule(pl.LightningModule):
 
             # 이상적 weight 할당
             W_ideal[false_mask] = 0.0
-            W_ideal[hard_mask]  = 1.0
+            W_ideal[hard_mask]  = 2.0
             W_ideal[easy_mask]  = 0.5
-            W_ideal[motion_mask] = 0.0
+            W_ideal[motion_mask] = 0.1
 
             # 자기 자신은 0
             W_ideal.fill_diagonal_(0.0)
@@ -760,7 +761,7 @@ class MethodLightningModule(pl.LightningModule):
             print(f"[Sanity Check] mean|W_final - ideal| = {diff:.4f}")
 
             W_final_log = W_final.clone().detach()
-            W_final = W_ideal
+            # W_final = W_ideal
 
 
 
@@ -788,7 +789,7 @@ class MethodLightningModule(pl.LightningModule):
             # 대각선(Positive)을 -inf로 마스킹
             neg_logits_v2s = logits_v2s.masked_fill(identity, -torch.inf)
             neg_logits_s2v = logits_s2v.masked_fill(identity, -torch.inf)
-            # 3. 가중치가 적용된 네거티브 합 계산
+            # 3. 가중치가 적용된 네거티브 합 계산x
             # W_final은 대칭이므로 (W_final.T == W_final) 동일하게 사용
             weighted_neg_v2s = (W_final * torch.exp(neg_logits_v2s)).sum(dim=1)
             weighted_neg_s2v = (W_final * torch.exp(neg_logits_s2v)).sum(dim=1)
@@ -800,10 +801,10 @@ class MethodLightningModule(pl.LightningModule):
             custom_contrastive_loss = (loss_v2s + loss_s2v) / 2.0
             # lambda_align = 1.0
             lambda_align = 0.0
-            lambda_contrastive = 3.0
-            # if self.epoch == 0:
+            lambda_contrastive = 5.0
+            if self.epoch == 0:
                 # first epoch is to syncronization.
-                # W_final = torch.zeros_like(W_final)
+                W_final = torch.zeros_like(W_final)
             
 
             if self.global_rank == 0:
@@ -1059,23 +1060,24 @@ class MethodLightningModule(pl.LightningModule):
             # 에포크가 끝난 후 epoch 업데이트
         self.eval()  
       # 1️⃣ rank 0이 아닌 프로세스는 먼저 대기 (pre-save barrier)
-        if dist.is_initialized() and self.global_rank != 0:
-            print(f"[rank{self.global_rank}] waiting before save")
-            dist.barrier()
+        # if dist.is_initialized() and self.global_rank != 0:
+        #     print(f"[rank{self.global_rank}] waiting before save")
+        #     dist.barrier()
 
         # 2️⃣ rank 0만 체크포인트 저장
-        if self.global_rank == 0:
-            save_path = f"/home/jaemo/Method/checkpoints/method/HWU-USP/manual_epochs/manual_epoch_{self.epoch}.ckpt"
-            self.trainer.save_checkpoint(save_path)
-            print(f"[rank0] checkpoint saved: {save_path}")
-            # finally:
-            #     # ✅ rank 0이 저장 끝나면 barrier로 나머지 깨워줌
-            #     if dist.is_initialized():
-            #         dist.barrier()
+        # try:
+        #     if self.global_rank == 0:
+        #         save_epochs = [1, 3, 5, 10, 15, 20, 25, 30, 40, 50]
+        #         if self.epoch in save_epochs:
+        #             save_path = f"/home/jaemo/Method/checkpoints/method/{self.hparams.dataset_name}/manual_epochs/manual_epoch_{self.epoch}.ckpt"
+        #             self.trainer.save_checkpoint(save_path)
+        #             print(f"[rank0] checkpoint saved: {save_path}")
+        # except Exception as e:
+        #     print(e)
 
-        # 3️⃣ 나머지 rank도 barrier 통과 후 진행
-        if dist.is_initialized() and self.global_rank != 0:
-            print(f"[rank{self.global_rank}] resume after rank0 save")
+        # # 3️⃣ 나머지 rank도 barrier 통과 후 진행
+        # if dist.is_initialized() and self.global_rank != 0:
+        #     print(f"[rank{self.global_rank}] resume after rank0 save")
             
         outputs = self.training_steps_outputs
         print(f"{self.global_rank} Epoch {self.epoch} - Collected {len(outputs)} training step outputs.")
@@ -1089,7 +1091,7 @@ class MethodLightningModule(pl.LightningModule):
             if self.epoch % self.clustering_module.deal_with_small_clusters_interval == 0:
                 self.clustering_module.clustering_manager.deal_with_small_clusters()
 
-        if self.epoch % 2 == 0:
+        if self.epoch % 4 == 0:
             print(f"\nEpoch {self.epoch}: Running ODC evaluation on training data...")
             self.clustering_module.evaluate(outputs)
         
@@ -1334,7 +1336,7 @@ class MethodLightningModule(pl.LightningModule):
             print("--------------------------")
         
         print(f"\n[{step_tag}] Composite-class (spatial×motion) region stats\n")
-        print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<13} | {'W_dmp':<13} | {'W_fin':<13} | {'Stbl':<1e} | {'Vid':<10} | {'Sen':<10} | {'Sen_mom_raw':<6} | {'Cros':<6}")
+        print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<13} | {'W_dmp':<13} | {'W_fin':<13} | {'Stbl':<10} | {'Vid':<10} | {'Sen':<10} | {'Sen_mom_raw':<6} | {'Cros':<6}")
         #print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Vid_mom_raw':<6} | {'Sen_mom_raw':<6} | {'Z_vid_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
         print("-" * 195)
 
@@ -1385,6 +1387,17 @@ class MethodLightningModule(pl.LightningModule):
             logger.experiment.log(wandb_data)
 
         print(f"\n✅ [{step_tag}] composite class-based symmetric region stats computed.")
+
+        visualize_Wfinal_differences(
+            W_final_np=W_final_np,
+            hard_mask=hard_mask,
+            false_mask=false_mask,
+            motion_same_mask=motion_same_mask,
+            labels_np=labels_np,
+            class_names=class_names,
+            step_tag=step_tag,
+            logger=logger
+        )
 
 
     @torch.no_grad()
@@ -1495,5 +1508,5 @@ class MethodLightningModule(pl.LightningModule):
 
         # ---------------------------------------------------------------------
         #  CONSOLE SUMMARY (Optional, too large matrices might clutter console)
-        # ---------------------------------------------------------------------
+        # ——————————————————————————————————
         # print(f"[Video Motion] classwise similarity matrix:\n{np.array2string(sim_v_class, precision=2, suppress_small=True)}")

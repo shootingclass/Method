@@ -48,7 +48,37 @@ def set_module_params(args):
     return args
 
 def get_backbone_with_mode(args):
-    if args.supervision:
+    if args.sensor_only:
+        print("⚙️  Sensor-only from scratch training.")
+
+        # sensor-only model import
+        from baseline_sensor.dlinear import DLinearModel
+        from baseline_sensor.timesnet import TimesNet
+        from baseline_sensor.moment_small import MomentSmall
+        from baseline_sensor.mantis import MantisModel
+
+        model_map = {
+            'dlinear': DLinearModel,
+            'timesnet': TimesNet,
+            'moment': MomentSmall,
+            'mantis': MantisModel,
+        }
+        sensor_encoder = model_map[args.sensor_model_name](sensor_channels=6, num_classes=args.num_classes)
+
+        # ✨ 여기 핵심: backbone 구조 대신 sensor encoder만 넣어줌
+        class DummyBackbone:
+            def __init__(self, encoder):
+                self.sensor_model = encoder
+                self.hparams = type('', (), {'embedding_dim': 128})()  # 임시 속성
+        backbone = DummyBackbone(sensor_encoder)
+        # sensor encoder만 학습
+        for name, p in backbone.named_parameters():
+            print(name)
+            # p.requires_grad = "sensor_model" in name
+            p.requires_grad = True
+        backbone.train()
+
+    elif args.supervision:
             print("⚙️  Sensor-only supervised mode enabled (no pretrained weights).")
             
             # 1️⃣ checkpoint의 하이퍼파라미터만 가져오기
@@ -57,6 +87,9 @@ def get_backbone_with_mode(args):
 
             # 2️⃣ 기존 load_pretrained_model의 인자를 동일하게 써서 구조만 초기화
             backbone = load_pretrained_model(args, reset_sensor_weights=True)
+              # ⚠️ 반드시 device 이동 이후에 freeze
+            if hasattr(backbone, "to"):
+                backbone = backbone.to("cuda")
 
             # sensor encoder만 학습
             for name, p in backbone.named_parameters():
@@ -68,9 +101,24 @@ def get_backbone_with_mode(args):
     else:
         # 기존 pretrained checkpoint 로드 루틴
         backbone = load_pretrained_model(args)
+          # ⚠️ 반드시 device 이동 이후에 freeze
+        if hasattr(backbone, "to"):
+            print("move to cuda")
+            backbone = backbone.to("cuda")
         for p in backbone.parameters():
             p.requires_grad = False
         backbone.eval()
+
+    # ✅ 3️⃣ Gradient 상태 확인 (디버깅용)
+    total_params = sum(1 for _ in backbone.parameters())
+    trainable_params = sum(p.requires_grad for p in backbone.parameters())
+    print(f"[Backbone Grad Check] Trainable parameters: {trainable_params}/{total_params}")
+    if trainable_params:
+        sample_layers = [n for n, p in backbone.named_parameters() if p.requires_grad][:5]
+        print(f"→ Sample trainable layers: {sample_layers}")
+    else:
+        print("✅ All parameters are frozen (no grad flow to backbone).")
+
     return backbone
 
 
@@ -100,13 +148,12 @@ def load_pretrained_model(args, reset_sensor_weights=False):
         raise ValueError(f"Unknown model_name: {args.model_name}")
     
     # 2️⃣ sensor encoder만 weight 초기화 (sensor-only 학습 모드)
-    # if reset_sensor_weights:
-    #     print("⚙️  Resetting sensor encoder weights for supervised fine-tuning")
+    if reset_sensor_weights:
+        print("⚙️  Resetting sensor encoder weights for supervised fine-tuning")
 
-    #     sensor_encoder = model.sensor_model
-    #     for layer in sensor_encoder.modules():
-    #         if hasattr(layer, 'reset_parameters'):
-    #             layer.reset_parameters()
+        for layer in model.modules():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
     return model
 
 
@@ -209,6 +256,7 @@ class LinearProbeLightningModule(pl.LightningModule):
             total_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
             print(f"Total trainable parameters in sensor_encoder: {total_params:,}")
             print(f"→ Sample trainable layers: {trainable[:5]}")
+        
         return logits
 
     def _shared_step(self, batch, batch_idx):
@@ -222,7 +270,31 @@ class LinearProbeLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self._shared_step(batch, batch_idx)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        print("grad: ", loss.requires_grad)
         return loss
+
+    def on_after_backward(self):
+        # 1️⃣ sensor encoder 파라미터 중 grad 있는 개수 카운트
+        try:
+            encoder = (
+                self.model.model.sensor_model
+                if hasattr(self.model, "model") and hasattr(self.model.model, "sensor_model")
+                else self.model.sensor_model
+            )
+
+            grad_exist = []
+            grad_sum = 0.0
+            for name, p in encoder.named_parameters():
+                if p.grad is not None:
+                    grad_exist.append(name)
+                    grad_sum += p.grad.abs().sum().item()
+
+            print(f"[Gradient Flow] params_with_grad={len(grad_exist)}, grad_sum={grad_sum:.6f}")
+            if grad_exist:
+                print("→ sample layers:", grad_exist[:5])
+        except Exception as e:
+            print(f"Error in on_after_backward: {e}")
+
 
     def on_validation_epoch_start(self):
         self.val_preds = []
@@ -330,13 +402,24 @@ class LinearProbeLightningModule(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        # ⭐️ 가장 중요한 부분: Fine-tuning을 위해 옵티마이저를 두 그룹으로 나눕니다. ⭐️
-        # 백본은 작은 learning rate로, 새로 추가된 분류기는 큰 learning rate로 학습합니다.
-        param_groups = [
-            {'params': self.classifier.parameters(), 'lr': self.hparams.lr},
-        ]
-        optimizer = torch.optim.Adam(param_groups)
-        return optimizer
+        groups = [{'params': self.classifier.parameters(), 'lr': self.hparams.lr}]
+
+        # supervision이면 sensor encoder도 함께 학습
+        if getattr(self.hparams, 'supervision', False):
+            enc_params = []
+            for n, p in self.model.named_parameters():
+                # requires_grad=True인 것만 (위에서 필터링 완료)
+                if p.requires_grad:
+                    enc_params.append(p)
+            # 백본은 약간 낮은 LR 권장
+            lr_backbone = getattr(self.hparams, 'lr_backbone', self.hparams.lr * 0.1)
+            groups.append({'params': enc_params, 'lr': lr_backbone})
+
+            if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                print(f"[OPT] classifier lr={self.hparams.lr}, sensor_encoder lr={lr_backbone}, "
+                    f"params={sum(p.numel() for g in groups for p in g['params'])}")
+
+        return torch.optim.Adam(groups)
 
 class LinearProbeLSTM(pl.LightningModule):
     """
@@ -648,8 +731,11 @@ def main(args):
         world_size = dist.get_world_size()
     else:
         world_size = 4  # 초기화되지 않았으면 (즉, 단일 프로세스 실행) 1로 설정
-    sensor_tag = "_supervision" if args.supervision else ""
-    run_name = f"{args.model_name}_{args.dataset_name}_{args.ckpt_name}_{backbone.hparams.batch_size*4}_{backbone.hparams.epochs}_inear_probe_{args.batch_size* world_size}_linearEpoch={args.linear_epochs}{sensor_tag}"
+    if args.sensor_only:
+        run_name = f"{args.sensor_model_name}_{args.dataset_name}_linear_probe_{args.batch_size* world_size}_linearEpoch={args.linear_epochs}"
+    else:
+        sensor_tag = "_supervision" if args.supervision else ""
+        run_name = f"{args.model_name}_{args.dataset_name}_{args.ckpt_name}_{backbone.hparams.batch_size*4}_{backbone.hparams.epochs}_inear_probe_{args.batch_size* world_size}_linearEpoch={args.linear_epochs}{sensor_tag}"
     is_master_process = os.environ.get("LOCAL_RANK", "0") == "0"
     logger = WandbLogger(project="Method_Linear_Probe", name=run_name) if is_master_process else False
     # ckpt_cb = ModelCheckpoint(monitor=monitor, mode='max',
@@ -682,5 +768,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--probe_mode', type=str, default='meanpool', choices=['lstm', 'meanpool'], help="Choose probing strategy: 'lstm' for temporal model or 'meanpool' for simple temporal average pooling")
     parser.add_argument('--supervision', type=bool, default=False, help='If True, skip backbone weight loading and run with frozen hyperparameter configs only')
+    parser.add_argument('--sensor_only', action='store_true', help='Train sensor-only model from scratch (no checkpoint)')
+    parser.add_argument('--sensor_model_name', type=str, default='dlinear', choices=['dlinear', 'timesnet', 'moment', 'mantis', 'imu2clip', 'comodo'])
+
     args = parser.parse_args()
     main(args)

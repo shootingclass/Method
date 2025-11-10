@@ -625,3 +625,95 @@ def cross_modal_retrieval(z_video_np, z_sensor_np):
     print(f"Cross-modal retrieval top-1 acc: {acc:.4f}")
     return acc
 
+
+
+@torch.no_grad()
+def visualize_Wfinal_differences(
+    self, W_final_np, hard_mask, false_mask, motion_same_mask,
+    labels_np, class_names, step_tag, logger=None
+):
+    """🔥 Hard/False/Easy 관계 간 W_final 차이 시각화 통합 함수"""
+
+    # ============= 1️⃣ 데이터프레임 구성 =============
+    N = len(labels_np)
+    mask_upper = np.triu(np.ones((N, N), dtype=bool), k=1)
+    data = []
+    for i in range(N):
+        for j in range(i+1, N):
+            relation = None
+            if hard_mask[i, j]:
+                relation = "Hard"
+            elif false_mask[i, j]:
+                relation = "False"
+            elif motion_same_mask[i, j]:
+                relation = "Easy(o)"
+            else:
+                continue
+            data.append({
+                "anchor_class": class_names[labels_np[i]],
+                "relation": relation,
+                "W_final": W_final_np[i, j],
+            })
+    df = pd.DataFrame(data)
+
+    # ============= 2️⃣ Class-wise violinplot =============
+    plt.figure(figsize=(14, 6))
+    sns.violinplot(x="anchor_class", y="W_final", hue="relation", data=df,
+                   split=True, inner="quartile", palette="Set2", cut=0)
+    plt.xticks(rotation=45, ha="right")
+    plt.title("Per-class W_final Distribution by Relation Type")
+    plt.tight_layout()
+    fig1 = plt.gcf()
+    if logger is not None:
+        logger.experiment.log({f"{step_tag}/classwise_Wfinal_violin": wandb.Image(fig1)})
+    plt.close(fig1)
+
+    # ============= 3️⃣ Global Mean Comparison =============
+    mean_vals = df.groupby("relation")["W_final"].mean().reset_index()
+    plt.figure(figsize=(5, 5))
+    sns.barplot(x="relation", y="W_final", data=mean_vals, palette="Set2")
+    plt.ylabel("Mean W_final")
+    plt.title("Global Mean W_final by Relation Type")
+    fig2 = plt.gcf()
+    if logger is not None:
+        logger.experiment.log({f"{step_tag}/global_Wfinal_means": wandb.Image(fig2)})
+    plt.close(fig2)
+
+    # ============= 4️⃣ Class-wise ΔW_final (False - Hard) =============
+    diff_vals = []
+    for c_idx, cname in enumerate(class_names):
+        class_mask = (labels_np == c_idx)
+        pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
+        hard_vals = W_final_np[hard_mask & pair_mask]
+        false_vals = W_final_np[false_mask & pair_mask]
+        easy_vals = W_final_np[motion_same_mask & pair_mask]
+        if len(hard_vals) == 0 or len(false_vals) == 0:
+            continue
+        diff_vals.append({
+            "class_name": cname,
+            "Δ(False−Hard)": np.mean(false_vals) - np.mean(hard_vals),
+            "Δ(Easy−Hard)": np.mean(easy_vals) - np.mean(hard_vals) if len(easy_vals)>0 else np.nan
+        })
+    df_diff = pd.DataFrame(diff_vals)
+
+    plt.figure(figsize=(8, 3))
+    sns.barplot(x="class_name", y="Δ(False−Hard)", data=df_diff, color="#27ae60")
+    plt.xticks(rotation=45, ha="right")
+    plt.title("Per-class ΔW_final (False - Hard)")
+    plt.ylabel("ΔW_final")
+    plt.tight_layout()
+    fig3 = plt.gcf()
+    if logger is not None:
+        logger.experiment.log({f"{step_tag}/per_class_Wfinal_diff": wandb.Image(fig3)})
+    plt.close(fig3)
+
+    # ============= 5️⃣ Easy까지 포함한 비교 boxplot =============
+    plt.figure(figsize=(10, 5))
+    sns.boxplot(x="relation", y="W_final", data=df, palette="Set3")
+    plt.title("Distribution of W_final by Relation Type (All Classes)")
+    fig4 = plt.gcf()
+    if logger is not None:
+        logger.experiment.log({f"{step_tag}/relation_boxplot": wandb.Image(fig4)})
+    plt.close(fig4)
+
+    print(f"✅ {step_tag}: 4 visualizations (classwise, global mean, Δ per class, boxplot) logged.")

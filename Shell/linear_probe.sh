@@ -32,4 +32,4 @@ echo "comodo 끝"
 # echo "mae 끝 HWU 끝"
 CUDA_VISIBLE_DEVICES=0 python linear_probe.py --batch_size 1 --checkpoint_path /home/jaemo/Method/checkpoints/primus/HWU-USP/last_bs=64_epoch=50.ckpt
 CUDA_VISIBLE_DEVICES=0 python linear_probe.py --batch_size 1 --checkpoint_path /home/jaemo/Method/checkpoints/mae/HWU-USP/last_bs=32_epoch=50.ckpt
-CUDA_VISIBLE_DEVICES=0 python linear_probe.py --batch_size 1 --checkpoint_path /home/jaemo/Method/checkpoints/comodo/Opportunity++/last_bs=84*3_epoch=50.ckpt
+CUDA_VISIBLE_DEVICES=0 python linear_probe.py --batch_size 1 --checkpoint_path /home/jaemo/Method/checkpoints/comodo/HWU-USP/last_bs=84*3_epoch=50.ckpt
