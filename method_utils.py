@@ -99,6 +99,17 @@ def time_warp(x, sigma=0.2, num_knots=4):
 
 def gather(tensor: torch.Tensor) -> torch.Tensor:
     """Gather tensors from all replicas into a single tensor."""
+
+    """
+    Differentiable all_gather version (autograd supported)
+    """
+    from torch.distributed.nn.functional import all_gather
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return tensor
+    tensor = tensor.cuda()
+    gathered = all_gather(tensor)  # ✅ autograd 지원 버전
+    return torch.cat(gathered, dim=0)
     # 현재 분산 그룹의 GPU 개수를 가져옵니다.
     world_size = dist.get_world_size()
     if world_size == 1:

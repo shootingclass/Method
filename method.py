@@ -9,15 +9,15 @@ import wandb
 import matplotlib.pyplot as plt
 import imageio
 import math
-import torch.distributed as dist
 import os
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from method_utils import gather, log_video_recon_grid, log_video_recon_gif, to_vis_motion, CovarianceAlignmentLoss, overlay_motion_heatmap, log_optical_flow_overlay_to_wandb, log_shared_feat_overlay_to_wandb
 import copy
+import torch.distributed as dist
 
 # --- 사용자 정의 모듈 임포트 ---
-from model import SensorEncoder, SensorModel, VisionModel, ClusteringModule
+from model import SensorEncoder, SensorMotionEncoder, SensorModel, VisionModel, ClusteringModule
 
 ####################################################################
 
@@ -59,7 +59,11 @@ class MethodLightningModule(pl.LightningModule):
         self.mutual_information_loss_fn = CovarianceAlignmentLoss()
         self.epoch = 0        
         # =================================================================
-        
+        ## video_model 고정!!!!
+        # for param in self.video_model.parameters():
+            # param.requires_grad = False
+            
+
         self.momentum_video_model = copy.deepcopy(self.video_model)
         for param in self.momentum_video_model.parameters():
             param.requires_grad = False
@@ -69,8 +73,8 @@ class MethodLightningModule(pl.LightningModule):
         # =================================================================
         # [1단계-B] 모멘텀 센서 모션 모델 추가
         # =================================================================
-        self.momentum_sensor_motion_model = copy.deepcopy(self.sensor_motion_encoder)
-        for param in self.momentum_sensor_motion_model.parameters():
+        self.momentum_sensor_model = copy.deepcopy(self.sensor_model)
+        for param in self.momentum_sensor_model.parameters():
             param.requires_grad = False
         
         self.train_video_accs = []  # video classifier accuracy 저장용
@@ -93,8 +97,8 @@ class MethodLightningModule(pl.LightningModule):
             param_k.data = param_k.data * m + param_q.data * (1. - m)
             
         # 2. 센서 모션 모델 파라미터 업데이트
-        for param_q, param_k in zip(self.sensor_motion_encoder.parameters(), 
-                                self.momentum_sensor_motion_model.parameters()):
+        for param_q, param_k in zip(self.sensor_model.parameters(), 
+                                self.momentum_sensor_model.parameters()):
             # param_k = param_k * m + param_q * (1. - m)
             param_k.data = param_k.data * m + param_q.data * (1. - m)
 
@@ -104,12 +108,22 @@ class MethodLightningModule(pl.LightningModule):
         for n, p in self.video_model.named_parameters():
             if any(key in n for key in ["shared_encoder", "scene", "object", "fuse", "appearance", "video_classifier"]):
                 p.requires_grad = False
+        
+        for n, p in self.sensor_model.named_parameters():
+            if any(key in n for key in ["appearance"]):
+                p.requires_grad = False
 
         # 2) 모션 브랜치만 학습
         for n, p in self.video_model.named_parameters():
             if "motion_encoder" in n:
                 p.requires_grad = True
-                print("motion encoder trainable")
+                print("video motion encoder trainable")
+        
+        for n, p in self.sensor_model.named_parameters():
+            if "motion_encoder" in n:
+                p.requires_grad = True
+                print("sensor motion encoder trainable")
+
 
         self.stage2_only = True
         print("\n[🔍 Trainable Parameter Overview]\n")
@@ -131,6 +145,23 @@ class MethodLightningModule(pl.LightningModule):
         print(f"📦 Total params:           {total_trainable + total_frozen:,}")
         print("-" * 90 + "\n")
 
+        total_trainable, total_frozen = 0, 0
+        for name, param in self.sensor_model.named_parameters():
+            status = "✅ TRAINABLE" if param.requires_grad else "🚫 FROZEN"
+            count = param.numel()
+            print(f"{status:12s} | {name:60s} | {count:,} params")
+
+            if param.requires_grad:
+                total_trainable += count
+            else:
+                total_frozen += count
+
+        print("\n" + "-" * 90)
+        print(f"🟢 Total s-trainable params: {total_trainable:,}")
+        print(f"🔴 Total s-frozen params:    {total_frozen:,}")
+        print(f"📦 Total s-params:           {total_trainable + total_frozen:,}")
+        print("-" * 90 + "\n")
+
 
     # 에포크 시작 시 clustering_module 상태 업데이트
     def on_train_epoch_start(self):
@@ -141,7 +172,7 @@ class MethodLightningModule(pl.LightningModule):
             self.clustering_module.init_prototypes_with_data(self.device, self.hparams.num_classes)
             self.stage2_only = False
             if self.hparams.threshold_epoch == -1:
-                ckpt_path = os.path.join(self.hparams.cache_dir, f"clustering_module_stage1_epoch=5.pt")
+                ckpt_path = os.path.join(self.hparams.cache_dir, f"threshold_epoch=5.pt")
                 state = torch.load(ckpt_path, map_location="cpu")
                 self.clustering_module.load_state_dict(state["cluster_model"])
                 self.clustering_module.clustering_manager.feature_bank = state["memory"].to(self.device)
@@ -154,7 +185,22 @@ class MethodLightningModule(pl.LightningModule):
                 print(f"[✔] Loaded pretrained clustering model from {ckpt_path}")
 
             elif self.hparams.threshold_epoch == -2 and self.hparams.video_classifier_epoch == 2:
-                ckpt_path = os.path.join(self.hparams.cache_dir, f"vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch=9_motion2_priority.pt")
+                ckpt_dir = self.hparams.cache_dir
+                ckpt_candidates = [
+                    os.path.join(ckpt_dir, f"vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch=10.pt"),
+                    os.path.join(ckpt_dir, f"vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch=9.pt"),
+                ]
+
+                # ✅ 존재하는 체크포인트 선택
+                ckpt_path = None
+                for path in ckpt_candidates:
+                    if os.path.exists(path):
+                        ckpt_path = path
+                        break
+
+                if ckpt_path is None:
+                    raise FileNotFoundError(f"No valid checkpoint found in {ckpt_dir}")
+
                 print(f"[Classifier Cached Mode] Loading pretrained models from {ckpt_path}")
                 state = torch.load(ckpt_path, map_location="cpu")
                 self.clustering_module.load_state_dict(state["cluster_model"])
@@ -179,12 +225,12 @@ class MethodLightningModule(pl.LightningModule):
                 self.video_model.to(self.device)
 
             # ✅ Stage2-only 모드 (캐시 로드)
-            elif self.hparams.threshold_epoch == 0 and self.hparams.video_classifier_epoch == 0:
+            elif self.hparams.threshold_epoch == 0 and self.hparams.video_classifier_epoch == 0 and self.hparams.bad_correction_epoch == 0:
                 # ✅ 후보 경로 정의
                 ckpt_dir = self.hparams.cache_dir
                 ckpt_candidates = [
-                    os.path.join(ckpt_dir, "vision_model_stage1_epoch=19.pt"),
-                    os.path.join(ckpt_dir, "vision_model_stage1_epoch=15.pt"),
+                    os.path.join(ckpt_dir, "start_stage2_epoch=19.pt"),
+                    os.path.join(ckpt_dir, "start_stage2_epoch=15.pt"),
                 ]
 
                 # ✅ 존재하는 체크포인트 선택
@@ -226,39 +272,40 @@ class MethodLightningModule(pl.LightningModule):
 
 
         else:
-            if self.epoch == self.hparams.threshold_epoch - 1 and self.epoch > 3 and self.global_rank == 0:
-                ckpt_path = os.path.join(self.hparams.cache_dir, f"clustering_module_stage1_epoch={self.hparams.threshold_epoch}.pt")
-                torch.save({
-                    "cluster_model": self.clustering_module.state_dict(),
-                    "memory": self.clustering_module.clustering_manager.feature_bank,
-                    "centroids": self.clustering_module.clustering_manager.centroids,
-                    "label_bank": self.clustering_module.clustering_manager.label_bank,
-                }, ckpt_path)
+            if self.hparams.save_stage_cache:
+                if self.epoch == self.hparams.threshold_epoch - 1 and self.epoch > 3 and self.global_rank == 0:
+                    ckpt_path = os.path.join(self.hparams.cache_dir, f"threshold_epoch={self.hparams.threshold_epoch}.pt")
+                    torch.save({
+                        "cluster_model": self.clustering_module.state_dict(),
+                        "memory": self.clustering_module.clustering_manager.feature_bank,
+                        "centroids": self.clustering_module.clustering_manager.centroids,
+                        "label_bank": self.clustering_module.clustering_manager.label_bank,
+                    }, ckpt_path)
 
-                print(f"[✔] Saved clustering stage-1 weights → {ckpt_path}")
-            
-            elif self.epoch == self.hparams.threshold_epoch + self.hparams.video_classifier_epoch and self.global_rank == 0:
-                classifier_ckpt_path = os.path.join(self.hparams.cache_dir, f"vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch={self.epoch}_motion2_priority.pt")
-                torch.save({
-                    "cluster_model": self.clustering_module.state_dict(),
-                    "memory": self.clustering_module.clustering_manager.feature_bank,
-                    "centroids": self.clustering_module.clustering_manager.centroids,
-                    "label_bank": self.clustering_module.clustering_manager.label_bank,
-                    "vision_model": self.video_model.state_dict()},
-                classifier_ckpt_path)
-                print(f"[✔] Saved VisionModel weights → {classifier_ckpt_path}")
+                    print(f"[✔] Saved clustering stage-1 weights → {ckpt_path}")
+                
+                elif self.epoch == self.hparams.threshold_epoch + self.hparams.video_classifier_epoch and self.global_rank == 0:
+                    classifier_ckpt_path = os.path.join(self.hparams.cache_dir, f"vision_model_classifier_cetroid_threshold={self.hparams.centroid_threshold}_epoch={self.epoch}.pt")
+                    torch.save({
+                        "cluster_model": self.clustering_module.state_dict(),
+                        "memory": self.clustering_module.clustering_manager.feature_bank,
+                        "centroids": self.clustering_module.clustering_manager.centroids,
+                        "label_bank": self.clustering_module.clustering_manager.label_bank,
+                        "vision_model": self.video_model.state_dict()},
+                    classifier_ckpt_path)
+                    print(f"[✔] Saved VisionModel weights → {classifier_ckpt_path}")
 
-            
-            elif self.epoch == self.hparams.threshold_epoch + self.hparams.video_classifier_epoch + self.hparams.bad_correction_epoch:
-                stage1_ckpt_path = os.path.join(self.hparams.cache_dir, f"vision_model_stage1_epoch={self.epoch}_motion2_priority.pt")
-                torch.save({
-                    "cluster_model": self.clustering_module.state_dict(),
-                    "memory": self.clustering_module.clustering_manager.feature_bank,
-                    "centroids": self.clustering_module.clustering_manager.centroids,
-                    "label_bank": self.clustering_module.clustering_manager.label_bank,
-                    "vision_model": self.video_model.state_dict()},
-                stage1_ckpt_path)
-                print(f"[✔] Saved VisionModel weights → {stage1_ckpt_path}")
+                
+                elif self.epoch == self.hparams.threshold_epoch + self.hparams.video_classifier_epoch + self.hparams.bad_correction_epoch:
+                    stage1_ckpt_path = os.path.join(self.hparams.cache_dir, f"start_stage2_epoch={self.epoch}.pt")
+                    torch.save({
+                        "cluster_model": self.clustering_module.state_dict(),
+                        "memory": self.clustering_module.clustering_manager.feature_bank,
+                        "centroids": self.clustering_module.clustering_manager.centroids,
+                        "label_bank": self.clustering_module.clustering_manager.label_bank,
+                        "vision_model": self.video_model.state_dict()},
+                    stage1_ckpt_path)
+                    print(f"[✔] Saved VisionModel weights → {stage1_ckpt_path}")
         self.training_steps_outputs = []  # 에포크 동안의 출력 저장용
 
 
@@ -405,7 +452,7 @@ class MethodLightningModule(pl.LightningModule):
                 video_logits_bad = self.video_classifier(v_appearance[bad_mask])
                 video_probs_bad = F.softmax(video_logits_bad, dim=1)
                 video_max_probs, video_pseudo_bad = torch.max(video_probs_bad, dim=1)
-                high_confidence_mask = video_max_probs >= 0.99
+                high_confidence_mask = video_max_probs >= self.hparams.threshold_classifier_confidence
 
                 # ✅ confidence 기록용 (기존 로직 그대로)
                 if self.global_rank == 0:
@@ -523,15 +570,14 @@ class MethodLightningModule(pl.LightningModule):
         )
         if self.epoch >= stage2_start: 
             v_motion = model_output["v_motion"]
-            self.training_steps_outputs[-1]["v_motion"] = F.normalize(v_motion, dim=1)
+            # print("v motion shape", v_motion.shape)
             v_app = model_output["v_appearance"]
-            self.training_steps_outputs[-1]["v_appearance"] = F.normalize(v_app, dim=1)
+
             
             v_app_norm = F.normalize(v_app.detach(), dim=1)
             features_norm = F.normalize(features.detach(), dim=1)
 
             sensor_motion_emb = self.sensor_model.encoding_motion(sensors)["emb"]
-            self.training_steps_outputs[-1]["s_motion"]=sensor_motion_emb
 
            # -------------------------------------------------------------
             # (align_loss_fn이 CovarianceAlignmentLoss라고 가정)
@@ -548,17 +594,17 @@ class MethodLightningModule(pl.LightningModule):
             # 정규화 (Cosine Similarity 계산용)
             # z_video_online = F.normalize(z_video_online, dim=1)
             # z_sensor_online = F.normalize(z_sensor_online, dim=1)
-            self.training_steps_outputs[-1]["z_video"] = F.normalize(z_video_online)
-            self.training_steps_outputs[-1]["z_sensor"] = F.normalize(z_sensor_online)
+  
 
             # --- 7-B: 모멘텀 특징 (False Negative 감지용) ---
             with torch.no_grad():
                 # (batch에서 videos, sensors를 다시 사용)
                 v_motion_mom = self.momentum_video_model(videos, flows)["v_motion"]
-                sensor_motion_mom = self.momentum_sensor_motion_model(sensors)["emb"]
-                # 정규화
-                v_motion_mom = F.normalize(v_motion_mom, dim=1)
-                sensor_motion_mom = F.normalize(sensor_motion_mom, dim=1)
+                sensor_motion_mom = self.momentum_sensor_model.encoding_motion(sensors)["emb"]
+
+           
+            print("gradient check (Mom/Onl):", sensor_motion_mom.requires_grad, z_sensor_online.requires_grad)
+
             # --- 7-C: DDP All-Gather ---
             # 모든 GPU의 특징과 레이블을 수집 (N = B * num_gpus)
             # gathered_z_video = self.all_gather(z_video_online).reshape(-1, z_video_online.shape[-1])
@@ -567,16 +613,63 @@ class MethodLightningModule(pl.LightningModule):
             # gathered_s_mom = self.all_gather(sensor_motion_mom).reshape(-1, sensor_motion_mom.shape[-1])
             # gathered_v_app = self.all_gather(v_app_norm).reshape(-1, v_app_norm.shape[-1])
             # gathered_features = self.all_gather(features_norm).reshape(-1, features_norm.shape[-1])
-            gathered_z_video = gather(z_video_online)
-            gathered_z_sensor = gather(z_sensor_online)
-            gathered_v_mom = gather(v_motion_mom)
-            gathered_s_mom = gather(sensor_motion_mom)
-            gathered_v_app = gather(v_app_norm)
-            gathered_features = gather(features_norm)
-            # print("requires_grad z_video:", z_video_online.requires_grad)  
-            # print("gathered z gradient", gathered_z_video.requires_grad)
-            N = gathered_z_video.shape[0] # Effective Batch Size
-            # --- 7-D: 가중치 행렬 계산 (W = W_app * W_motion_damp) ---
+            # gathered_z_video = gather(z_video_online)
+            # gathered_z_sensor = gather(z_sensor_online)
+            # gathered_v_mom = gather(v_motion_mom)
+            # gathered_s_mom = gather(sensor_motion_mom)
+            # gathered_v_app = gather(v_app_norm)
+            # gathered_features = gather(features_norm)
+
+            # --- 7-C: DDP All-Gather ---
+            gathered_z_video = F.normalize(gather(z_video_online), dim=1)
+            gathered_z_sensor = F.normalize(gather(z_sensor_online), dim=1)
+            gathered_v_mom = F.normalize(gather(v_motion_mom), dim=1)
+            gathered_s_mom = F.normalize(gather(sensor_motion_mom), dim=1)
+            gathered_v_app = F.normalize(gather(v_app_norm), dim=1)
+            gathered_features = F.normalize(gather(features_norm), dim=1)
+
+            self.training_steps_outputs[-1]["z_video"] = F.normalize((z_video_online), dim=1)
+            self.training_steps_outputs[-1]["z_sensor"] = F.normalize((z_sensor_online), dim=1)
+            self.training_steps_outputs[-1]["v_motion"] = F.normalize((v_motion_mom), dim=1)
+            self.training_steps_outputs[-1]["s_motion"]= F.normalize((sensor_motion_mom), dim=1)
+            self.training_steps_outputs[-1]["v_appearance"] = F.normalize((v_app), dim=1)
+
+            motion_labels = self.clustering_module._remap_pairwise_2(labels)
+            motion_labels_np = gather(motion_labels).cpu().numpy()
+            labels_gathered = gather(labels)
+            labels_np = labels_gathered.cpu().numpy()
+
+
+                        # ============================================================
+            # 2️⃣ raw temporal similarity 계산 (뒤 절반을 temporal feature로 간주)
+            # ============================================================
+            if gathered_z_video.dim() == 2:
+                # [N, D] case
+                D_half = gathered_z_video.size(1) // 2
+                v_temp = gathered_z_video[:, D_half:]       # temporal feature 영역
+                s_temp = gathered_z_sensor[:, D_half:]
+            elif gathered_z_video.dim() == 3:
+                # [N, T, D] case → 시간 절반 사용 후 mean pooling
+                T_half = gathered_z_video.size(1) // 2
+                v_temp = gathered_z_video[:, T_half:, :].mean(dim=1)
+                s_temp = gathered_z_sensor[:, T_half:, :].mean(dim=1)
+            else:
+                raise ValueError("Unexpected shape for z_video/sensor features")
+
+            # ⚠️ 여기서는 정규화하지 않음 (raw similarity)
+            sim_vid_raw = v_temp @ v_temp.T              # [N, N]
+            sim_sen_raw = s_temp @ s_temp.T  
+            sim_z_sen_raw = gathered_z_sensor @ gathered_z_sensor.T
+            sim_z_vid_raw = gathered_z_video @ gathered_z_video.T
+
+
+
+
+
+            # # print("requires_grad z_video:", z_video_online.requires_grad)  
+            # # print("gathered z gradient", gathered_z_video.requires_grad)
+            # N = gathered_z_video.shape[0] # Effective Batch Size
+            # # --- 7-D: 가중치 행렬 계산 (W = W_app * W_motion_damp) ---
             # 1. Appearance 비중 조절 (온건한 re-weighting)
             sim_app_vid = gathered_v_app @ gathered_v_app.T
             sim_app_sen = gathered_features @ gathered_features.T
@@ -584,35 +677,92 @@ class MethodLightningModule(pl.LightningModule):
             sim_app_vid_rel = F.relu(sim_app_vid)
             sim_app_sen_rel = F.relu(sim_app_sen)
             sim_app_max = torch.max(sim_app_vid_rel, sim_app_sen_rel) # [N, N]
-            lambda_easy = getattr(self.hparams, "lambda_easy", 0.2)
+            # sim_app_mean = (sim_app_vid_rel + sim_app_sen_rel)/2 # 빠른 디버깅 위해 mean 사용!!
             # [버그 1 수정] sim_app_avg -> sim_app_max
-            W_app = lambda_easy + (1.0 - lambda_easy) * sim_app_max
+            # W_app = sim_app_mean
+            W_app = sim_app_max
+            # W_app *= self.hparams.lambda_hard
+            
+            spatial_labels_gathered = gather(spatial_labels)
+            spatial_labels_np = spatial_labels_gathered.cpu().numpy()
+            #     # --- 7-D: 가중치 행렬 계산 (W = W_app * W_motion_damp) ---
+
+              # --- 7-D: 가중치 행렬 계산 (W = W_app * W_motion_damp) ---
+            # 1. Appearance 비중 조절 (온건한 re-weighting)
+            sim_app_vid = gathered_v_app @ gathered_v_app.T
+            sim_app_sen = gathered_features @ gathered_features.T
+            # [수정됨] F.relu()를 torch.max() 밖으로 이동하여 음수 유사도를 먼저 처리
+            sim_app_vid_rel = F.relu(sim_app_vid)
+            sim_app_sen_rel = F.relu(sim_app_sen)
+            sim_app_max = torch.max(sim_app_vid_rel, sim_app_sen_rel) # [N, N]
+            # [버그 1 수정] sim_app_avg -> sim_app_max
+            W_app = 1.0 + (3.0 - 1.0) * sim_app_max
             # 2. Motion 감쇠 (FN filtering)
             sim_vid_mom = gathered_v_mom @ gathered_v_mom.T
             sim_sen_mom = gathered_s_mom @ gathered_s_mom.T
+            sim_cross_mom = gathered_v_mom @ gathered_s_mom.T
+
             sim_stable = (sim_vid_mom + sim_sen_mom) / 2.0
-            motion_damp_factor = torch.tanh(F.relu(sim_stable) / self.hparams.motion_damp_temp)
+
+            # 🔹 Global Softmax Normalization (short, symmetric, stable)
+            tau = 0.7
+            sim_exp = torch.exp((sim_app_max*sim_stable - sim_app_max*sim_stable.max()) / tau)
+            sim_stable = sim_exp / (sim_exp.sum() + 1e-6)
+            sim_stable = (sim_stable - sim_stable.min()) / (sim_stable.max() - sim_stable.min() + 1e-6)
+
+            motion_damp_factor = sim_stable
             # [버그 1 수정] sim_app_avg -> sim_app_max
             W_conditional_damp = 1.0 - sim_app_max * motion_damp_factor
             # =====================================================================
             # 3. [안정성 수정] Hard-Switch가 아닌 "Smooth Transition" 적용
             # =====================================================================
             # 1단계 가중치 (W_app만 적용)
-            W_phase1 = W_app
-            # 2단계 가중치 (FN 필터까지 적용)
-            W_phase2 = W_app * W_conditional_damp
-            # Warm-up 스케줄링 (0.0에서 1.0으로 증가)
-            current_progress = max(0, self.epoch - stage2_start)
-            schedule_factor = min(1.0, current_progress / self.hparams.damp_warmup_epochs)
+            
             # [버그 2 수정] schedule_factor를 사용하여 W_phase1에서 W_phase2로 부드럽게 전환
             # schedule_factor = 0.0 -> W_final = W_phase1
             # schedule_factor = 1.0 -> W_final = W_phase2
-            W_final = (1.0 - schedule_factor) * W_phase1 + schedule_factor * W_phase2
+            W_final = W_app * W_conditional_damp
+            N = W_app.shape[0]
             # 4. Self-similarity 마스킹 (기존과 동일)
             identity = torch.eye(N, device=self.device, dtype=torch.bool)
             W_final = W_final.masked_fill(identity, 0.0)
 
-            # W_final = W_app
+            # ===============================================================
+            # ✅ Sanity Check: Idealized Hard / Easy / False Region Mask
+            # ===============================================================
+            N = len(spatial_labels_np)
+            W_ideal = torch.zeros((N, N), device=self.device)
+
+            # mask 정의
+            same_spatial = torch.tensor(spatial_labels_np[:, None] == spatial_labels_np[None, :], device=self.device)
+            same_motion  = torch.tensor(motion_labels_np[:, None]  == motion_labels_np[None, :],  device=self.device)
+
+            # False Negative (같은 공간, 같은 동작)
+            false_mask = same_spatial & same_motion
+            # Hard Negative (같은 공간, 다른 동작)
+            hard_mask  = same_spatial & ~same_motion
+            # Easy Negative (다른 공간)
+            easy_mask  = ~same_spatial & ~same_motion
+            motion_mask = ~same_spatial & same_motion
+            
+
+            # 이상적 weight 할당
+            W_ideal[false_mask] = 0.0
+            W_ideal[hard_mask]  = 1.0
+            W_ideal[easy_mask]  = 0.5
+            W_ideal[motion_mask] = 0.0
+
+            # 자기 자신은 0
+            W_ideal.fill_diagonal_(0.0)
+
+            # 비교용 로깅
+            diff = torch.abs(W_final - W_ideal).mean().item()
+            print(f"[Sanity Check] mean|W_final - ideal| = {diff:.4f}")
+
+            W_final_log = W_final.clone().detach()
+            W_final = W_ideal
+
+
 
             # --- 7-E: InfoNCE 손실 계산 (양방향) ---
             # 1. 유사도 행렬 (Logits)
@@ -650,140 +800,246 @@ class MethodLightningModule(pl.LightningModule):
             custom_contrastive_loss = (loss_v2s + loss_s2v) / 2.0
             # lambda_align = 1.0
             lambda_align = 0.0
-            lambda_contrastive = 1.0
+            lambda_contrastive = 3.0
+            # if self.epoch == 0:
+                # first epoch is to syncronization.
+                # W_final = torch.zeros_like(W_final)
+            
+
             if self.global_rank == 0:
+                W_conditional_damp_cpu = W_conditional_damp.detach().cpu().numpy()
+
+                # --- 이제 shape 맞음 ---
+                same_mask = labels_np[:, None] == labels_np[None, :]
+                diff_mask = labels_np[:, None] != labels_np[None, :]
+
+                same_mean = W_conditional_damp_cpu[same_mask].mean()
+                diff_mean = W_conditional_damp_cpu[diff_mask].mean()
+
+                print(f"[DEBUG] Same-label W_damp mean: {same_mean:.4f} | Diff-label W_damp mean: {diff_mean:.4f}")
+
+
+                sim_vid_mom_cpu = sim_vid_mom.detach().cpu().numpy()
+
+                same_mean_v = sim_vid_mom_cpu[same_mask].mean()
+                diff_mean_v = sim_vid_mom_cpu[diff_mask].mean()
+
+                print(f"[DEBUG] Same-label vid_mom mean: {same_mean_v:.4f} | Diff-label vid_mom mean: {diff_mean_v:.4f}")
+
+
+                sim_sen_mom_cpu = sim_sen_mom.detach().cpu().numpy()
+
+                same_mean_s = sim_sen_mom_cpu[same_mask].mean()
+                diff_mean_s = sim_sen_mom_cpu[diff_mask].mean()
+
+                print(f"[DEBUG] Same-label s_mom mean: {same_mean_s:.4f} | Diff-label s_mom mean: {diff_mean_s:.4f}")
+
+                # --- wandb 시각화 동일 ---
+                sorted_idx = np.argsort(labels_np)
+                W_sorted = W_conditional_damp_cpu[sorted_idx][:, sorted_idx]
+                sorted_labels = labels_np[sorted_idx]
+
+                fig, ax = plt.subplots(figsize=(8, 7))
+                im = ax.imshow(W_sorted, cmap='magma', interpolation='nearest')
+                plt.colorbar(im, ax=ax, label='W_damp value')
+
+                boundaries = np.where(np.diff(sorted_labels) != 0)[0]
+                for b in boundaries:
+                    ax.axhline(b + 0.5, color='white', linewidth=0.8)
+                    ax.axvline(b + 0.5, color='white', linewidth=0.8)
+
+                ax.set_title(f"W_damp heatmap | same={same_mean:.3f}, diff={diff_mean:.3f}")
+                ax.set_xlabel("Samples (sorted by motion label)")
+                ax.set_ylabel("Samples (sorted by motion label)")
+                plt.tight_layout()
+
+                if self.logger is not None:  # rank 0에서만 wandb 업로드
+                    self.logger.experiment.log({
+                        "debug/W_motion_heatmap": wandb.Image(fig),
+                        "debug/W_motion_same_mean": same_mean,
+                        "debug/W_motion_diff_mean": diff_mean
+                    })
+                plt.close(fig)
+
+                # --- 추가: 각 similarity 히스토그램 ---
+                def plot_similarity_hist(mat, name, color_same, color_diff):
+                    same_vals = mat[same_mask].flatten()
+                    diff_vals = mat[diff_mask].flatten()
+                    plt.figure(figsize=(6, 4))
+                    plt.hist(same_vals, bins=50, alpha=0.6, color=color_same, label="same-label")
+                    plt.hist(diff_vals, bins=50, alpha=0.6, color=color_diff, label="diff-label")
+                    plt.title(f"{name} Similarity Dist.\n(same={same_vals.mean():.3f}, diff={diff_vals.mean():.3f})")
+                    plt.xlabel("Similarity"); plt.ylabel("Frequency"); plt.legend(); plt.tight_layout()
+                    if self.logger is not None:
+                        self.logger.experiment.log({f"debug/{name}_hist": wandb.Image(plt)})
+                    plt.close()
+
+                plot_similarity_hist(sim_vid_mom_cpu, "Vid_Motion", "royalblue", "lightcoral")
+                plot_similarity_hist(sim_sen_mom_cpu, "Sen_Motion", "seagreen", "orange")
+                plot_similarity_hist(sim_stable.cpu(), "Stable_Motion", "mediumpurple", "gray")
+
+                print(f"[DEBUG] Logged W_damp heatmap + similarity histograms to wandb")
+
+            if self.global_rank == 0 and (self.global_step % 1) == 0:
                 wandb.log({"train/algin loss": align_loss,
                           "train/contrastive loss": custom_contrastive_loss})
                 # self.log("train/contrastive loss", custom_contrastive_loss)
                 # ✅ Debugging hook
-                self.debug_contrastive_step(
-                    z_video_online,
-                    z_sensor_online,
-                    v_motion,
-                    v_app_norm,
-                    W_final,
-                    logits_v2s,
-                    step_tag="train/contrastive_debug",
-                    model=self.video_model,
-                    global_rank=self.global_rank,
+                class_names= {0: 'Open Door 1',
+                1: 'Open Door 2',
+                2: 'Close Door 1',
+                3: 'Close Door 2',
+                4: 'Open Fridge',
+                5: 'Close Fridge',
+                6: 'Open Dishwasher',
+                7: 'Close Dishwasher',
+                8: 'Open Drawer 1',
+                9: 'Close Drawer 1',
+                10: 'Open Drawer 2',
+                11: 'Close Drawer 2',
+                12: 'Open Drawer 3',
+                13: 'Close Drawer 3'},
+                class_names_list = [
+                    'Open Door 1',
+                    'Open Door 2',
+                    'Close Door 1',
+                    'Close Door 2',
+                    'Open Fridge',
+                    'Close Fridge',
+                    'Open Dishwasher',
+                    'Close Dishwasher',
+                    'Open Drawer 1',
+                    'Close Drawer 1',
+                    'Open Drawer 2',
+                    'Close Drawer 2',
+                    'Open Drawer 3',
+                    'Close Drawer 3'
+                ]
+                # class_names_list = [
+                #     'Ktch_B4_Cupboard',
+                #     'Ktch_Motion_1',
+                #     'Ktch_Motion_2',
+                #     'Ktch_T2_Cupboard',
+                #     'Ktch_T3_Cupboard',
+                #     'None Behavior',
+                # ]
+                try:
+                    self.debug_motion_and_weights_regions_by_composite_class(
+                        W_app, W_conditional_damp, W_final,             # [N, N]
+                        sim_vid_mom, sim_sen_mom, sim_cross_mom, sim_stable, 
+                        motion_damp_factor,  # [N, N]
+                        labels_np,
+                        spatial_labels_np, motion_labels_np,  # [N]
+                        class_names=class_names_list,
+                        sim_vid_raw=sim_vid_raw,
+                        sim_sen_raw=sim_sen_raw,
+                        sim_z_vid_raw=sim_z_vid_raw,
+                        sim_z_sen_raw=sim_z_sen_raw,
+                        step_tag="debug/W_and_MotionSim_regions",
+                        logger=self.logger,
+                    )
+                except Exception as e:
+                    print("debug motion pass", e)
+
+                try:
+                    self.debug_contrastive_by_label(
+                        logits_v2s=logits_v2s.detach(),
+                        logits_s2v=logits_s2v.detach(),
+                        W_final=W_final.detach(),
+                        labels=spatial_labels_gathered,  # or motion_labels
+                        temp=self.hparams.contrastive_temp,
+                        step_tag="train/contrastive_label_debug",
+                        logger=self.logger,
+                    )
+                except:
+                    print("debug contrastive pass")
+
+                try:
+                    self.debug_motion_similarity_matrix(
+                        sim_vid_mom=sim_vid_mom,
+                        sim_sen_mom=sim_sen_mom,
+                        motion_labels_np=labels_np,
+                        step_tag="debug/W_motion_classwise",
+                        logger=self.logger,
+                    )
+                except:
+                    print("debug motion sim pass")
+
+
+                self.visualize_classwise_motion_similarity(
+                    sim_vid_mom=sim_vid_mom,                # [N, D]
+                    sim_sen_mom=sim_sen_mom,                # [N, D]
+                    motion_labels=labels_gathered,      # [N]
+                    class_names=class_names,
+                    logger=self.logger
                 )
 
+
+            # cos_reg = F.mse_loss(v_norm @ v_norm.T, v_mom_norm @ v_mom_norm.T.detach())
             # --- 7-F: 최종 손실 결합 ---
             final_loss = (
-                lambda_align * align_loss +
+                # lambda_align * align_loss +
                 lambda_contrastive * custom_contrastive_loss
             )
             # -------------------------------------------------------------
             # 6) 종료
             # -------------------------------------------------------------
+        def log_grad(module, name="sensor_motion_encoder"):
+            total_grad = 0.0
+            count = 0
+            for p in module.parameters():
+                if p.grad is not None:
+                    total_grad += p.grad.detach().abs().mean().item()
+                    count += 1
+            if count == 0:
+                print(f"[{name}] ⚠️ no grad found")
+                return 0.0
+            mean_grad = total_grad / count
+            print(f"[{name}] mean abs grad = {mean_grad:.6f}")
+            return mean_grad
+
+        # training_step 끝부분 직전에
+        if self.global_step % 3 == 0:  # 로그 주기 조절 가능
+            g_sensor_motion = log_grad(self.sensor_motion_encoder, "sensor_motion_encoder")
+            self.log("debug/grad/sensor_motion_encoder", g_sensor_motion)
+            print("sensor motion emb grad", sensor_motion_emb.requires_grad)
+
+            for name, p in self.sensor_motion_encoder.named_parameters():
+                if p.grad is not None:
+                    print(name, p.grad.abs().mean().item())
+                else:
+                    print(name, "⚠️ no grad")
+
+            import seaborn as sns
+            if self.logger is not None:
+                fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+
+                sns.heatmap(W_ideal.cpu(), cmap="coolwarm", ax=ax[0], vmin=0, vmax=1)
+                sns.heatmap(W_final_log.detach().cpu(), cmap="coolwarm", ax=ax[1], vmin=0, vmax=1)
+
+                ax[0].set_title("Ideal W")
+                ax[1].set_title("Computed W_final")
+
+                plt.tight_layout()
+                self.logger.experiment.log({"Sanity_W_Matrix": wandb.Image(fig)})
+                plt.close(fig)
+
+
+
             
-
-        if (self.global_step % 10) == 0 and self.global_rank == 0:
+        if (self.global_step % 400) == 0 and self.global_rank == 0:
             try:
-                pass
-                # log_shared_feat_overlay_to_wandb(
-                #     videos[0].unsqueeze(0),
-                #     self.video_model.shared_encoder,
-                #     label=labels[0]
-                # )
-            except Exception as e:
-                print(f"[viz] skip due to error: {e}")
-
-        if (self.global_step % 200) == 0 and self.global_rank == 0:
-            try:
-                try:
-                    log_optical_flow_overlay_to_wandb(
-                        video=videos[0].unsqueeze(0),      # [1, 20, 3, 224, 224]
-                        flows=flows[0].unsqueeze(0),       # [1, 20, 2, 224, 224]
-                        wandb_key="Flow_Overlay/S1_ADL1",
-                        stride=8,
-                        scale=6,
-                        fps=10
-                    )
-                except Exception as e:
-                    print("skip: fail to logging optical flow", e)
-                log_video_recon_gif(
-                    videos,
-                    videos-videos.mean(dim=1, keepdim=True),
-                    logger=self.logger,
-                    step=self.global_step,
-                    max_n=2,
-                    fps=4
-                )
-                log_video_recon_gif(
-                    videos,
-                    videos-videos.mean(dim=2, keepdim=True),
-                    logger=self.logger,
-                    step=self.global_step,
-                    max_n=2,
-                    fps=4,
-                    title="dim=2 video"
-                ),
-                log_video_recon_gif(
-                    videos,
-                    model_output["vis_v"],
-                    logger=self.logger,
-                    step=self.global_step,
-                    max_n=2,
-                    fps=4,
-                    title="no light"
-                )
-                # log_video_recon_gif(
-                #     video_target_ds,
-                #     model_output["fused_motion"],
-                #     logger=self.logger,
-                #     step=self.global_step,
-                #     max_n=2,
-                #     fps=4,
-                #     title="motion_rec"
-                # )
-                temporal_diff_recon = to_vis_motion(temporal_diff_recon)
-                temporal_diff_target = to_vis_motion(temporal_diff_target)
-                log_video_recon_gif(
-                    temporal_diff_target,
-                    temporal_diff_recon,
-                    logger=self.logger,
-                    step=self.global_step,
-                    max_n=2,
-                    fps=4,
-                    title="temporal_diff"
-                )
-                print("motion start")
-
-
-                # vis_motion = normalize_for_viz(motion_residual)
-                # print("vis_motion shape", vis_motion.shape)
-                # log_video_recon_gif(
-                #     video_target_ds,
-                #     motion_residual,
-                #     logger=self.logger,
-                #     step=self.global_step,
-                #     max_n=2,
-                #     fps=4,
-                #     title="motion_residual"
-                # )
-                # log_video_recon_gif(
-                #     video_target_ds,
-                #     # motion_residual,
-                #     vis_motion,
-                #     logger=self.logger,
-                #     step=self.global_step,
-                #     max_n=2,
-                #     fps=4,
-                #     title="motion_residual_norm"
-                # )
-                log_video_recon_gif(
-                    model_output['residual_motion'],
-                    model_output['upsized_fused_app'],
-                    logger=self.logger,
-                    step=self.global_step,
-                    max_n=2,
-                    fps=4,
-                    title="residual answer / appearance upsized"
+                log_optical_flow_overlay_to_wandb(
+                    video=videos[0].unsqueeze(0),      # [1, 20, 3, 224, 224]
+                    flows=flows[0].unsqueeze(0),       # [1, 20, 2, 224, 224]
+                    wandb_key="Flow_Overlay/S1_ADL1",
+                    stride=8,
+                    scale=6,
+                    fps=10
                 )
             except Exception as e:
-                print(f"[viz] skip gif log: {e}")
-
+                print("skip [vis] ", e)
+        print("final_loss!! ", final_loss)
         return final_loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -802,6 +1058,25 @@ class MethodLightningModule(pl.LightningModule):
     def on_train_epoch_end(self):    
             # 에포크가 끝난 후 epoch 업데이트
         self.eval()  
+      # 1️⃣ rank 0이 아닌 프로세스는 먼저 대기 (pre-save barrier)
+        if dist.is_initialized() and self.global_rank != 0:
+            print(f"[rank{self.global_rank}] waiting before save")
+            dist.barrier()
+
+        # 2️⃣ rank 0만 체크포인트 저장
+        if self.global_rank == 0:
+            save_path = f"/home/jaemo/Method/checkpoints/method/HWU-USP/manual_epochs/manual_epoch_{self.epoch}.ckpt"
+            self.trainer.save_checkpoint(save_path)
+            print(f"[rank0] checkpoint saved: {save_path}")
+            # finally:
+            #     # ✅ rank 0이 저장 끝나면 barrier로 나머지 깨워줌
+            #     if dist.is_initialized():
+            #         dist.barrier()
+
+        # 3️⃣ 나머지 rank도 barrier 통과 후 진행
+        if dist.is_initialized() and self.global_rank != 0:
+            print(f"[rank{self.global_rank}] resume after rank0 save")
+            
         outputs = self.training_steps_outputs
         print(f"{self.global_rank} Epoch {self.epoch} - Collected {len(outputs)} training step outputs.")
         self.epoch += 1
@@ -814,7 +1089,7 @@ class MethodLightningModule(pl.LightningModule):
             if self.epoch % self.clustering_module.deal_with_small_clusters_interval == 0:
                 self.clustering_module.clustering_manager.deal_with_small_clusters()
 
-        if self.epoch % 1 == 0:
+        if self.epoch % 2 == 0:
             print(f"\nEpoch {self.epoch}: Running ODC evaluation on training data...")
             self.clustering_module.evaluate(outputs)
         
@@ -912,77 +1187,313 @@ class MethodLightningModule(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
         return optimizer
-
-    def debug_contrastive_step(
+   
+    @torch.no_grad()
+    def debug_motion_and_weights_regions_by_composite_class(
         self,
-        z_video_online,
-        z_sensor_online,
-        v_motion,
-        v_app,
-        W_final,
-        logits_v2s,
-        step_tag="train/contrastive_debug",
-        model=None,
-        global_rank=0,
+        W_app, W_damp, W_final,             # [N, N]
+        sim_vid_mom, sim_sen_mom, sim_cross_mom, # [N, N]
+        sim_stable, motion_damp_factor,      # [N, N]
+        labels_np, spatial_labels_np, motion_labels_np,  # [N], [N], [N]
+        class_names,  # 총 14개 라벨 이름 (예: ["Door1-Open", "Door1-Close", ...])
+        sim_vid_raw=None,
+        sim_sen_raw=None,
+        sim_z_vid_raw=None,
+        sim_z_sen_raw=None,
+        step_tag="debug/W_and_MotionSim_byCompositeClass",
+        logger=None,
     ):
         """
-        Contrastive 학습 중간 단계의 sanity check.
-        - embedding scale
-        - similarity matrix
-        - logits 분포
-        - 가중치 행렬
-        - grad flow (motion encoder)
+        🎯 Class-wise symmetric region analysis based on (spatial, motion) decomposition.
+        - labels_np: 전체 클래스 (예: 14개)
+        - spatial_labels_np: 7개 공간적 클래스
+        - motion_labels_np: 2개 동작 클래스
+        """
+
+        # ===============================================================
+        # 1️⃣ 기본 세팅
+        # ===============================================================
+        W_app_np   = W_app.detach().cpu().numpy()
+        W_damp_np  = W_damp.detach().cpu().numpy()
+        W_final_np = W_final.detach().cpu().numpy()
+        motion_damp_np = motion_damp_factor.detach().cpu().numpy()
+        sim_vid_np = sim_vid_mom.detach().cpu().numpy()
+        sim_sen_np = sim_sen_mom.detach().cpu().numpy()
+        sim_cross_np = sim_cross_mom.detach().cpu().numpy()
+        sim_stb_np = sim_stable.detach().cpu().numpy()
+        sim_vid_raw_np = sim_vid_raw.detach().cpu().numpy() if sim_vid_raw is not None else None  # ✅ (2)
+        sim_sen_raw_np = sim_sen_raw.detach().cpu().numpy() if sim_sen_raw is not None else None  # ✅ (2)
+        sim_z_vid_raw_np = sim_z_vid_raw.detach().cpu().numpy() if sim_z_vid_raw is not None else None  # ✅ (2)
+        sim_z_sen_raw_np = sim_z_sen_raw.detach().cpu().numpy() if sim_z_sen_raw is not None else None  # ✅ (2)
+
+        N = W_app_np.shape[0]
+        num_classes = len(class_names)
+
+        mask_upper = np.triu(np.ones((N, N), dtype=bool), k=1)
+
+        # ===============================================================
+        # 2️⃣ Pair 관계 정의
+        # ===============================================================
+        same_spatial = (spatial_labels_np[:, None] == spatial_labels_np[None, :])
+        same_motion  = (motion_labels_np[:, None]  == motion_labels_np[None, :])
+
+        hard_mask   = (same_spatial & ~same_motion) & mask_upper
+        false_mask  = (same_spatial & same_motion) & mask_upper
+        motion_same_mask = (~same_spatial &  same_motion) & mask_upper  # ✅ 다른 spatial, 같은 motion
+        motion_diff_mask = (~same_spatial & ~same_motion) & mask_upper  # ✅
+
+
+        # ===============================================================
+        # 3️⃣ 통계 헬퍼
+        # ===============================================================
+        def compute_stats(vals):
+            if vals.size == 0:
+                return {k: np.nan for k in ["mean", "median", "min", "max", "q1", "q3", "count"]}
+            return {
+                "mean": np.mean(vals),
+                "median": np.median(vals),
+                "min": np.min(vals),
+                "max": np.max(vals),
+                "q1": np.quantile(vals, 0.25),
+                "q3": np.quantile(vals, 0.75),
+                "count": vals.size,
+            }
+
+        def compute_all_stats(mat, mask):
+            out = {
+                "W_app": compute_stats(W_app_np[mask]),
+                "W_damp": compute_stats(W_damp_np[mask]),
+                "W_final": compute_stats(W_final_np[mask]),
+                "Stable": compute_stats(sim_stb_np[mask]),
+                "Vid_mom": compute_stats(sim_vid_np[mask]),
+                "Sen_mom": compute_stats(sim_sen_np[mask]),
+                "Cross_Sim": compute_stats(sim_cross_np[mask]),
+                "MotDamp": compute_stats(motion_damp_np[mask]),
+            }
+            if sim_vid_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+                out["Vid_mom_raw"] = compute_stats(sim_vid_raw_np[mask])
+            if sim_sen_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+                out["Sen_mom_raw"] = compute_stats(sim_sen_raw_np[mask])
+            if sim_z_vid_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+                out["Z_vid_mom_raw"] = compute_stats(sim_z_vid_raw_np[mask])
+            if sim_z_sen_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+                out["Z_sen_mom_raw"] = compute_stats(sim_z_sen_raw_np[mask])
+            return out
+
+        # ===============================================================
+        # 4️⃣ Class-wise 통계 계산
+        # ===============================================================
+        print(f"\n[{step_tag}] Composite-class (spatial×motion) region stats\n")
+        print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Sen_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
+        #print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Vid_mom_raw':<6} | {'Sen_mom_raw':<6} | {'Z_vid_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
+        print("-" * 195)
+
+        wandb_data = {}
+
+        for class_idx, class_name in enumerate(class_names):
+            # 현재 클래스 샘플 인덱스
+            class_mask = (labels_np == class_idx)
+            if not np.any(class_mask):
+                continue
+
+            # 이 클래스의 샘플들이 포함된 페어
+            class_pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
+
+            # Hard/False 교집합
+            hard_pairs = hard_mask & class_pair_mask
+            false_pairs = false_mask & class_pair_mask
+            # print("mean and median")
+            # print("q1 and q3")
+
+            region_dict = {
+                "Hard": hard_mask & class_pair_mask,
+                "False": false_mask & class_pair_mask,
+                "Easy(o)": motion_same_mask & class_pair_mask,
+                "Easy(x)": motion_diff_mask & class_pair_mask,
+            }
+
+            for region_name, region_mask in region_dict.items():
+                stats = compute_all_stats(W_app_np, region_mask)
+                count = stats["W_app"]["count"]
+                if count == 0:
+                    continue
+
+                print(f"{class_name:<20} | {region_name:<6} | {count:<6} | "
+                  f"{stats['W_app']['mean']:<6.2f} | "
+                  f"{stats['W_damp']['mean']:<6.2f} | "
+                  f"{stats['W_final']['mean']:<6.2f} | "
+                  f"{stats['Stable']['mean']:<6.2f} | "
+                #   f"{stats['Vid_mom']['mean']:<6.2f} | "
+                  f"{stats['Sen_mom']['mean']:<6.2f} | "
+                #   f"{(stats['Vid_mom_raw']['mean'] if 'Vid_mom_raw' in stats else np.nan):<15.2f} | "
+                  f"{(stats['Sen_mom_raw']['mean'] if 'Sen_mom_raw' in stats else np.nan):<15.2f} | "
+                #   f"{(stats['Z_vid_mom_raw']['mean'] if 'Z_vid_mom_raw' in stats else np.nan):<15.2f} | "
+                  f"{(stats['Z_sen_mom_raw']['mean'] if 'Z_sen_mom_raw' in stats else np.nan):<15.2f} | "
+                  f"{stats['Cross_Sim']['mean']:<6.2f}")
+
+            print("--------------------------")
+        
+        print(f"\n[{step_tag}] Composite-class (spatial×motion) region stats\n")
+        print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<13} | {'W_dmp':<13} | {'W_fin':<13} | {'Stbl':<1e} | {'Vid':<10} | {'Sen':<10} | {'Sen_mom_raw':<6} | {'Cros':<6}")
+        #print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Vid_mom_raw':<6} | {'Sen_mom_raw':<6} | {'Z_vid_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
+        print("-" * 195)
+
+        for class_idx, class_name in enumerate(class_names):
+            # 현재 클래스 샘플 인덱스
+            class_mask = (labels_np == class_idx)
+            if not np.any(class_mask):
+                continue
+
+            # 이 클래스의 샘플들이 포함된 페어
+            class_pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
+
+            # Hard/False 교집합
+            hard_pairs = hard_mask & class_pair_mask
+            false_pairs = false_mask & class_pair_mask
+            # print("mean and median")
+            # print("q1 and q3")
+
+            for region_name, region_mask in region_dict.items():
+                stats = compute_all_stats(W_app_np, region_mask)
+                count = stats["W_app"]["count"]
+                if count == 0:
+                    continue    # 바로 밑줄에 Q1~Q3 표시 추가
+
+                print(f"{class_name:<20} | {region_name:<6} | {count:<6}  | "
+                    f"{stats['W_app']['q1']:<6.2f}/{stats['W_app']['q3']:<6.2f} | "
+                    f"{stats['W_damp']['q1']:<6.2f}/{stats['W_damp']['q3']:<6.2f} | "
+                    f"{stats['W_final']['q1']:<6.2f}/{stats['W_final']['q3']:<6.2f} | "
+                    f"{stats['Stable']['q1']:<6.2f}/{stats['Stable']['q3']:<6.2f} | "
+                    f"{stats['Vid_mom']['q1']:<6.2f}/{stats['Vid_mom']['q3']:<6.2f} | "
+                    f"{stats['Sen_mom']['q1']:<6.2f}/{stats['Sen_mom']['q3']:<6.2f} | "
+                    # f"{(stats['Vid_mom_raw']['q1'] if 'Vid_mom_raw' in stats else np.nan):<15.2f} | "
+                    # f"{(stats['Sen_mom_raw']['q1'] if 1'Sen_mom_raw' in stats else np.nan):<15.2f} | "
+                    # f"{(stats['Z_vid_mom_raw']['q1'] if 'Z_vid_mom_raw' in stats else np.nan):<15.2f} | "
+                    # f"{(stats['Z_sen_mom_raw']['q1'] if 'Z_sen_mom_raw' in stats else np.nan):<15.2f} | "
+                    f"{stats['Cross_Sim']['q1']:<6.2f}/{stats['Cross_Sim']['q3']:<6.2f}")
+
+                # wandb 로깅용
+                for key, s in stats.items():
+                    for stat_key in ["mean", "median", "count"]:
+                        wandb_data[f"{step_tag}/{class_name}/{region_name}/{key}_{stat_key}"] = s[stat_key]
+            print("----------------")
+
+        # ===============================================================
+        # 5️⃣ WandB 로그 업로드
+        # ===============================================================
+        if logger is not None and len(wandb_data) > 0:
+            logger.experiment.log(wandb_data)
+
+        print(f"\n✅ [{step_tag}] composite class-based symmetric region stats computed.")
+
+
+    @torch.no_grad()
+    def visualize_classwise_motion_similarity(
+        self,
+        sim_vid_mom, sim_sen_mom,  # [N, N] Pre-computed similarity matrices
+        motion_labels,             # [N]
+        class_names=None,
+        logger=None
+    ):
+        """
+        현재 batch (또는 전체 데이터)에서 등장한 클래스 n개에 대해:
+        - (i, j): 클래스 i와 j의 평균 cosine similarity
+        - i==j 인 경우 자기 자신 제외 (intra-class mean)
+        - 입력으로 이미 계산된 N*N 유사도 행렬을 받아서 효율적으로 처리
         """
         import torch
-        import torch.nn.functional as F
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import seaborn as sns
         import wandb
 
-        if global_rank != 0:
-            return
+        # ---------------------------------------------------------------------
+        #  PREPARE LABELS
+        # ---------------------------------------------------------------------
+        labels_np = motion_labels.detach().cpu().numpy()
+        unique_labels = np.unique(labels_np)
+        num_classes = len(unique_labels)
+        
+        # 클래스 이름 매핑 (없으면 숫자 그대로 사용)
+        if class_names:
+            # class_names가 dict인 경우와 list인 경우 모두 처리
+            if isinstance(class_names, dict):
+                 class_names_used = [class_names.get(i, str(i)) for i in unique_labels]
+            else:
+                 class_names_used = [class_names[i] if i < len(class_names) else str(i) for i in unique_labels]
+        else:
+            class_names_used = [str(i) for i in unique_labels]
 
-        # 1️⃣ Embedding 통계
-        stats = {
-            "z_video_mean": z_video_online.mean().item(),
-            "z_video_std": z_video_online.std().item(),
-            "z_sensor_mean": z_sensor_online.mean().item(),
-            "z_sensor_std": z_sensor_online.std().item(),
-            "v_motion_std": v_motion.std().item(),
-            "v_app_std": v_app.std().item(),
-        }
+        # ---------------------------------------------------------------------
+        #  CLASSWISE SIMILARITY COMPUTATION (Optimized)
+        # ---------------------------------------------------------------------
+        def compute_classwise_from_sim_matrix(sim_matrix_tensor, labels_np, unique_labels):
+            n = len(unique_labels)
+            class_sim_matrix = np.zeros((n, n))
+            
+            # 텐서를 CPU numpy로 변환 (인덱싱 편의를 위해)
+            sim_np = sim_matrix_tensor.detach().cpu().numpy()
 
-        # 2️⃣ Similarity 구조
-        sim_v2s = z_video_online @ z_sensor_online.T
-        stats.update({
-            "sim_diag_mean": sim_v2s.diag().mean().item(),
-            "sim_offdiag_mean": (sim_v2s.sum() - sim_v2s.diag().sum()) / (sim_v2s.numel() - len(sim_v2s)),
-        })
+            for i, ci in enumerate(unique_labels):
+                idx_i = np.where(labels_np == ci)[0]
+                if len(idx_i) == 0: continue
 
-        # 3️⃣ Logit 분포
-        stats.update({
-            "logits_mean": logits_v2s.mean().item(),
-            "logits_std": logits_v2s.std().item(),
-        })
+                for j, cj in enumerate(unique_labels):
+                    idx_j = np.where(labels_np == cj)[0]
+                    if len(idx_j) == 0: continue
 
-        # 4️⃣ W_final 영향
-        stats.update({
-            "W_final_min": W_final.min().item(),
-            "W_final_max": W_final.max().item(),
-            "W_final_mean": W_final.mean().item(),
-            "W_final_var": W_final.var().item()
-        })
+                    # ✅ 이미 계산된 유사도 행렬에서 해당 클래스 쌍의 부분 행렬 추출
+                    # sim_np[idx_i][:, idx_j] -> [Ni, Nj] 형태의 부분 행렬
+                    # (ixgrid를 사용하여 효율적으로 추출)
+                    sub_sim = sim_np[np.ix_(idx_i, idx_j)]
 
-        # 5️⃣ Positive cosine similarity
-        pos_sim = F.cosine_similarity(z_video_online, z_sensor_online, dim=1)
-        stats["pos_sim_mean"] = pos_sim.mean().item()
+                    if ci == cj:
+                        # 🔹 Intra-class: 자기 자신과의 비교(대각선 성분) 제외
+                        if len(idx_i) > 1:
+                            # 대각선 마스크 생성 (Ni x Ni)
+                            mask = ~np.eye(len(idx_i), dtype=bool)
+                            class_sim_matrix[i, j] = sub_sim[mask].mean()
+                        else:
+                            # 샘플이 1개뿐이면 자기 자신과의 유사도(1.0)를 제외할 수 없음 -> NaN 또는 1.0 처리
+                            # 여기서는 의미상 NaN이 맞으나, 편의상 1.0으로 둘 수도 있음. (보통 이런 경우는 드묾)
+                            class_sim_matrix[i, j] = np.nan 
+                    else:
+                        # 🔹 Inter-class: 모든 쌍의 평균
+                        class_sim_matrix[i, j] = sub_sim.mean()
 
-        # 6️⃣ Motion encoder grad flow
-        if model is not None:
-            grad_list = []
-            for n, p in model.named_parameters():
-                if "motion_encoder" in n and p.grad is not None:
-                    grad_list.append(p.grad.abs().mean().item())
-            stats["grad_motion_mean"] = sum(grad_list) / len(grad_list) if grad_list else 0.0
+            return class_sim_matrix
 
-        wandb.log({f"{step_tag}/{k}": v for k, v in stats.items()})
-        print(f"🧩 Contrastive Debug @ {step_tag} | " + " | ".join([f"{k}: {v:.3f}" for k, v in stats.items()]))
+        # ✅ Compute using pre-calculated similarity matrices
+        sim_v_class = compute_classwise_from_sim_matrix(sim_vid_mom, labels_np, unique_labels)
+        sim_s_class = compute_classwise_from_sim_matrix(sim_sen_mom, labels_np, unique_labels)
 
+        # ---------------------------------------------------------------------
+        #  PLOT HEATMAP
+        # ---------------------------------------------------------------------
+        def plot_heatmap(mat, title, modality):
+            # NaN 값이 있을 경우 처리 (예: 0으로 대체하거나 마스킹)
+            mat_safe = np.nan_to_num(mat, nan=0.0)
+            
+            fig, ax = plt.subplots(figsize=(10, 8)) # 크기 약간 키움
+            sns.heatmap(mat_safe, cmap="magma", vmin=0, vmax=1,
+                        xticklabels=class_names_used, yticklabels=class_names_used,
+                        ax=ax, annot=True, fmt=".2f", square=True, # 정사각형 모양 유지
+                        cbar_kws={"shrink": 0.8}) # 컬러바 크기 조절
+            ax.set_title(title, fontsize=14, pad=20)
+            ax.set_xlabel("Class j", fontsize=12)
+            ax.set_ylabel("Class i", fontsize=12)
+            plt.xticks(rotation=45, ha="right") # X축 라벨 회전
+            plt.yticks(rotation=0)
+            plt.tight_layout()
+
+            if logger:
+                logger.experiment.log({f"debug/classwise_sim/{modality}": wandb.Image(fig)})
+            plt.close(fig)
+
+        plot_heatmap(sim_v_class, "Class-wise Motion Similarity (Video)", "video")
+        plot_heatmap(sim_s_class, "Class-wise Motion Similarity (Sensor)", "sensor")
+
+        # ---------------------------------------------------------------------
+        #  CONSOLE SUMMARY (Optional, too large matrices might clutter console)
+        # ---------------------------------------------------------------------
+        # print(f"[Video Motion] classwise similarity matrix:\n{np.array2string(sim_v_class, precision=2, suppress_small=True)}")

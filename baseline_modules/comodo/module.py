@@ -34,7 +34,7 @@ class COMODOLightningModule(BasePretrainModule):
         )
 
         # --- 2. Loss 함수 정의 ---
-        if instance_queue_encoded:
+        if instance_queue_encoded is not None:
             self.comodo_loss = COMODOLoss(
                 instanceQ_encoded=instance_queue_encoded.cpu(), # device는 trainer가 관리
                 student_model=self.sensor_model,

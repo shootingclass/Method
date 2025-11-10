@@ -191,7 +191,7 @@ class PRIMUSLightningModule(BasePretrainModule):
         x_video = videos
         y_video = torch.zeros((len(x_sensor), 512), dtype=torch.float32).to(self.device)
         for i in range(len(batch)):
-            videos, sensors, labels, sample_ids = batch
+            videos, sensors, labels, sample_ids, _ = batch
             idx, sample_id = sample_ids
             folder_name = sample_id[i].split('_')[0]  # "S3-ADL1"
             cache_path = os.path.join(self.hparams.baseline_video_cache_dir, folder_name, sample_id[i] + '.pt')

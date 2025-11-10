@@ -8,10 +8,12 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import seed_everything
 import wandb
+import torch.distributed as dist
 
 # --- 사용자 정의 모듈 임포트 ---
 from datamodule import MethodDataModule
 from method import MethodLightningModule
+
 
 ####################################################################
 
@@ -35,6 +37,7 @@ def set_model(args, datamodule):
         args.sensor_seq_len = 128
         args.min_cluster_size = 100
         args.mid_label = False
+        args.threshold_classifier_confidence = 0.90
     elif args.dataset_name == "HWU-USP":
         args.num_sensors = 6
         args.num_classes = 7
@@ -42,16 +45,19 @@ def set_model(args, datamodule):
         args.sensor_seq_len = 128
         args.min_cluster_size = 30
         args.mid_label = True
+        args.threshold_classifier_confidence = 0.99
 
     args.baseline_video_cache_dir = f"./video_caches/{args.model_name}/{args.dataset_name}"
     args.seed = 42
     if args.model_name == "method":
+        args.embedding_dim //= 2 # each encoder has half of total embedding_dim
         return MethodLightningModule(args, datamodule)
     elif args.model_name == "comodo":
         from baseline_modules.comodo import initialize_comodo
         args.video_ckpt = "facebook/timesformer-base-finetuned-k400"
         args.imu_ckpt = "paris-noah/Mantis-8M"
         args.mlp_hidden_dim = 2048
+        args.mlp_output_dim = 128
         args.embedding_dim = 128
         args.queue_size_ratio = 0.1
         args.reduction = "concat" # "mean", "concat"
@@ -99,6 +105,45 @@ class DatasetEpochCallback(pl.Callback):
         if hasattr(trainer.datamodule.train_dataset, 'set_epoch'):
             trainer.datamodule.train_dataset.set_epoch(trainer.current_epoch)
 
+# -------------------------------------------
+# 특정 epoch마다 수동 checkpoint 저장 콜백
+# -------------------------------------------
+class SaveSpecificEpochCallback(pl.Callback):
+    def __init__(self, save_epochs, bs, save_dir="./checkpoints/custom_saves"):
+        super().__init__()
+        self.save_epochs = set(save_epochs)
+        self.save_dir = save_dir
+        self.bs = bs
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        ws = getattr(trainer, "world_size", 1)
+        strategy = getattr(trainer, "strategy", None) or getattr(trainer, "_strategy", None)
+
+        # --- pre-sync (optional, 대부분 생략 가능)
+        if strategy is not None and hasattr(strategy, "barrier"):
+            try:
+                strategy.barrier("pre-save sync")
+            except Exception as e:
+                print(f"[rank{trainer.global_rank}] pre-save barrier skip: {e}")
+
+        # --- checkpoint 저장
+        if epoch in self.save_epochs and trainer.is_global_zero:
+            save_path = os.path.join(
+                self.save_dir,
+                f"bs={self.bs * ws}_epoch={epoch}.ckpt"
+            )
+            print(f"[rank0] start saving -> {save_path}")
+            trainer.save_checkpoint(save_path)
+            print(f"✅ [rank0] saved: {save_path}")
+
+        if trainer.global_rank != 0 or trainer.global_rank != "0":
+            print("end print")
+            strategy.barrier("post-save sync")
+
+        print(f"[rank{trainer.global_rank}] epoch {epoch} callback done")
+
 
 ####################################################################
 
@@ -142,12 +187,18 @@ def main(args):
             wandb.log({"dashboard/attn_correlation": panel})
             
     # 4. 콜백 리스트 생성
+    save_epochs = [1, 3, 5, 10, 20, 30, 40, 50]
+    custom_save_callback = SaveSpecificEpochCallback(
+        save_epochs,
+        bs=args.batch_size,
+        save_dir=f"./checkpoints/{args.model_name}/{args.dataset_name}/manual_epochs"
+    )
     if args.model_name != "methodd":
         checkpoint_callback = ModelCheckpoint(
             dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
             # filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
             save_top_k=1,            # 가장 좋은 모델 1개만 저장
-            # monitor="train/contrastive loss",      # val_loss를 기준으로 성능을 판단
+            monitor="train/contrastive_loss",      # val_loss를 기준으로 성능을 판단
             mode="min",              # val_loss는 낮을수록 좋으므로 'min' 모드
             save_last=True,
         )
@@ -190,6 +241,7 @@ if __name__ == '__main__':
     parser.add_argument("--model_name", type=str, default="method")
     parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
     parser.add_argument("--project_name", type=str, default="Method_Test_Lightning", help="WandB project name")
+    parser.add_argument("--save_stage_cache", type=bool, default=False, help="Whether use stage cache")
 
     # 학습 인자    
     parser.add_argument("--epochs", type=int, default=50)
@@ -197,7 +249,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_frames", type=int, default=20)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--embedding_dim", type=int, default=256)
+    parser.add_argument("--embedding_dim", type=int, default=512) # Total
     parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
@@ -205,7 +257,7 @@ if __name__ == '__main__':
     parser.add_argument("--bad_correction_epoch", type=int, default=10)
 
     parser.add_argument("--momentum_m", type=float, default=0.999)
-    parser.add_argument("--lambda_hard", type=float, default=2.0)
+    parser.add_argument("--lambda_hard", type=float, default=3.0)
     parser.add_argument("--motion_damp_temp", type=float, default=0.1)
     parser.add_argument("--contrastive_temp", type=float, default=0.07)
 

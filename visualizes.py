@@ -520,3 +520,108 @@ def visualize_sensor_name(top_indices, labels, id, dataset_name="Opportunity++")
                 index_val = index_tensor.item()
                 sensor_name = get_sensor_name(index_val + START_INDEX + 1)
                 print(f"  - Index: {index_val}, Name: {sensor_name}, {ACTION_MERGE_LABELS[label.item()]}")
+
+
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
+import wandb
+
+def visualize_joint_space(
+    z_video_np, 
+    z_sensor_np, 
+    labels, 
+    title="Joint Z-space", 
+    max_samples=2000, 
+    log_to_wandb=True
+):
+    # 1️⃣ 샘플 제한
+    n = min(len(z_video_np), max_samples)
+    idx = np.random.choice(len(z_video_np), n, replace=False)
+    z_video_np = z_video_np[idx]
+    z_sensor_np = z_sensor_np[idx]
+    labels = labels[idx]
+
+    # 2️⃣ 결합
+    all_embs = np.concatenate([z_video_np, z_sensor_np], axis=0)
+    all_labels = np.concatenate([labels, labels], axis=0)
+    modalities = np.array([0]*len(z_video_np) + [1]*len(z_sensor_np))
+
+    # 3️⃣ 2D t-SNE
+    tsne_2d = TSNE(n_components=2, perplexity=30, init="random", learning_rate="auto")
+    emb_2d = tsne_2d.fit_transform(all_embs)
+
+    plt.figure(figsize=(8, 6))
+    scatter_v = plt.scatter(
+        emb_2d[modalities==0, 0], emb_2d[modalities==0, 1],
+        c=all_labels[modalities==0], cmap="tab10", s=25, alpha=0.7, label="Video"
+    )
+    scatter_s = plt.scatter(
+        emb_2d[modalities==1, 0], emb_2d[modalities==1, 1],
+        c=all_labels[modalities==1], cmap="tab10", s=25, marker="x", alpha=0.7, label="Sensor"
+    )
+    plt.legend()
+    plt.title(f"{title} (2D)")
+    plt.tight_layout()
+    plt.show()
+
+    if log_to_wandb:
+        wandb.log({f"{title}_2D": wandb.Image(plt)})
+    plt.close()
+
+    # 4️⃣ 3D t-SNE
+    tsne_3d = TSNE(n_components=3, perplexity=30, init="random", learning_rate="auto")
+    emb_3d = tsne_3d.fit_transform(all_embs)
+
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection='3d')
+
+    p1 = ax.scatter(
+        emb_3d[modalities==0,0], emb_3d[modalities==0,1], emb_3d[modalities==0,2],
+        c=all_labels[modalities==0], cmap="tab10", s=30, alpha=0.7, label="Video"
+    )
+    p2 = ax.scatter(
+        emb_3d[modalities==1,0], emb_3d[modalities==1,1], emb_3d[modalities==1,2],
+        c=all_labels[modalities==1], cmap="tab10", s=30, marker="x", alpha=0.7, label="Sensor"
+    )
+    ax.set_title(f"{title} (3D)")
+    ax.legend()
+
+    plt.tight_layout()
+    if log_to_wandb:
+        wandb.log({f"{title}_3D": wandb.Image(fig)})
+    plt.show()
+    plt.close(fig)
+
+    return emb_2d, emb_3d
+
+import numpy as np
+
+def compute_alignment_score(z_video_np, z_sensor_np, labels_np):
+    unique_labels = np.unique(labels_np)
+    dists = []
+    for lab in unique_labels:
+        v_center = z_video_np[labels_np==lab].mean(axis=0)
+        s_center = z_sensor_np[labels_np==lab].mean(axis=0)
+        dist = np.linalg.norm(v_center - s_center)
+        dists.append(dist)
+    mean_dist = np.mean(dists)
+    print(f"Alignment Score (lower is better): {mean_dist:.4f}")
+    return mean_dist
+
+import torch
+import torch.nn.functional as F
+
+def cross_modal_retrieval(z_video_np, z_sensor_np):
+    v = F.normalize(torch.tensor(z_video_np), dim=1)
+    s = F.normalize(torch.tensor(z_sensor_np), dim=1)
+    sim = v @ s.T
+    top1 = sim.argmax(dim=1).cpu().numpy()
+    acc = np.mean(np.arange(len(v)) == top1)
+    print(f"Cross-modal retrieval top-1 acc: {acc:.4f}")
+    return acc
+

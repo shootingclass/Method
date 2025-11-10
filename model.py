@@ -15,7 +15,7 @@ import torchvision
 import cv2
 from PIL import Image, ImageDraw
 
-from visualizes import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX, visualize_cropped_tensor, denormalize, compute_hungarian_matching
+from visualizes import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX, visualize_cropped_tensor, denormalize, compute_hungarian_matching, visualize_joint_space, compute_alignment_score, cross_modal_retrieval
 from tqdm import tqdm
 from method_utils import gather, time_warp, log_optical_flow_overlay_to_wandb
 
@@ -44,7 +44,7 @@ from method_utils import gather, time_warp, log_optical_flow_overlay_to_wandb
 #         return x * (1 + 0.5 * w), attention
 
 
-# class SensorModel(nn.Module):
+# class SensorMotionEncoder(nn.Module):
 #     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
 #         super().__init__()
 #         # 개별 레이어 정의
@@ -132,6 +132,109 @@ from method_utils import gather, time_warp, log_optical_flow_overlay_to_wandb
 #         mmcl_out = self.mmcl_head(emb)
 #         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 #         return out
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# # -----------------------------------------------------------
+# # 🧩 Temporal Attention Layer
+# # -----------------------------------------------------------
+class TemporalAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.scale = dim ** -0.5
+
+    def forward(self, x):  # [B, L, D]
+        q, k, v = self.query(x), self.key(x), self.value(x)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        out = attn @ v
+        return out.mean(dim=1)  # temporal weighted average
+
+
+# -----------------------------------------------------------
+# 🧱 Dilated Temporal Block
+# -----------------------------------------------------------
+class TemporalBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, pool=True):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=(kernel_size // 2) * dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool1d(2) if pool else nn.Identity()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        return x
+
+
+# -----------------------------------------------------------
+# 🚀 SensorMotionEncoder (drop-in replacement for SensorEncoder)
+# -----------------------------------------------------------
+class SensorMotionEncoder(nn.Module):
+    def __init__(self, sensor_channels, size_embeddings=128, base_dim=32):
+        super().__init__()
+
+        # 1️⃣ Multi-scale dilated convolutions (temporal receptive field 확대)
+        self.block1 = TemporalBlock(sensor_channels, base_dim, kernel_size=5, dilation=1)
+        self.block2 = TemporalBlock(base_dim, base_dim * 2, kernel_size=3, dilation=2)
+        self.block3 = TemporalBlock(base_dim * 2, base_dim * 4, kernel_size=3, dilation=4, pool=False)
+
+        self.norm = nn.GroupNorm(8, base_dim * 4)
+
+        # 2️⃣ GRU + Attention 조합
+        self.gru = nn.GRU(
+            input_size=base_dim * 4,
+            hidden_size=size_embeddings,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.temporal_attn = TemporalAttention(size_embeddings * 2)
+
+        # 3️⃣ Projection heads
+        self.proj = nn.Linear(size_embeddings * 2, size_embeddings)
+        self.ssl_head = nn.Linear(size_embeddings, size_embeddings)
+        self.mmcl_head = nn.Linear(size_embeddings, size_embeddings)
+
+    def forward(self, batch):
+        """
+        batch: [B, C, L]  (sensor sequence)
+        return: {"emb": motion embedding, "ssl": ssl_out, "mmcl": mmcl_out}
+        """
+        # Conv feature extraction
+        x = self.block1(batch)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.norm(x)                # [B, C, L]
+        x = x.permute(0, 2, 1)          # [B, L, C]
+        self.gru.flatten_parameters()
+        # Temporal modeling
+        out, _ = self.gru(x)
+        attn_out = self.temporal_attn(out)   # [B, D]
+        emb = self.proj(attn_out)            # [B, embedding_dim]
+
+        # Heads
+        ssl_out = self.ssl_head(emb)
+        mmcl_out = self.mmcl_head(emb)
+
+        return {"emb": emb, "ssl": ssl_out, "mmcl": mmcl_out}
+
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, pool_type="max", embedding_size=32):
@@ -226,14 +329,16 @@ class SensorModel(nn.Module):
     def forward(self, batch):
         # z_sensor embedding
         _, features, _ = self.clustering_module(batch, return_features = True)
-        sensor_motion_emb = self.sensor_motion_encoder(batch)["emb"]
+        sensor_motion_emb = self.encoding_motion(batch)["emb"]
         s_app_norm = F.normalize(features, dim=1)
         s_mot_norm = F.normalize(sensor_motion_emb, dim=1)
         # features는 그래디언트 차단
-        z_sensor_online = torch.cat((s_app_norm.detach(), s_mot_norm), dim=1)
+        with torch.no_grad():
+            s_app_norm = F.normalize(features, dim=1)
+        z_sensor_online = torch.cat((s_app_norm, s_mot_norm), dim=1)
         # z_sensor_online = torch.cat((features.detach(), sensor_motion_emb), dim=1)
 
-        z_sensor_online = F.normalize(z_sensor_online, dim=1) * (z_sensor_online.shape[1] ** 0.5 * 0.2)
+        # z_sensor_online = F.normalize(z_sensor_online, dim=1) * (z_sensor_online.shape[1] ** 0.5 * 0.2)
         # z_sensor_online = self.norm(z_sensor_online)
         return z_sensor_online
 
@@ -245,7 +350,11 @@ class SensorModel(nn.Module):
     
     def encoding_motion(self, batch):
         # motion embedding
-        return self.sensor_motion_encoder(batch)
+        mot_emb = self.sensor_motion_encoder(batch)
+        # for emb_type, emb in mot_emb.items():
+        #     mot_emb[emb_type] = (emb - emb.mean(dim=0, keepdim=True)) / (emb.std(dim=0, keepdim=True) + 1e-6)
+        return mot_emb
+
 
 
 #################################################################
@@ -468,83 +577,81 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 class MotionEncoder(nn.Module):
     """
-    Temporal difference + optical flow 기반 Motion Encoder.
-    flows=None일 경우 optical flow 없이 video difference만 사용.
+    Motion Encoder with cosine-consistent projection.
+    강조점:
+      - CosineProj: norm-invariant projection layer
+      - optional cosine regularization for self-consistency
     """
-    def __init__(self, in_channels=5, base_dim=32, latent_dim=256):
+    def __init__(self, in_channels=5, base_dim=32, latent_dim=256, use_cosine_proj=True):
         super().__init__()
         self.in_channels = in_channels
         self.latent_dim = latent_dim
 
+        # 3D backbone (temporal gradient feature)
         self.backbone = nn.Sequential(
             nn.Conv3d(in_channels, base_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
             nn.BatchNorm3d(base_dim),
             nn.ReLU(inplace=True),
-
             nn.Conv3d(base_dim, base_dim * 2, kernel_size=3, stride=(1, 2, 2), padding=1),
             nn.BatchNorm3d(base_dim * 2),
             nn.ReLU(inplace=True),
-
             nn.Conv3d(base_dim * 2, latent_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
             nn.BatchNorm3d(latent_dim),
             nn.ReLU(inplace=True),
         )
 
         self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
-        self.proj = nn.Linear(latent_dim, latent_dim)
+
+        # ✅ projection head 변경
+        if use_cosine_proj:
+            self.proj = CosineProj(latent_dim, latent_dim)
+        else:
+            self.proj = nn.Linear(latent_dim, latent_dim)
 
     def forward(self, videos, flows=None):
-        """
-        Args:
-            videos: [B, T, 3, H, W]
-            flows : [B, T, 2, H, W] or None
-        Returns:
-            v_motion: [B, latent_dim]
-        """
         B, T, _, H, W = videos.shape
 
-        # ✅ 비디오 temporal difference 계산
-        video_diff = videos[:, 1:] - videos[:, :-1]  # [B, T-1, 3, H, W]
+        video_diff = videos[:, 1:] - videos[:, :-1]
 
-        # ✅ optical flow optional 처리
         if isinstance(flows, torch.Tensor):
-            # flow 길이 맞춤
             if flows.shape[1] > video_diff.shape[1]:
                 flows = flows[:, : video_diff.shape[1]]
             elif flows.shape[1] < video_diff.shape[1]:
-                pad = flows[:, -1:, :, :, :]
-                flows = torch.cat([flows, pad], dim=1)
-
-            # ✅ concat along channel → [B, T-1, 5, H, W]
+                flows = torch.cat([flows, flows[:, -1:, :, :, :]], dim=1)
             x = torch.cat([video_diff, flows], dim=2)
         else:
-            # ✅ flow가 없으면 video_diff만 사용 → channel=3으로 맞춤
-            x = video_diff
-            # 3D conv 입력 채널수를 runtime에 맞추기 위해 padding
-            # (flow 없는 경우라도 backbone은 in_channels=5이므로 2채널 zero-pad)
             pad = torch.zeros(B, T - 1, 2, H, W, device=videos.device, dtype=videos.dtype)
-            x = torch.cat([x, pad], dim=2)
+            x = torch.cat([video_diff, pad], dim=2)
 
-        # ✅ channel-first 변환
-        x = x.permute(0, 2, 1, 3, 4)  # [B, C=5, T-1, H, W]
+        x = x.permute(0, 2, 1, 3, 4)
+        feat = self.backbone(x)
+        feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)
 
-        # ✅ feature 추출
-        feat = self.backbone(x)  # [B, D, T', H', W']
-        feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)  # [B, D, T']
-
-        # ✅ temporal difference (2차 차분)
         if feat.shape[2] > 1:
             motion_diff = feat[:, :, 1:] - feat[:, :, :-1]
             v_motion = motion_diff.mean(dim=2)
         else:
             v_motion = feat.mean(dim=2)
 
-        # ✅ projection
+        # projection
         v_motion = self.proj(v_motion)
         return v_motion
+
+
+# --- Cosine Projection Layer ---
+class CosineProj(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x):
+        w = F.normalize(self.weight, dim=1)
+        x = F.normalize(x, dim=1)
+        return F.linear(x, w)
+
 
 
 
@@ -687,14 +794,17 @@ class VisionModel(nn.Module):
         video_centered = video_centered / (video_centered.std(dim=[3, 4], keepdim=True) + 1e-6)
         preprocessed_videos = video_centered - video.mean(dim=1, keepdim=True)
         v_motion = self.motion_encoder(videos = video, flows=flows)
+        # v_motion = (v_motion - v_motion.mean(dim=0, keepdim=True)) / (v_motion.std(dim=0, keepdim=True) + 1e-6)
 
         # detach appearance for z_video_online
         v_app_norm = F.normalize(v_appearance, dim=1)
         v_mot_norm = F.normalize(v_motion, dim=1)
-        z_video_online = torch.cat([v_app_norm.detach()/5, v_mot_norm*5], dim=1) # motion var 균형을 위해 스케일링 반영
+        with torch.no_grad():
+            v_app_norm = v_app_norm.detach()
+        z_video_online = torch.cat([v_app_norm, v_mot_norm], dim=1) # motion var 균형을 위해 스케일링 반영
         # z_video_online = torch.cat([v_app_norm.detach()*0.5, v_mot_norm*1.5], dim=1)
         # z_video_online = self.norm(z_video_online)
-        z_video_online = F.normalize(z_video_online, dim=1) * (z_video_online.shape[1] ** 0.5 * 0.2)
+        # z_video_online = F.normalize(z_video_online, dim=1) * (z_video_online.shape[1] ** 0.5 * 0.2)
 
         # Forward
         # z_video_online = self.fusion(v_appearance.detach(), v_motion)
@@ -836,7 +946,7 @@ class ClusteringManager(nn.Module):
         change_ratio = (newlabel != self.label_bank[idx]
                         ).sum().float().cuda() / float(newlabel.shape[0])
         self.label_bank[idx] = newlabel.cuda().clone()  # all gpu have the same label_bank
-        print("update_samples_memory", change_ratio)
+        # print("update_samples_memory", change_ratio)
         return change_ratio
 
     @torch.no_grad()
@@ -986,7 +1096,7 @@ class ClusteringManager(nn.Module):
         histogram = np.bincount(
             self.label_bank.cpu().numpy(), minlength=self.num_clusters)
         cluster_size = torch.tensor(histogram, device=self.centroids.device)
-        print("Cluster sizes:", cluster_size)
+        # print("Cluster sizes:", cluster_size)
         normalized_sizes = cluster_size + 1e-8
 
         # ----------------------------------------
@@ -1021,14 +1131,13 @@ class ClusteringManager(nn.Module):
                         "q75": q75,
                     }
                 else:
-                    assert False
                     cluster_stats[k] = {
                         "size": 0,
-                        "mean": None,
-                        "std": None,
-                        "q25": None,
-                        "q50": None,
-                        "q75": None,
+                        "mean": -1,
+                        "std": -1,
+                        "q25": -1,
+                        "q50": -1,
+                        "q75": -1,
                     }
 
             # ✅ 기록용으로 저장
@@ -1639,6 +1748,16 @@ class ClusteringModule(nn.Module):
                 self.visualize_embedding(z_video_np, all_labels, title="Z_Video")
             except Exception as e:
                 print(f"Error during z video t-SNE visualization: {e}")  
+            try:
+                visualize_joint_space(z_video_np, z_sensor_np, all_labels, title="Z_video vs Z_sensor (Joint t-SNE)")
+                wandb.log({"joint_z_tsne": wandb.Image(plt)})
+                score = compute_alignment_score(z_video_np, z_sensor_np, all_labels)
+                wandb.log({"alignment_score": score})
+                cross_acc = cross_modal_retrieval(z_video_np, z_sensor_np)
+                wandb.log({"cross_modal_retrieval": cross_acc})
+            except Exception as e:
+                print("Joint visualization error:", e)
+
               
 
         self.train()

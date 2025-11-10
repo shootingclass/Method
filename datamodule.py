@@ -41,52 +41,59 @@ class MethodDataModule(pl.LightningDataModule):
             mean=mean,
             std=std
         )
+        self.stage = stage
     
     def set_dataset_params(self, args, stage):
         if args.dataset_name == "Opportunity++":
             self.data_root = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-            # self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/actionOnlyObject"
-            self.json_path = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action"
+            self.json_path = os.path.join(self.data_root, "action")
             self.stats_file_path = "/mnt/hdd4tb/junho/Opportunity++/sensor_stats/sensor_stats_37.npy"
-            self.start_index = 194
-            self.end_index = 230
-            self.cache_dir = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/caches"
+            self.start_index, self.end_index = 194, 230
+            embedding_dim = args.embedding_dim if hasattr(args, "embedding_dim") else None
+            if embedding_dim is not None and embedding_dim != 512:
+                self.cache_dir = os.path.join(self.data_root, f"{embedding_dim}\caches")
+            else:
+                self.cache_dir = os.path.join(self.data_root, "caches")
+
         elif args.dataset_name == "HWU-USP":
             self.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
-            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/splits_with_trashes"
-            self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_priority" # without trashes
-            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_almost_priority" # without trashes
-            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2"
-            # self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/merging_motion_sensors"
-            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_6_with_trashes.npy" # 다시 만들기
-            self.start_index = 4
-            self.end_index = 9
+            self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_priority_test=18"
+            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_6_with_trashes.npy"
+            self.start_index, self.end_index = 4, 9
             self.cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/caches"
+
         else:
             raise ValueError(f"Invalid dataset name: {args.dataset_name}")
-        
-        # --- stage에 따른 JSON 경로 분기 설정 ---
+
+        # ============================================================
+        # ✅ Stage별 JSON 분기
+        # ============================================================
         if stage == 'pretrain':
             print("INFO: DataModule configured for PRE-TRAINING stage.")
-            self.json_train_path = os.path.join(self.json_path, "pretrain_cropped_with_flow.json")
             self.json_train_path = os.path.join(self.json_path, "pretrain.json")
-            # Pre-training 시 val/test가 필요 없다면 None으로 설정하거나 train과 동일하게 설정
-            self.json_val_path = os.path.join(self.json_path, "pretrain_cropped_with_flow.json") if args.model_name == "method" else None
-            # self.json_val_path = os.path.join(self.json_path, "pretrain.json") if args.model_name == "method" else None
-            # Evaluate 용 data를 pretrain data와 동일하게 설정 (leak 방지)
+            self.json_val_path = (
+                os.path.join(self.json_path, "pretrain.json") if args.model_name == "method" else None
+            )
             self.json_test_path = None
-        
+
         elif stage == 'linear_probe':
-            print("INFO: DataModule configured for LINEAR PROBING stage.")
+            print("INFO: DataModule configured for LINEAR PROBE stage.")
             self.json_train_path = os.path.join(self.json_path, "linear_train.json")
             self.json_val_path = os.path.join(self.json_path, "linear_val.json")
             self.json_test_path = os.path.join(self.json_path, "linear_test.json")
-        
-        else:
-            raise ValueError(f"Invalid stage: {stage}. Choose 'pretrain' or 'linear_probe'.")
 
-    # 이 메서드는 단일 프로세스에서만 실행됩니다.
-    # 파일 다운로드나 데이터 전처리 등 한 번만 수행해야 할 작업을 여기에 둡니다.
+        elif stage == 'linear_probe_lstm':
+            print("INFO: DataModule configured for LINEAR PROBE LSTM stage.")
+            self.json_train_path = os.path.join(self.json_path, "linear_probe_train.json")
+            self.json_val_path = os.path.join(self.json_path, "linear_probe_val.json")
+            self.json_test_path = os.path.join(self.json_path, "linear_probe_test.json")
+
+        else:
+            raise ValueError(f"Invalid stage: {stage}. Choose 'pretrain', 'linear_probe', or 'linear_probe_lstm'.")
+
+    # ============================================================
+    # ✅ prepare_data: mean/std 계산 (최초 1회)
+    # ============================================================
     def prepare_data(self):
         if not os.path.exists(self.stats_file_path):
             print(f"Statistics file not found. Calculating for the first time...")
@@ -105,13 +112,19 @@ class MethodDataModule(pl.LightningDataModule):
             stats = calculate_sensor_stats(temp_dataset)
             save_stats(stats, self.stats_file_path)
 
-    # 이 메서드는 모든 GPU에서 각각 실행됩니다.
-    # 데이터셋을 여기서 정의합니다.
+    # ============================================================
+    # ✅ setup: Dataset 로드 (Stage별 분기)
+    # ============================================================
     def setup(self, stage=None):
         stats = load_stats(self.stats_file_path)
-        sensor_preprocessor = SensorTransform(target_len=128, mean=stats['mean'], std=stats['std'])
+        sensor_preprocessor = SensorTransform(
+            target_len=128, mean=stats["mean"], std=stats["std"]
+        )
 
-        if stage == 'fit' or stage is None:
+        # -------------------------------
+        # ① 기존 pretrain / linear_probe
+        # -------------------------------
+        if self.stage in ["pretrain", "linear_probe"]:
             self.train_dataset = VideoSensorDataset(
                 json_path=self.json_train_path,
                 data_root=self.data_root,
@@ -121,10 +134,11 @@ class MethodDataModule(pl.LightningDataModule):
                 threshold_epoch=self.threshold_epoch,
                 start_index=self.start_index,
                 end_index=self.end_index,
-                cache_dir=self.cache_dir
+                cache_dir=self.cache_dir,
             )
             print(f"Train dataset size: {len(self.train_dataset)}")
-            if self.json_val_path: # val 경로가 있을 때만 생성
+
+            if self.json_val_path:
                 self.val_dataset = VideoSensorDataset(
                     json_path=self.json_val_path,
                     data_root=self.data_root,
@@ -134,11 +148,10 @@ class MethodDataModule(pl.LightningDataModule):
                     threshold_epoch=self.threshold_epoch,
                     start_index=self.start_index,
                     end_index=self.end_index,
-                    cache_dir=self.cache_dir
+                    cache_dir=self.cache_dir,
                 )
-        
-        if stage == 'test' or stage is None:
-            if self.json_test_path: # test 경로가 있을 때만 생성
+
+            if self.json_test_path:
                 self.test_dataset = VideoSensorDataset(
                     json_path=self.json_test_path,
                     data_root=self.data_root,
@@ -148,10 +161,53 @@ class MethodDataModule(pl.LightningDataModule):
                     threshold_epoch=self.threshold_epoch,
                     start_index=self.start_index,
                     end_index=self.end_index,
-                    cache_dir=self.cache_dir
+                    cache_dir=self.cache_dir,
                 )
+                
+
+        # -------------------------------
+        # ② LSTM용 시퀀스 데이터셋
+        # -------------------------------
+        elif self.stage == "linear_probe_lstm":
+            print("Loading SequenceDataset for Linear Probe LSTM ...")
+            from dataset_lstm import SequenceDataset, collate_variable_length
+
+            shared_class_to_idx = {}
+            self.train_dataset = SequenceDataset(
+                json_path=self.json_train_path,
+                data_root=self.data_root,
+                class_to_idx=shared_class_to_idx,
+                sensor_transform=sensor_preprocessor,
+            )
+            self.val_dataset = SequenceDataset(
+                json_path=self.json_test_path,
+                data_root=self.data_root,
+                class_to_idx=shared_class_to_idx,
+                sensor_transform=sensor_preprocessor,
+            )
+            self.test_dataset = SequenceDataset(
+                json_path=self.json_test_path,
+                data_root=self.data_root,
+                class_to_idx=shared_class_to_idx,
+                sensor_transform=sensor_preprocessor,
+            )
+
+            self.collate_fn = collate_variable_length
+
+        else:
+            raise ValueError(f"Invalid stage: {self.stage}")
 
     def train_dataloader(self):
+        if self.stage == "linear_probe_lstm":
+            return DataLoader(
+                dataset=self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=self.collate_fn,  # ✅ variable-length batch
+            )
         return DataLoader(
             dataset=self.train_dataset,
             batch_size=self.batch_size,
@@ -160,24 +216,49 @@ class MethodDataModule(pl.LightningDataModule):
             pin_memory=True,
             drop_last=True,
         )
+
     def val_dataloader(self):
+        if self.stage == "linear_probe_lstm":
+            return DataLoader(
+                dataset=self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=self.collate_fn,  # ✅ 추가
+            )
         return DataLoader(
             dataset=self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
             drop_last=False,
         )
+    
     def test_dataloader(self):
+        """테스트용 DataLoader 반환"""
+        if self.stage == "linear_probe_lstm":
+            return DataLoader(
+                dataset=self.test_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=self.collate_fn,  # ✅ 추가
+            )
         return DataLoader(
             dataset=self.test_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
             drop_last=False,
         )
+    
+
 
     # VideoSensorDataset의 set_epoch를 호출하기 위한 콜백
     def on_before_train_epoch(self, epoch):

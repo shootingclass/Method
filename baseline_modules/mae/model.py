@@ -470,7 +470,8 @@ class CAVMAE(nn.Module):
         # pos_embed_s_resized = self.interpolate_pos_encoding(s_patches, self.pos_embed_s, self.patch_embed_s)
         # s = s_patches + pos_embed_s_resized + self.modality_s
         # 또는 초기화 시 패딩된 크기 기준으로 만들었다면 바로 더하기
-        s = s_patches + self.pos_embed_s + self.modality_s 
+        s = s_patches + self.pos_embed_s
+        s += self.modality_s 
 
         # 3. 센서 전용 블록 통과
         for blk in self.blocks_s:

@@ -72,7 +72,7 @@ def initialize_comodo(args, datamodule):
                 # 3. 현재 샘플이 큐에 필요한지 확인
                 if idx in idxs_in_queue:
                     # __getitem__ 반환 순서 및 video_id 추출 방식 확인 필요
-                    frames_tensor, _, _, item_ids = batch 
+                    frames_tensor, _, _, item_ids, _ = batch 
                     try:
                         original_idx, video_id = item_ids # (idx, video_id) 튜플 가정
                     except ValueError:
