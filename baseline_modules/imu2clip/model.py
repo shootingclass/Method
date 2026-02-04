@@ -449,7 +449,7 @@ class ClipPLModel(pl.LightningModule):
             mid_frame_index = int(video.shape[2] / 2)
             frame = video[:, :, mid_frame_index, :, :]
             video_features = self.get_img_embeddings(frame)
-
+            print("get only one frame")
         elif self.video_encoder_name == "clip_avg_frames":
             # For speed purposes, we just use 3 frames
             start_frame_index = 0

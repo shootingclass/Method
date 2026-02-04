@@ -285,6 +285,94 @@ class Block(torch.nn.Module):
 #         mmcl_out = self.mmcl_head(emb)
 #         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 #         return out
+import torch
+import torch.nn as nn
+import math
+
+# -----------------------------------------------------------
+# 🛠️ Transformer용 Positional Encoding (Sinusoidal)
+# -----------------------------------------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0) # [1, max_len, d_model]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [B, L, D]
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+# -----------------------------------------------------------
+# 🚀 Improved SensorTransformerEncoder
+# -----------------------------------------------------------
+class SensorTransformerEncoder(nn.Module):
+    def __init__(self, sensor_channels, size_embeddings=128, base_dim=32, 
+                 num_layers=2, num_heads=4, dropout=0.1):
+        super().__init__()
+
+        # 1️⃣ CNN Backbone: GRU 모델과 '완전히 동일하게' 맞춤
+        # (Block 클래스 대신 TemporalBlock 사용)
+        self.block1 = TemporalBlock(sensor_channels, base_dim, kernel_size=5, dilation=1)
+        self.block2 = TemporalBlock(base_dim, base_dim * 2, kernel_size=3, dilation=2)
+        # 중요: 여기서 pool=False로 설정하여 시퀀스 길이를 보존하거나, 
+        # GRU 모델과 똑같이 맞춥니다. (GRU 모델은 block3에서 pool=False였음)
+        self.block3 = TemporalBlock(base_dim * 2, base_dim * 4, kernel_size=3, dilation=4, pool=False)
+
+        self.norm = nn.GroupNorm(8, base_dim * 4)
+        
+        feature_dim = base_dim * 4  # 128
+
+        # 2️⃣ Positional Encoding & Transformer
+        # 학습 가능한 PE 대신 Sinusoidal 사용 추천 (데이터 적을 때 유리)
+        self.pos_encoder = PositionalEncoding(feature_dim, dropout=dropout)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feature_dim,
+            nhead=num_heads,
+            dim_feedforward=feature_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True # Pre-LN이 학습 안정성이 더 높음
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 3️⃣ Projection heads
+        self.ssl_head = nn.Linear(feature_dim, size_embeddings)
+        self.mmcl_head = nn.Linear(feature_dim, size_embeddings)
+        self.out_proj = nn.Linear(feature_dim, size_embeddings)
+
+    def forward(self, batch):
+        # 1. CNN Feature Extraction
+        x = self.block1(batch)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.norm(x)              # [B, C, L]
+        x = x.permute(0, 2, 1)        # [B, L, C]
+
+        # 2. Apply Positional Encoding
+        x = self.pos_encoder(x)       # [B, L, C]
+
+        # 3. Transformer Encoder
+        x = self.transformer(x)       # [B, L, C]
+
+        # 4. Pooling Strategy: [CLS] 대신 Mean Pooling (Global Average Pooling)
+        # Transformer가 시퀀스의 문맥을 파악한 후, 시간 축으로 평균을 냄
+        emb = x.mean(dim=1)           # [B, C]
+
+        # 5. Heads
+        ssl_out = self.ssl_head(emb)
+        mmcl_out = self.mmcl_head(emb)
+        emb = self.out_proj(emb)
+
+        return {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 
 class SensorEncoder(nn.Module):
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
@@ -357,78 +445,7 @@ class SensorModel(nn.Module):
 
 
 
-#################################################################
-
-
-class Clip4ClipVisionModel(nn.Module):
-    
-    def __init__(self):
-        super().__init__() 
-
-        # 1. CLIP 비전 모델 로드 (기존과 동일)
-        self.video_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32", attn_implementation="eager")
-        
-        # 'openai/clip-vit-base-patch32' 모델의 hidden_size는 768입니다.
-        # 이 부분은 LoRA로 관리하지 않고 전체 파라미터를 학습(full-tuning)합니다.
-        hidden_size = self.video_model.config.hidden_size # 768
-        # ==========================================================================================
-        
-        # LoRA 설정
-        lora_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=[
-                "self_attn.q_proj",
-                "self_attn.k_proj",
-                "self_attn.v_proj",
-                "self_attn.out_proj",
-                "mlp.fc1",
-                "mlp.fc2",
-                "visual_projection"
-            ],
-            lora_dropout=0.05,
-            bias="none"
-        )
-        
-        self.video_model = get_peft_model(self.video_model, lora_config)
-        # self.video_model.print_trainable_parameters()
-
-
-    def forward(self, video: torch.Tensor, output_attentions: bool = False):
-        if video.dim() == 4:
-            video = video.unsqueeze(1)
-
-        batch_size, n_frames, c, h, w = video.shape
-        video_reshaped = video.view(batch_size * n_frames, c, h, w)
-
-        # 💡 self.video_model 호출 시 output_attentions 인자 전달
-        visual_output = self.video_model(
-            pixel_values=video_reshaped,
-            output_attentions=output_attentions
-        )
-
-        final_features = visual_output.last_hidden_state
-        seq_len = final_features.shape[1]
-        hidden_size = final_features.shape[2]
-        final_features = final_features.view(batch_size, n_frames, seq_len, hidden_size)
-
-        # 💡 output_attentions 값에 따라 반환값을 다르게 설정
-        if output_attentions:
-            # .attentions 값의 형태를 원래 비디오 차원에 맞게 복원
-            # attentions는 튜플이므로 마지막 레이어의 어텐션만 사용
-            attentions = visual_output.attentions[-1]
-            num_heads = attentions.shape[1]
-            attn_seq_len = attentions.shape[2]
-            attentions = attentions.view(batch_size, n_frames, num_heads, attn_seq_len, attn_seq_len)
-            
-            return {
-                "final_features": final_features,
-                "attentions": attentions
-            }
-        else:
-            return {
-                "final_features": final_features
-            }
+#############################################################
 
 # ---------------------------------------------------------------------
 # Attention Head (Object Encoder saliency map)
@@ -474,109 +491,6 @@ class SharedEncoder(nn.Module):
     def forward(self, x):
         return self.net(x)  # [B, out_dim, H', W']
 
-# class MotionEncoder(nn.Module):
-#     """Temporal difference-based motion encoder."""
-#     def __init__(self, in_channels=3, base_dim=32, latent_dim=256):
-#         super().__init__()
-#         self.backbone = nn.Sequential(
-#             nn.Conv3d(in_channels, base_dim, kernel_size=3, stride=(1,2,2), padding=1),
-#             nn.BatchNorm3d(base_dim),
-#             nn.ReLU(inplace=True),
-
-#             nn.Conv3d(base_dim, base_dim * 2, kernel_size=3, stride=(1,2,2), padding=1),
-#             nn.BatchNorm3d(base_dim * 2),
-#             nn.ReLU(inplace=True),
-
-#             nn.Conv3d(base_dim * 2, latent_dim, kernel_size=3, stride=(1,2,2), padding=1),
-#             nn.BatchNorm3d(latent_dim),
-#             nn.ReLU(inplace=True),
-#         )
-#         self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))  # 시간축 유지
-#         self.proj = nn.Linear(latent_dim, latent_dim)
-
-#     def forward(self, video):  # [B, T, C, H, W]
-#         x = video.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
-#         feat = self.backbone(x)           # [B, D, T', H', W']
-#         print("feat shape", feat.shape)
-#         feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)  # [B, D, T']
-
-#         # --- Temporal difference ---
-#         motion_diff = feat[:, :, 1:] - feat[:, :, :-1]  # [B, D, T'-1]
-#         v_motion = motion_diff.mean(dim=2)              # [B, D]
-#         v_motion = self.proj(v_motion)                  # [B, D]
-
-#         return v_motion
-
-# class MotionEncoder(nn.Module):
-#     """Temporal difference + optical flow motion encoder."""
-#     def __init__(self, in_channels=5, base_dim=32, latent_dim=256):  # ✅ 3(RGB) + 2(Flow)
-#         super().__init__()
-#         self.backbone = nn.Sequential(
-#             nn.Conv3d(in_channels, base_dim, kernel_size=3, stride=(1,2,2), padding=1),
-#             nn.BatchNorm3d(base_dim),
-#             nn.ReLU(inplace=True),
-
-#             nn.Conv3d(base_dim, base_dim * 2, kernel_size=3, stride=(1,2,2), padding=1),
-#             nn.BatchNorm3d(base_dim * 2),
-#             nn.ReLU(inplace=True),
-
-#             nn.Conv3d(base_dim * 2, latent_dim, kernel_size=3, stride=(1,2,2), padding=1),
-#             nn.BatchNorm3d(latent_dim),
-#             nn.ReLU(inplace=True),
-#         )
-
-#         self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
-#         self.proj = nn.Linear(latent_dim, latent_dim)
-
-#     # def forward(self, video, flows):
-
-#     #     # ✅ 시간 길이 맞춤
-#     #     if flows.shape[1] < video.shape[1]:
-#     #         pad = flows[:, -1:, :, :, :]
-#     #         flows = torch.cat([flows, pad], dim=1)
-
-#     #     # ✅ 채널 결합
-#     #     x = torch.cat([video, flows], dim=2)  # [B, T, 5, H, W]
-#     #     x = x.permute(0, 2, 1, 3, 4)          # [B, 5, T, H, W]
-
-#     #     feat = self.backbone(x)
-#     #     feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)
-#     #     motion_diff = feat[:, :, 1:] - feat[:, :, :-1]
-#     #     v_motion = motion_diff.mean(dim=2)
-#     #     v_motion = self.proj(v_motion)
-
-#     #     return v_motion
-#     def forward(self, videos, flows, crop_size=112):
-#         # ✅ 시간 길이 맞춤
-#         if flows.shape[1] < videos.shape[1]:
-#             pad = flows[:, -1:, :, :, :]
-#             flows = torch.cat([flows, pad], dim=1)
-
-#         # ✅ 중앙 crop (H=W=56)
-#         _, _, T, H, W = videos.shape
-#         top = max(0, H - crop_size)
-#         left = max(0, W - crop_size)
-#         videos = videos[:, :, :, top:, left:]  # 끝까지 포함
-#         flows = flows[:, :, :, top:, left:]
-
-#         # ✅ 채널 결합
-#         x = torch.cat([videos, flows], dim=2)  # [B, T, 5, H, W]
-#         x = x.permute(0, 2, 1, 3, 4)          # [B, 5, T, H, W]
-
-#         feat = self.backbone(x)
-#         feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)
-#         motion_diff = feat[:, :, 1:] - feat[:, :, :-1]
-#         v_motion = motion_diff.mean(dim=2)
-#         v_motion = self.proj(v_motion)
-
-#         return v_motion
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 class MotionEncoder(nn.Module):
     """
     Motion Encoder with cosine-consistent projection.
@@ -626,18 +540,14 @@ class MotionEncoder(nn.Module):
             x = torch.cat([video_diff, pad], dim=2)
 
         x = x.permute(0, 2, 1, 3, 4)
-        feat = self.backbone(x)
-        feat = self.spatial_pool(feat).squeeze(-1).squeeze(-1)
+        feature_5d = self.backbone(x)
+        feat = self.spatial_pool(feature_5d).squeeze(-1).squeeze(-1)
 
-        if feat.shape[2] > 1:
-            motion_diff = feat[:, :, 1:] - feat[:, :, :-1]
-            v_motion = motion_diff.mean(dim=2)
-        else:
-            v_motion = feat.mean(dim=2)
+        v_motion = feat.mean(dim=2)
 
         # projection
         v_motion = self.proj(v_motion)
-        return v_motion
+        return v_motion, feature_5d
 
 
 # --- Cosine Projection Layer ---
@@ -694,44 +604,7 @@ class ObjectEncoder(nn.Module):
         attn = self.attn(feat)              # [B, 1, H, W]
         obj_feat = self.pool(feat * attn).flatten(1)
         return obj_feat
-
-
-class LearnableWeightedFusion(nn.Module):
-    """
-    Learnable scaling fusion for (v_appearance, v_motion).
-    appearance와 motion의 스케일을 학습 가능한 파라미터로 조절.
     
-    - v_app, v_mot은 각각 [B, D]
-    - LayerNorm을 각 브랜치별로 적용하여 통계적 독립성 유지
-    - α, β (학습가능 파라미터)가 feature variance imbalance를 자동 보정
-    - residual-like 효과 포함 (motion gradient 보존)
-    """
-    def __init__(self, dim=256, init_alpha=0.7, init_beta=1.3):
-        super().__init__()
-        self.norm_app = nn.LayerNorm(dim)
-        self.norm_mot = nn.LayerNorm(dim)
-        self.alpha = nn.Parameter(torch.tensor(init_alpha))
-        self.beta = nn.Parameter(torch.tensor(init_beta))
-        self.out_norm = nn.LayerNorm(dim * 2)
-
-    def forward(self, v_app, v_mot):
-        # 1️⃣ branch-wise normalization
-        v_app = self.norm_app(v_app)
-        v_mot = self.norm_mot(v_mot)
-
-        v_app = F.normalize(v_app, dim=1)
-        v_mot = F.normalize(v_mot, dim=1)
-
-        # 2️⃣ learnable weighted fusion
-        z = torch.cat([self.alpha * v_app, self.beta * v_mot], dim=1)
-
-        # 3️⃣ global normalization
-        z = self.out_norm(z)
-        z = F.normalize(z, dim=1)
-
-        return z
-
-
     
 # ---------------------------------------------------------------------
 # VisionModel (Simplified Appearance Encoder + Motion Encoder)
@@ -762,8 +635,6 @@ class VisionModel(nn.Module):
             base_dim=base_dim // 2,
             latent_dim=latent_dim
         )
-        # Motion–appearance fusion
-        self.fusion = LearnableWeightedFusion(dim=latent_dim, init_alpha=0.7, init_beta=1.3)
 
     def forward(self, video, flows):
         """
@@ -780,6 +651,7 @@ class VisionModel(nn.Module):
         _, D, Hf, Wf = shared_feat.shape
 
         # temporal average pooling
+        avg_shared_feat_2d = shared_feat.view(B, T, D, Hf, Wf).mean(dim=1)
         shared_feat = shared_feat.view(B, T, D, Hf, Wf).mean(dim=1)
 
         v_scene = self.scene_encoder(shared_feat)
@@ -789,11 +661,7 @@ class VisionModel(nn.Module):
         fused = torch.cat([v_scene, v_object], dim=1)
         v_appearance = self.fuse(fused)
 
-        # 3️⃣ motion feature extraction
-        video_centered = video - video.mean(dim=[3, 4], keepdim=True)
-        video_centered = video_centered / (video_centered.std(dim=[3, 4], keepdim=True) + 1e-6)
-        preprocessed_videos = video_centered - video.mean(dim=1, keepdim=True)
-        v_motion = self.motion_encoder(videos = video, flows=flows)
+        v_motion, feature_map_3d = self.motion_encoder(videos = video, flows=flows)
         # v_motion = (v_motion - v_motion.mean(dim=0, keepdim=True)) / (v_motion.std(dim=0, keepdim=True) + 1e-6)
 
         # detach appearance for z_video_online
@@ -811,8 +679,9 @@ class VisionModel(nn.Module):
         return {
             "v_appearance": v_appearance,
             "v_motion": v_motion,
-            "vis_v": video_centered - video.mean(dim=1, keepdim=True),
             "z_video_online": z_video_online,
+            "motion_feature_map": feature_map_3d,
+            "spatial_feature_map": avg_shared_feat_2d
         }
 
 
@@ -1122,6 +991,7 @@ class ClusteringManager(nn.Module):
                     q25 = torch.quantile(distances, 0.25).item()
                     q50 = torch.quantile(distances, 0.50).item()
                     q75 = torch.quantile(distances, 0.75).item()
+                    all = torch.quantile(distances, 1.00).item()
                     cluster_stats[k] = {
                         "size": int(mask.sum().item()),
                         "mean": mean_d,
@@ -1129,6 +999,7 @@ class ClusteringManager(nn.Module):
                         "q25": q25,
                         "q50": q50,
                         "q75": q75,
+                        "all": all*2, # all samples are good.
                     }
                 else:
                     cluster_stats[k] = {
@@ -1138,6 +1009,7 @@ class ClusteringManager(nn.Module):
                         "q25": -1,
                         "q50": -1,
                         "q75": -1,
+                        "all": -1,
                     }
 
             # ✅ 기록용으로 저장
@@ -1247,115 +1119,6 @@ class ClusteringModule(nn.Module):
         
         # ⚠️ (중요) Cache 성공 시, 나머지 Rank는 Broadcast를 기다리고 있어야 합니다.
         cache_hit = False
-        # # --- ★★★ 추가된 코드: 전체 학습 데이터 t-SNE 시각화 ★★★ ---
-        # if rank_str == "0": # Rank 0에서만 시각화 수행
-        #     print(f"[{rank}] Generating initial t-SNE plot from the *entire* train dataset...")
-        #     print(f"[{rank}] WARNING: This might take a long time!")
-            
-        #     all_features_list = []
-        #     all_labels_list = []
-            
-        #     # try:
-        #         # 데이터 로더 전체 순회하며 특징 및 레이블 수집 (CPU 사용)
-        #         # (GPU 메모리 부족 방지 위해 CPU 사용 후 t-SNE 시 필요하면 샘플링)
-        #     print(f"[{rank}] Collecting features and labels from train_dataloader...")
-        #     for batch in tqdm(self.train_dataloader, desc=f"[{rank}] Collecting Features"):
-        #         videos, sensors, labels, sample_ids = batch
-                
-        #         sensors = sensors.to(device) 
-                
-        #         # 모델 forward 호출 (특징 추출)
-        #         _, _, features = self(sensors, return_features=True) 
-        #         # features = self.projection_layer(features) # 필요시
-                
-        #         all_features_list.append(features.detach().cpu())
-        #         all_labels_list.append(labels.detach().cpu()) # 레이블도 CPU로
-
-        #     # 리스트를 하나의 텐서/배열로 합치기
-        #     all_features = torch.cat(all_features_list).numpy()
-        #     all_labels = torch.cat(all_labels_list).numpy()
-            
-        #     print(f"[{rank}] Collected {len(all_features)} total samples.")
-            
-        #     # --- ★★★ 레이블 병합 로직 추가 ★★★ ---
-        #     labels_to_plot = all_labels
-        #     # print(f"[{rank}] Merging labels...")
-        #     # merged_labels = np.zeros_like(all_labels) # 결과를 저장할 새 배열
-        #     # for i, l in enumerate(all_labels):
-        #     #     if l == 0 or l == 1:
-        #     #         merged_labels[i] = 0
-        #     #     elif l == 2 or l == 3:
-        #     #         merged_labels[i] = 1
-        #     #     else:
-        #     #         # 정수 나눗셈 // 사용
-        #     #         merged_labels[i] = l % 2 
-            
-        #     # labels_to_plot = merged_labels # 시각화에는 병합된 레이블 사용
-        #     print(f"[{rank}] Labels merged.")
-        #     # --- ★★★ 레이블 병합 끝 ★★★ ---
-
-        #     # (선택) 레이블 병합 로직 (필요하다면 여기에 적용)
-        #     # labels_to_plot = all_labels 
-
-        #     # 샘플링 (데이터가 너무 많을 경우)
-        #     num_samples_for_tsne = min(20000, len(all_features)) # 샘플 수 증가 (시간 더 걸림)
-        #     if num_samples_for_tsne < len(all_features):
-        #         print(f"[{rank}] Sampling {num_samples_for_tsne} for t-SNE...")
-        #         sample_indices = np.random.choice(len(all_features), num_samples_for_tsne, replace=False)
-        #         features_subset = all_features[sample_indices]
-        #         labels_subset = labels_to_plot[sample_indices]
-        #     else:
-        #         features_subset = all_features
-        #         labels_subset = labels_to_plot
-
-        #     # t-SNE 실행
-        #     perplexity_value = min(30, len(features_subset) - 1)
-        #     if perplexity_value <= 0: perplexity_value = 1.0
-        #     from sklearn.manifold import TSNE
-        #     print(f"[{rank}] Running t-SNE (2D) on {len(features_subset)} samples...")
-        #     tsne_2d = TSNE(n_components=2, perplexity=perplexity_value, random_state=42, metric="cosine")
-        #     reduced_features_2d = tsne_2d.fit_transform(features_subset)
-
-        #     print(f"[{rank}] Running t-SNE (3D) on {len(features_subset)} samples...")
-        #     tsne_3d = TSNE(n_components=3, perplexity=perplexity_value, random_state=42, metric="cosine")
-        #     reduced_features_3d = tsne_3d.fit_transform(features_subset)
-
-        #     # 시각화 (간단 버전)
-        #     unique_labels = np.unique(labels_subset)
-        #     num_unique_labels = len(unique_labels)
-        #     if num_unique_labels <= 20: cmap = plt.cm.get_cmap('tab20', num_unique_labels) 
-        #     else: cmap = plt.cm.get_cmap('viridis', num_unique_labels)
-        #     colors = cmap(np.linspace(0, 1, num_unique_labels))
-        #     label_to_color = {label: colors[i] for i, label in enumerate(unique_labels)}
-        #     label_names = {label: f"Class_{label}" for label in unique_labels} # 임시 이름
-
-        #     # 2D
-        #     fig_2d = plt.figure(figsize=(10, 8)); ax_2d = fig_2d.add_subplot(111); handles = []
-        #     for i in unique_labels:
-        #         mask = (labels_subset == i); color=label_to_color[i]; label_name=label_names[i]
-        #         ax_2d.scatter(reduced_features_2d[mask, 0], reduced_features_2d[mask, 1], color=color, label=label_name, alpha=0.7)
-        #         if not any(h.get_label() == label_name for h in handles): handles.append(plt.Line2D([],[],color=color, marker='o', ls='', ms=8, label=label_name))
-        #     ax_2d.set_title("Initial t-SNE (Full Train Set - 2D)"); ax_2d.legend(handles=handles, loc='best')
-            
-        #     # 3D
-        #     fig_3d = plt.figure(figsize=(10, 8)); ax_3d = fig_3d.add_subplot(111, projection='3d'); handles_3d = []
-        #     for i in unique_labels:
-        #         mask = (labels_subset == i); color=label_to_color[i]; label_name=label_names[i]
-        #         ax_3d.scatter(reduced_features_3d[mask, 0], reduced_features_3d[mask, 1], reduced_features_3d[mask, 2], color=color, label=label_name, alpha=0.7)
-        #         if not any(h.get_label() == label_name for h in handles_3d): handles_3d.append(plt.Line2D([],[],color=color, marker='o', ls='', ms=8, label=label_name))
-        #     ax_3d.set_title("Initial t-SNE (Full Train Set - 3D)"); ax_3d.legend(handles=handles_3d, loc='best')
-
-        #     # WandB 로깅
-        #     wandb.log({
-        #         "initial_train_tsne_2d": wandb.Image(fig_2d),
-        #         "initial_train_tsne_3d": wandb.Image(fig_3d)
-        #     })
-        #     plt.close(fig_2d); plt.close(fig_3d) 
-        #     print(f"[{rank}] Initial Train t-SNE logged to WandB.")
-
-        #     # except Exception as e:
-        #     #     print(f"[{rank}] Error during initial full train t-SNE visualization: {e}")
-        # # --- ★★★ 추가된 코드 끝 ★★★ ---
         if rank_str == "0" and os.path.exists(prototype_cache_path):
             try:
                 # 🚨 UnpicklingError 방지: PIL.Image.Image 등이 저장되지 않았다고 가정하거나,
@@ -1584,6 +1347,72 @@ class ClusteringModule(nn.Module):
     @torch.no_grad()
     def evaluate(self, outputs):
         self.eval()
+
+        # 1) gather
+        features = gather(torch.cat([x['features'] for x in outputs])).cpu().numpy()
+        labels = gather(torch.cat([x['labels'] for x in outputs])).cpu().numpy()
+        preds = gather(torch.cat([x['predicted_labels'] for x in outputs])).cpu().numpy()
+
+        # optional embeddings
+        def get_optional(key):
+            if key in outputs[0]:
+                return gather(torch.cat([x[key] for x in outputs])).cpu().numpy()
+            return None
+
+        v_appearance = get_optional("v_appearance")
+        v_motion = get_optional("v_motion")
+        s_motion = get_optional("s_motion")
+        z_sensor = get_optional("z_sensor")
+        z_video  = get_optional("z_video")
+        bad      = get_optional("bad")
+
+        # Hungarian mapping etc (기존 유지)
+        num_clusters = self.clustering_manager.num_clusters
+        remap = not self.mid_label
+
+        if remap:
+            labels_remapped = self._remap_pairwise_7(torch.tensor(labels)).numpy()
+        else:
+            labels_remapped = labels
+
+        # ======== (1) Accuracy + Hungarian matching 수행 (이건 과제라 유지 가능) ========
+        if self.local_rank == "0":
+
+            raw_accuracy, new_mapping = compute_hungarian_matching(
+                preds, labels_remapped, num_clusters
+            )
+            mapped_preds = np.array([new_mapping.get(int(c), int(c)) for c in preds])
+            mapped_accuracy = (mapped_preds == labels_remapped).mean()
+
+            wandb.log({"val_accuracy_raw": raw_accuracy})
+            wandb.log({"val_accuracy_mapped": mapped_accuracy})
+
+            # mapping 업데이트
+            self.clustering_manager.mapping = new_mapping
+
+            # ======== (2) Embedding 저장만 하기 (t-SNE 등 안함) ========
+            save_dir = "/mnt/hdd4tb/junho/Opportunity++/tsne_cache"
+            os.makedirs(save_dir, exist_ok=True)
+
+            save_path = os.path.join(save_dir, f"epoch_{self.epoch:04d}.npz")
+
+            np.savez(
+                save_path,
+                features=features,
+                labels=labels_remapped,
+                preds=mapped_preds,
+                v_motion=v_motion,
+                s_motion=s_motion,
+                z_sensor=z_sensor,
+                z_video=z_video,
+                v_appearance=v_appearance,
+                bad=bad,
+                num_clusters=num_clusters,
+            )
+
+            print(f"✔ Saved embeddings for epoch {self.epoch} → {save_path}")
+        self.train()
+        self.eval()
         features_gathered = gather(torch.cat([x['features'] for x in outputs]))
         labels_gathered = gather(torch.cat([x['labels'] for x in outputs]))
         predicted_labels_gathered = gather(torch.cat([x['predicted_labels'] for x in outputs]))
@@ -1763,7 +1592,7 @@ class ClusteringModule(nn.Module):
         self.train()
 
     def visualize_embedding(self, some_np, all_labels, title="S_Motion"):
-        num_samples_for_tsne = min(1200, len(some_np))
+        num_samples_for_tsne = min(600, len(some_np))
         sample_indices = np.random.choice(len(some_np), num_samples_for_tsne, replace=False)
 
         print(f"Running {title} t-SNE on {num_samples_for_tsne} samples...")

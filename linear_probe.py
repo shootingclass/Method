@@ -14,13 +14,12 @@ from sklearn.metrics import confusion_matrix
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.distributed as dist
+from pathlib import Path # pathlib 임포트
 
 # --- 사용자 정의 모듈 임포트 ---
 from datamodule import MethodDataModule
 from method import MethodLightningModule
 from method_utils import gather
-from dataset_lstm import LinearProbeLSTMDatamodule
-
 
 ####################################################################
 #                         Utility Functions
@@ -36,78 +35,275 @@ def set_random_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def set_module_params(args):
-    parts = args.checkpoint_path.split('/')
-    if len(parts) >= 3:
-        args.dataset_name = parts[-2]
-        args.model_name = parts[-3]
-        args.ckpt_name = parts[-1].split('.')[0]
-        print(f"Dataset: {args.dataset_name}, Model: {args.model_name}")
+def profile_model_efficiency(model, datamodule, args, device='cuda'):
+    """
+    GFLOPS와 FPS(Throughput) 측정
+    """
+    import time
+    
+    model.eval()
+    model.to(device)
+    
+    # 샘플 데이터 준비
+    datamodule.setup("fit")
+    sample_batch = next(iter(datamodule.val_dataloader()))
+    
+    # 데이터 형태에 따라 처리
+    if len(sample_batch) == 5:
+        video_data, sensor_data, labels, _, flow = sample_batch
     else:
-        print("경로 구조가 예상과 다릅니다.")
+        video_data, sensor_data, labels = sample_batch[:3]
+        flow = None
+    
+    sensor_data = sensor_data.to(device)
+    video_data = video_data.to(device) if video_data is not None else None
+    
+    # flow가 dict인 경우 처리
+    if flow is not None:
+        if isinstance(flow, dict):
+            flow = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in flow.items()}
+        elif isinstance(flow, torch.Tensor):
+            flow = flow.to(device)
+        # 그 외의 경우 그대로 둠
+    
+    batch_size = sensor_data.shape[0]
+    
+    print("\n" + "=" * 70)
+    print("Model Efficiency Profiling")
+    print("=" * 70)
+    
+    # ============================================================
+    # 1. FLOPs 계산 (fvcore 또는 thop 사용)
+    # ============================================================
+    flops_giga = None
+    encoder_fn = None  # throughput 측정용
+    
+    # LinearProbeLightningModule의 경우
+    if hasattr(model, 'model'):
+        backbone = model.model
+        
+        # sensor encoder 선택 및 forward 함수 설정
+        if args.model_name == "method":
+            sensor_encoder = backbone.sensor_model
+            encoder_fn = lambda x: sensor_encoder(x)
+        elif args.model_name == "mae":
+            # MAE는 forward_sensor_only 메서드만 사용
+            mae_model = backbone.model
+            sensor_encoder = mae_model  # 파라미터 카운트용
+            encoder_fn = lambda x: mae_model.forward_sensor_only(x)
+            
+            # FLOPs 계산을 위한 래퍼 모듈
+            class SensorOnlyWrapper(nn.Module):
+                def __init__(self, mae):
+                    super().__init__()
+                    self.mae = mae
+                def forward(self, x):
+                    return self.mae.forward_sensor_only(x)
+            sensor_encoder_for_flops = SensorOnlyWrapper(mae_model).to(device)
+        else:
+            sensor_encoder = getattr(backbone, 'sensor_model', backbone)
+            encoder_fn = lambda x: sensor_encoder(x)
+        
+        # 파라미터 수 계산
+        total_params = sum(p.numel() for p in sensor_encoder.parameters())
+        print(f"[Encoder] Total Params: {total_params:,} ({total_params/1e6:.2f}M)")
+        
+        # FLOPs 계산 시도 (fvcore 우선 + 상세 breakdown)
+        try:
+            from fvcore.nn import FlopCountAnalysis, flop_count_table
+            
+            if args.model_name == "mae":
+                target_encoder = sensor_encoder_for_flops
+            else:
+                target_encoder = sensor_encoder
+            
+            target_encoder.eval()
+            with torch.no_grad():
+                flops_analyzer = FlopCountAnalysis(target_encoder, (sensor_data,))
+                flops_analyzer.unsupported_ops_warnings(False)
+                flops = flops_analyzer.total()
+                
+                # 상세 breakdown 출력
+                print("\n--- FLOPs Breakdown by Module ---")
+                by_module = flops_analyzer.by_module()
+                # Top-level 모듈만 출력
+                for name, val in by_module.items():
+                    if val > 0 and name.count('.') <= 1:  # 1단계 깊이만
+                        print(f"  {name}: {val/1e6:.3f} MFLOPs")
+                
+            flops_giga = flops / 1e9
+            print(f"\n[Encoder] Total FLOPs (fvcore): {flops_giga:.4f} GFLOPs")
+            
+        except ImportError:
+            print("[INFO] fvcore not installed. Install with: pip install fvcore")
+            flops_giga = None
+        except Exception as e:
+            print(f"[WARNING] FLOPs calculation failed: {e}")
+            flops_giga = None
+        
+        # 수동 FLOPs 계산 (보조)
+        print("\n--- Manual FLOPs Estimation ---")
+        manual_flops = 0
+        for name, module in sensor_encoder.named_modules():
+            if isinstance(module, nn.Conv1d):
+                # FLOPs = 2 * Cin * Cout * K * L_out
+                cin, cout = module.in_channels, module.out_channels
+                k = module.kernel_size[0]
+                l_out = sensor_data.shape[-1] // (module.stride[0] if hasattr(module, 'stride') else 1)
+                flops_conv = 2 * cin * cout * k * l_out * sensor_data.shape[0]
+                manual_flops += flops_conv
+                print(f"  Conv1d {name}: {flops_conv/1e6:.3f} MFLOPs")
+            elif isinstance(module, nn.Conv2d):
+                cin, cout = module.in_channels, module.out_channels
+                k = module.kernel_size[0] * module.kernel_size[1]
+                h_out = 14  # 대략적 추정
+                w_out = 8
+                flops_conv = 2 * cin * cout * k * h_out * w_out * sensor_data.shape[0]
+                manual_flops += flops_conv
+                print(f"  Conv2d {name}: {flops_conv/1e6:.3f} MFLOPs")
+            elif isinstance(module, nn.Linear):
+                cin, cout = module.in_features, module.out_features
+                flops_linear = 2 * cin * cout * sensor_data.shape[0]
+                manual_flops += flops_linear
+                print(f"  Linear {name}: {flops_linear/1e6:.3f} MFLOPs")
+            elif isinstance(module, nn.GRU):
+                hidden = module.hidden_size
+                inp = module.input_size
+                seq_len = 32  # 대략적 추정
+                # GRU: 3 gates, each with 2 matmuls
+                flops_gru = 6 * (inp * hidden + hidden * hidden) * seq_len * sensor_data.shape[0]
+                if module.bidirectional:
+                    flops_gru *= 2
+                manual_flops += flops_gru
+                print(f"  GRU {name}: {flops_gru/1e6:.3f} MFLOPs")
+            elif isinstance(module, nn.MultiheadAttention):
+                embed_dim = module.embed_dim
+                seq_len = 32
+                # Attention: Q, K, V projections + attention scores + output projection
+                flops_attn = 4 * embed_dim * embed_dim * seq_len * sensor_data.shape[0]
+                flops_attn += 2 * seq_len * seq_len * embed_dim * sensor_data.shape[0]
+                manual_flops += flops_attn
+                print(f"  Attention {name}: {flops_attn/1e6:.3f} MFLOPs")
+        
+        print(f"\n[Encoder] Manual Total: {manual_flops/1e9:.4f} GFLOPs")
+    
+    # ============================================================
+    # 2. Throughput (FPS) 측정 - Encoder만 측정
+    # ============================================================
+    print("\n--- Throughput Measurement (Encoder Only) ---")
+    
+    if encoder_fn is None:
+        print("[WARNING] encoder_fn not defined, skipping throughput measurement")
+        fps = None
+        latency_ms = None
+    else:
+        # Warm-up (충분히 50회)
+        print("Warming up GPU (50 iterations)...")
+        with torch.no_grad():
+            for _ in range(50):
+                _ = encoder_fn(sensor_data)
+        
+        torch.cuda.synchronize()
+        
+        # 실제 측정 (500회로 늘림)
+        num_iterations = 500
+        
+        # CUDA Events로 더 정확한 시간 측정
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        with torch.no_grad():
+            for _ in range(num_iterations):
+                _ = encoder_fn(sensor_data)
+        end_event.record()
+        
+        # Wait for completion
+        torch.cuda.synchronize()
+        elapsed_time = start_event.elapsed_time(end_event) / 1000  # ms to seconds
+        
+        total_samples = batch_size * num_iterations
+        fps = total_samples / elapsed_time
+        latency_ms = (elapsed_time / num_iterations) * 1000
+        
+        print(f"Batch Size: {batch_size}")
+        print(f"Total Iterations: {num_iterations}")
+        print(f"Total Time: {elapsed_time:.3f}s")
+        print(f"Throughput (FPS): {fps:.2f} samples/sec")
+        print(f"Latency per batch: {latency_ms:.3f} ms")
+    
+    # ============================================================
+    # 3. 결과 요약
+    # ============================================================
+    print("\n" + "-" * 70)
+    print("Efficiency Summary")
+    print("-" * 70)
+    if flops_giga is not None:
+        print(f"GFLOPs:      {flops_giga:.3f}")
+    print(f"FPS:         {fps:.2f}")
+    print(f"Latency:     {latency_ms:.2f} ms")
+    print("=" * 70 + "\n")
+    
+    return {
+        'gflops': flops_giga,
+        'fps': fps,
+        'latency_ms': latency_ms
+    }
+
+
+def set_module_params(args):
+    try:
+        # 경로를 Path 객체로 변환
+        path = Path(args.checkpoint_path)
+                
+        parent_dir = path.parent
+
+        args.ckpt_name = path.parent / path.stem
+
+        
+        if 'manual_epochs' in parent_dir.name:
+            # 3-A. 부모가 'manual_epochs'인 경우 (예: .../model/dataset/manual_epochs/ckpt)
+            dataset_dir = parent_dir.parent
+            model_dir = dataset_dir.parent
+            
+            args.dataset_name = dataset_dir.name
+            args.model_name = model_dir.name
+        else:
+            # 3-B. 부모가 'manual_epochs'가 아닌 경우 (예: .../model/dataset/ckpt)
+            dataset_dir = parent_dir
+            model_dir = dataset_dir.parent
+            
+            args.dataset_name = dataset_dir.name
+            args.model_name = model_dir.name
+
+        print(f"Dataset: {args.dataset_name}, Model: {args.model_name}, Ckpt: {args.ckpt_name}")
+    
+    except Exception as e:
+        print(f"경로 분석 중 오류 발생: {e}")
+        print("경로 구조가 예상과 다릅니다. (예: .../model_name/dataset_name/[manual_epochs]/ckpt_name.ckpt)")
+        
     return args
 
 def get_backbone_with_mode(args):
-    if args.sensor_only:
-        print("⚙️  Sensor-only from scratch training.")
+    # 기존 pretrained checkpoint 로드 루틴
+    backbone = load_pretrained_model(args)
+        # ⚠️ 반드시 device 이동 이후에 freeze
+    if hasattr(backbone, "to"):
+        print("move to cuda")
+        backbone = backbone.to("cuda")
+    
+    # backbone.train()
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad = False
 
-        # sensor-only model import
-        from baseline_sensor.dlinear import DLinearModel
-        from baseline_sensor.timesnet import TimesNet
-        from baseline_sensor.moment_small import MomentSmall
-        from baseline_sensor.mantis import MantisModel
-
-        model_map = {
-            'dlinear': DLinearModel,
-            'timesnet': TimesNet,
-            'moment': MomentSmall,
-            'mantis': MantisModel,
-        }
-        sensor_encoder = model_map[args.sensor_model_name](sensor_channels=6, num_classes=args.num_classes)
-
-        # ✨ 여기 핵심: backbone 구조 대신 sensor encoder만 넣어줌
-        class DummyBackbone:
-            def __init__(self, encoder):
-                self.sensor_model = encoder
-                self.hparams = type('', (), {'embedding_dim': 128})()  # 임시 속성
-        backbone = DummyBackbone(sensor_encoder)
-        # sensor encoder만 학습
-        for name, p in backbone.named_parameters():
-            print(name)
-            # p.requires_grad = "sensor_model" in name
-            p.requires_grad = True
-        backbone.train()
-
-    elif args.supervision:
-            print("⚙️  Sensor-only supervised mode enabled (no pretrained weights).")
-            
-            # 1️⃣ checkpoint의 하이퍼파라미터만 가져오기
-            ckpt = torch.load(args.checkpoint_path, map_location="cpu")
-            hparams = ckpt["hyper_parameters"] if "hyper_parameters" in ckpt else {}
-
-            # 2️⃣ 기존 load_pretrained_model의 인자를 동일하게 써서 구조만 초기화
-            backbone = load_pretrained_model(args, reset_sensor_weights=True)
-              # ⚠️ 반드시 device 이동 이후에 freeze
-            if hasattr(backbone, "to"):
-                backbone = backbone.to("cuda")
-
-            # sensor encoder만 학습
-            for name, p in backbone.named_parameters():
-                print(name)
-                # p.requires_grad = "sensor_model" in name
-                p.requires_grad = True
-            backbone.train()
-
-    else:
-        # 기존 pretrained checkpoint 로드 루틴
-        backbone = load_pretrained_model(args)
-          # ⚠️ 반드시 device 이동 이후에 freeze
-        if hasattr(backbone, "to"):
-            print("move to cuda")
-            backbone = backbone.to("cuda")
-        for p in backbone.parameters():
-            p.requires_grad = False
-        backbone.eval()
+    # 모델 내 첫 번째 BN 레이어를 찾는 예시
+    for name, m in backbone.named_modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            print(f"Layer: {name}")
+            print(f" - Running Mean (첫 5개): {m.running_mean[:5]}")
+            print(f" - Running Var (첫 5개): {m.running_var[:5]}")
+            break
 
     # ✅ 3️⃣ Gradient 상태 확인 (디버깅용)
     total_params = sum(1 for _ in backbone.parameters())
@@ -122,7 +318,7 @@ def get_backbone_with_mode(args):
     return backbone
 
 
-def load_pretrained_model(args, reset_sensor_weights=False):
+def load_pretrained_model(args):
     ckpt = args.checkpoint_path
     if not ckpt or not os.path.exists(ckpt):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
@@ -131,7 +327,7 @@ def load_pretrained_model(args, reset_sensor_weights=False):
 
     if args.model_name == "method":
         from method import MethodLightningModule
-        model = MethodLightningModule.load_from_checkpoint(ckpt)
+        model = MethodLightningModule.load_from_checkpoint(ckpt, strict=False)
     elif args.model_name == "comodo":
         from baseline_modules.comodo.module import COMODOLightningModule
         model = COMODOLightningModule.load_from_checkpoint(ckpt, strict=False, map_location='cpu').to('cuda')
@@ -142,18 +338,28 @@ def load_pretrained_model(args, reset_sensor_weights=False):
         from baseline_modules.imu2clip import IMU2CLIPLightningModule
         model = IMU2CLIPLightningModule.load_from_checkpoint(ckpt)
     elif args.model_name == "mae":
-        from baseline_modules.mae import CAVMAELightningModule
-        model = CAVMAELightningModule.load_from_checkpoint(ckpt, map_location='cpu').to('cuda')
+        from baseline_modules.mae import EVIMAELightningModule
+        model = EVIMAELightningModule.load_from_checkpoint(ckpt, map_location='cpu').to('cuda')
     else:
         raise ValueError(f"Unknown model_name: {args.model_name}")
     
-    # 2️⃣ sensor encoder만 weight 초기화 (sensor-only 학습 모드)
-    if reset_sensor_weights:
-        print("⚙️  Resetting sensor encoder weights for supervised fine-tuning")
+    # --- Debug: Print Loaded Parameter Structure ---
+    print(f"\n[Debug] Verifying loaded parameters for model: {args.model_name}")
+    param_keys = list(model.state_dict().keys())
+    print(f"[Debug] Total keys in model state_dict: {len(param_keys)}")
+    prefixes = set()
+    for k in param_keys:
+        parts = k.split('.')
+        if len(parts) >= 2:
+            prefixes.add(f"{parts[0]}.{parts[1]}")
+        else:
+            prefixes.add(parts[0])
+    print("[Debug] Model parameter groups (prefixes):")
+    for p in sorted(list(prefixes)):
+        print(f"  - {p}")
+    print("-" * 50 + "\n")
+    # -----------------------------------------------
 
-        for layer in model.modules():
-            if hasattr(layer, 'reset_parameters'):
-                layer.reset_parameters()
     return model
 
 
@@ -175,6 +381,11 @@ class LinearProbeLightningModule(pl.LightningModule):
             emb_dim *= 2
         elif self.hparams.model_name == "comodo":
             emb_dim //= 2
+
+        # encoder_type에 따라 embedding dimension 조정
+        self.encoder_type = getattr(self.hparams, 'encoder_type', 'sensor')
+        if self.encoder_type == "sensor-video":
+            emb_dim *= 2  # sensor + video 임베딩 concatenation
 
         self.classifier = torch.nn.Linear(emb_dim, self.hparams.num_classes)
         self.criterion = torch.nn.CrossEntropyLoss()
@@ -213,37 +424,68 @@ class LinearProbeLightningModule(pl.LightningModule):
         }
         self.class_names = [v for v in self.class_dic.values()]
 
-    def forward(self, sensor_data):
+    def _get_sensor_embedding(self, sensor_data):
+        """센서 인코더에서 임베딩 추출"""
         if self.hparams.model_name == "method":
             sensor_encoder = self.model.sensor_model
-            representations = sensor_encoder(sensor_data)
-            # z_sensor embedding
-            # _, features, _ = self.model.clustering_module(sensor_data, return_features = True)
-            # sensor_motion_emb = self.model.momentum_sensor_model.encoding_motion(sensor_data)["emb"]
-            # import torch.nn.functional as F
-            # s_app_norm = F.normalize(features, dim=1)
-            # s_mot_norm = F.normalize(sensor_motion_emb, dim=1)
-            # # features는 그래디언트 차단
-            # representations = torch.cat((s_app_norm.detach(), s_mot_norm.detach()), dim=1)
-
+            return sensor_encoder(sensor_data)
         elif self.hparams.model_name == "imu2clip":
             sensor_encoder = self.model.sensor_model
             sensor_data = self.model.sensor_padding(sensor_data)
-            representations = sensor_encoder(sensor_data)
+            return sensor_encoder(sensor_data)
         elif self.hparams.model_name == "primus":
             sensor_encoder = self.model.sensor_model
-            representations = sensor_encoder(sensor_data)['mmcl']
+            return sensor_encoder(sensor_data)['mmcl']
         elif self.hparams.model_name == "mae":
-            representations = self.model.model.forward_sensor_only(sensor_data)
+            return self.model.model.forward_sensor_only(sensor_data)
         elif self.hparams.model_name == "comodo":
             sensor_encoder = self.model.sensor_model
-            representations = sensor_encoder(sensor_data)
+            return sensor_encoder(sensor_data)
         else:
-            raise ValueError(f"Unknown model_name for loading: {self.hparams.model_name}")
+            raise ValueError(f"Unknown model_name for sensor: {self.hparams.model_name}")
+
+    def _get_video_embedding(self, video_data, flow=None):
+        """비디오 인코더에서 임베딩 추출 (inference_mode로 메모리 절약)"""
+        if self.hparams.model_name == "method":
+            video_encoder = self.model.video_model
+            # method는 flow를 두번째 인자로 받음
+            return video_encoder(video_data, flow)["z_video_online"]
+        elif self.hparams.model_name == "imu2clip":
+            video_encoder = self.model.video_model
+            # imu2clip은 (B, T, C, H, W) -> (B, C, T, H, W) 변환 필요
+            video_data = video_data.permute(0, 2, 1, 3, 4)
+            return video_encoder.get_video_embeddings(video_data)
+        elif self.hparams.model_name == "primus":
+            video_encoder = self.model.video_model
+            video_emb, _ = video_encoder.get_video_embeddings(video_data)
+            return video_emb
+        elif self.hparams.model_name == "mae":
+            return self.model.model.forward_video_only(video_data)
+        elif self.hparams.model_name == "comodo":
+            # COMODO는 video_teacher를 사용
+            video_encoder = self.model.video_teacher
+            return video_encoder.encode(video_data)
+        else:
+            raise ValueError(f"Unknown model_name for video: {self.hparams.model_name}")
+
+    def forward(self, video_data, sensor_data, flow=None):
+        # encoder_type에 따라 다른 임베딩 사용
+        if self.encoder_type == "sensor":
+            representations = self._get_sensor_embedding(sensor_data)
+        elif self.encoder_type == "video":
+            representations = self._get_video_embedding(video_data, flow)
+        elif self.encoder_type == "sensor-video":
+            sensor_emb = self._get_sensor_embedding(sensor_data)
+            video_emb = self._get_video_embedding(video_data, flow)
+            representations = torch.cat([sensor_emb, video_emb], dim=1)
+        else:
+            raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
+
         logits = self.classifier(representations)
+        
         # ✅ gradient 흐름 확인 (1회만 출력)
         if self.current_epoch == 0:
-            if  self.hparams.model_name == "mae":
+            if self.hparams.model_name == "mae":
                 encoder = self.model.model
             else:
                 encoder = self.model.sensor_model
@@ -252,16 +494,16 @@ class LinearProbeLightningModule(pl.LightningModule):
                 for n, p in encoder.named_parameters()
             ]
             trainable = [n for n, rg, _ in grad_flags if rg]
-            print(f"[Gradient Check] Trainable params in sensor_encoder: {len(trainable)}")
+            print(f"[Gradient Check] Trainable params in encoder: {len(trainable)}")
             total_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-            print(f"Total trainable parameters in sensor_encoder: {total_params:,}")
+            print(f"Total trainable parameters in encoder: {total_params:,}")
             print(f"→ Sample trainable layers: {trainable[:5]}")
         
         return logits
 
     def _shared_step(self, batch, batch_idx):
-        _, sensor_data, y, _, _ = batch
-        logits = self(sensor_data)
+        video_data, sensor_data, y, _, flow = batch
+        logits = self(video_data, sensor_data, flow)
         loss = self.criterion(logits, y)
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(logits, dim=1)
@@ -273,27 +515,27 @@ class LinearProbeLightningModule(pl.LightningModule):
         print("grad: ", loss.requires_grad)
         return loss
 
-    def on_after_backward(self):
-        # 1️⃣ sensor encoder 파라미터 중 grad 있는 개수 카운트
-        try:
-            encoder = (
-                self.model.model.sensor_model
-                if hasattr(self.model, "model") and hasattr(self.model.model, "sensor_model")
-                else self.model.sensor_model
-            )
+    # def on_after_backward(self):
+    #     # 1️⃣ sensor encoder 파라미터 중 grad 있는 개수 카운트
+    #     try:
+    #         encoder = (
+    #             self.model.model.sensor_model
+    #             if hasattr(self.model, "model") and hasattr(self.model.model, "sensor_model")
+    #             else self.model.sensor_model
+    #         )
 
-            grad_exist = []
-            grad_sum = 0.0
-            for name, p in encoder.named_parameters():
-                if p.grad is not None:
-                    grad_exist.append(name)
-                    grad_sum += p.grad.abs().sum().item()
+    #         grad_exist = []
+    #         grad_sum = 0.0
+    #         for name, p in encoder.named_parameters():
+    #             if p.grad is not None:
+    #                 grad_exist.append(name)
+    #                 grad_sum += p.grad.abs().sum().item()
 
-            print(f"[Gradient Flow] params_with_grad={len(grad_exist)}, grad_sum={grad_sum:.6f}")
-            if grad_exist:
-                print("→ sample layers:", grad_exist[:5])
-        except Exception as e:
-            print(f"Error in on_after_backward: {e}")
+    #         print(f"[Gradient Flow] params_with_grad={len(grad_exist)}, grad_sum={grad_sum:.6f}")
+    #         if grad_exist:
+    #             print("→ sample layers:", grad_exist[:5])
+    #     except Exception as e:
+    #         print(f"Error in on_after_backward: {e}")
 
 
     def on_validation_epoch_start(self):
@@ -366,13 +608,13 @@ class LinearProbeLightningModule(pl.LightningModule):
         self.test_preds.append(preds.detach().cpu())
         self.test_labels.append(y.detach().cpu())
 
-        self.log("test/test_loss", loss, on_epoch=True)
-        self.log("test/test_acc", self.test_accuracy, on_epoch=True)
-        self.log("test/test_f1_macro", self.test_f1_macro, on_epoch=True)
-        self.log("test/test_f1_micro", self.test_f1_micro, on_step=False, on_epoch=True, prog_bar=False) # prog_bar는 선택사항
-        self.log("test/test_f1_weighted", self.test_f1_weighted, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("test/test_mAUC", self.test_auroc, on_epoch=True)
-        self.log("test/test_mAP", self.test_ap, on_epoch=True)
+        self.log("test/loss", loss, on_epoch=True)
+        self.log("test/acc", self.test_accuracy, on_epoch=True)
+        self.log("test/f1_macro", self.test_f1_macro, on_epoch=True)
+        self.log("test/f1_micro", self.test_f1_micro, on_step=False, on_epoch=True, prog_bar=False) # prog_bar는 선택사항
+        self.log("test/f1_weighted", self.test_f1_weighted, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("test/mAUC", self.test_auroc, on_epoch=True)
+        self.log("test/mAP", self.test_ap, on_epoch=True)
 
     def on_test_epoch_end(self):
         test_labels = gather(torch.cat(self.test_labels, dim=0))
@@ -436,6 +678,12 @@ class LinearProbeLSTM(pl.LightningModule):
         if self.hparams.model_name == "method":
             emb_dim *= 2
             # self.backbone.hprams.embedding *=2
+        
+        # encoder_type에 따라 embedding dimension 조정
+        self.encoder_type = getattr(args, 'encoder_type', 'sensor')
+        if self.encoder_type == "sensor-video":
+            emb_dim *= 2  # sensor + video 임베딩 concatenation
+        
         self.emb_dim = emb_dim
 
              # 🔹 probe_mode가 LSTM일 때만 LSTM 정의
@@ -500,13 +748,10 @@ class LinearProbeLSTM(pl.LightningModule):
         self.test_labels_raw = []
         
 
-    def _encode_windows(self, windows_b_sct):
+    def _encode_sensor_windows(self, windows_b_sct):
+        """센서 윈도우 인코딩"""
         B, S, C, T = windows_b_sct.shape
-        # print("shape: ", B, S, C, T)x
         flat = windows_b_sct.reshape(B * S, C, T)
-        # ✅ Conv1d expects [B, C, T]. If input is [B, T, C], fix it.
-        # if flat.shape[1] < flat.shape[2]:
-        #     flat = flat.permute(0, 2, 1)
 
         if self.hparams.model_name in ["method", "comodo", "primus", "imu2clip"]:
             sensor_encoder = self.backbone.sensor_model
@@ -523,13 +768,77 @@ class LinearProbeLSTM(pl.LightningModule):
         elif self.hparams.model_name == "comodo":
             reps = sensor_encoder(flat)
         else:
-            raise ValueError(f"Unknown model_name: {self.hparams.model_name}")
+            raise ValueError(f"Unknown model_name for sensor: {self.hparams.model_name}")
 
         reps = reps.reshape(B, S, -1)
         return reps
+
+    def _encode_video_windows(self, video_windows, flow_windows=None):
+        """비디오 윈도우 인코딩 (정확히 batch_size개씩 처리하여 메모리 절약)"""
+        B, S, T, C, H, W = video_windows.shape
+        print("video_windows shape:", video_windows.shape)
         
-    def forward(self, windows_b_sct, lengths_b):
-        seq_emb = self._encode_windows(windows_b_sct)  # [B, S, D]
+        # B × S를 먼저 flatten
+        total_windows = B * S
+        all_videos = video_windows.reshape(total_windows, T, C, H, W)
+        
+        if flow_windows is not None:
+            all_flows = flow_windows.reshape(total_windows, *flow_windows.shape[2:])
+        else:
+            all_flows = None
+        
+        chunk_size = self.hparams.batch_size  # 정확히 batch_size개씩 처리
+        all_reps = []
+        
+        for start in range(0, total_windows, chunk_size):
+            end = min(start + chunk_size, total_windows)
+            chunk = all_videos[start:end].contiguous()
+            
+            if all_flows is not None:
+                flow_chunk = all_flows[start:end].contiguous()
+            else:
+                flow_chunk = None
+            
+            with torch.inference_mode():
+                if self.hparams.model_name == "method":
+                    video_encoder = self.backbone.video_model
+                    chunk_reps = video_encoder(chunk, flow_chunk)["z_video_online"]
+                elif self.hparams.model_name == "imu2clip":
+                    video_encoder = self.backbone.video_model
+                    chunk = chunk.permute(0, 2, 1, 3, 4)
+                    chunk_reps = video_encoder.get_video_embeddings(chunk)
+                elif self.hparams.model_name == "primus":
+                    video_encoder = self.backbone.video_model
+                    chunk_reps, _ = video_encoder.get_video_embeddings(chunk)
+                elif self.hparams.model_name == "mae":
+                    chunk_reps = self.backbone.model.forward_video_only(chunk)
+                elif self.hparams.model_name == "comodo":
+                    video_encoder = self.backbone.video_teacher
+                    chunk_reps = video_encoder.encode(chunk)
+                else:
+                    raise ValueError(f"Unknown model_name for video: {self.hparams.model_name}")
+            
+            all_reps.append(chunk_reps)
+        
+        reps = torch.cat(all_reps, dim=0)  # (total_windows, D)
+        reps = reps.reshape(B, S, -1)  # 다시 (B, S, D)로 복원
+        return reps
+
+    def _encode_windows(self, sensor_windows, video_windows=None, flow_windows=None):
+        """encoder_type에 따라 윈도우 인코딩"""
+        if self.encoder_type == "sensor":
+            return self._encode_sensor_windows(sensor_windows)
+        elif self.encoder_type == "video":
+            return self._encode_video_windows(video_windows, flow_windows)
+        elif self.encoder_type == "sensor-video":
+            sensor_reps = self._encode_sensor_windows(sensor_windows)
+            video_reps = self._encode_video_windows(video_windows, flow_windows)
+            return torch.cat([sensor_reps, video_reps], dim=-1)
+        else:
+            raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
+        
+    def forward(self, sensor_windows, lengths_b, video_windows=None, flow_windows=None):
+        seq_emb = self._encode_windows(sensor_windows, video_windows, flow_windows)  # [B, S, D]
 
         # 🔹 probe_mode별 처리
         if self.probe_mode == "meanpool":
@@ -546,12 +855,25 @@ class LinearProbeLSTM(pl.LightningModule):
             return logits
 
     def _shared_step(self, batch):
-        windows, lengths, targets, metas = batch
-        windows = windows.to(self.device, non_blocking=True)
+        # batch에서 video 데이터와 flow도 가져오기 (datamodule에서 제공하는 경우)
+        if len(batch) == 6:
+            sensor_windows, video_windows, flow_windows, lengths, targets, metas = batch
+            video_windows = video_windows.to(self.device, non_blocking=True) if video_windows is not None else None
+            flow_windows = flow_windows.to(self.device, non_blocking=True) if flow_windows is not None else None
+        elif len(batch) == 5:
+            sensor_windows, video_windows, lengths, targets, metas = batch
+            video_windows = video_windows.to(self.device, non_blocking=True) if video_windows is not None else None
+            flow_windows = None
+        else:
+            sensor_windows, lengths, targets, metas = batch
+            video_windows = None
+            flow_windows = None
+        
+        sensor_windows = sensor_windows.to(self.device, non_blocking=True)
         lengths = lengths.to(self.device)
         targets = targets.to(self.device)
 
-        logits = self(windows, lengths)
+        logits = self(sensor_windows, lengths, video_windows, flow_windows)
         loss = self.criterion(logits, targets)
         preds = logits.argmax(dim=1)
         probs = F.softmax(logits, dim=1)  # AUROC/AP 용
@@ -684,7 +1006,7 @@ class LinearProbeLSTM(pl.LightningModule):
         for m in [
             self.test_acc, self.test_f1_micro, self.test_f1_macro, self.test_f1_weighted,
             self.test_prec_macro, self.test_recall_macro, self.test_auroc, self.test_ap,
-            self.test_conf_matrix
+            # self.test_conf_matrix
         ]:
             m.reset()
 
@@ -704,7 +1026,9 @@ def main(args):
     # HWU-USP 분기
     if args.dataset_name == "HWU-USP":
         args.num_classes = 5
-        args.threshold_epoch = 100
+        args.threshold_epoch = -1
+        args.seq_len = 100
+        args.num_sensors = 6
         datamodule = MethodDataModule(args, stage="linear_probe_lstm")
         datamodule.setup("fit")  # ✅ 추가
         backbone = get_backbone_with_mode(args)
@@ -719,13 +1043,18 @@ def main(args):
 
     else:
         args.num_classes = 14
-        args.threshold_epoch = 100 # need only sensor data
+        args.threshold_epoch = -1
+        args.seq_len = 128
+        args.num_sensors = 37
         datamodule = MethodDataModule(args, stage='linear_probe')
         
         backbone = get_backbone_with_mode(args)
         model = LinearProbeLightningModule(args, backbone)
         monitor = 'val_acc'
     
+    if args.encoder_type == "sensor":
+        args.threshold_epoch = 100 # need only sensor data
+        
     # 분산 환경이 초기화되었는지 확인
     if dist.is_initialized():
         world_size = dist.get_world_size()
@@ -735,7 +1064,7 @@ def main(args):
         run_name = f"{args.sensor_model_name}_{args.dataset_name}_linear_probe_{args.batch_size* world_size}_linearEpoch={args.linear_epochs}"
     else:
         sensor_tag = "_supervision" if args.supervision else ""
-        run_name = f"{args.model_name}_{args.dataset_name}_{args.ckpt_name}_{backbone.hparams.batch_size*4}_{backbone.hparams.epochs}_inear_probe_{args.batch_size* world_size}_linearEpoch={args.linear_epochs}{sensor_tag}"
+        run_name = f"{args.model_name}_{args.dataset_name}_{args.ckpt_name}_{backbone.hparams.batch_size*4}_{backbone.hparams.epochs}_linear_probe_{args.batch_size* world_size}_linearEpoch={args.linear_epochs}{sensor_tag}_{args.encoder_type}"
     is_master_process = os.environ.get("LOCAL_RANK", "0") == "0"
     logger = WandbLogger(project="Method_Linear_Probe", name=run_name) if is_master_process else False
     # ckpt_cb = ModelCheckpoint(monitor=monitor, mode='max',
@@ -748,12 +1077,34 @@ def main(args):
         devices=-1,
         strategy='ddp_find_unused_parameters_true',
         logger=logger,
+        sync_batchnorm=True,
         # callbacks=[ckpt_cb]
     )
+
+    # datamodule.setup("fit")
+
+    # backbone.train()
+    # with torch.no_grad():
+    #     device = 'cuda'
+    #     for i, batch in enumerate(datamodule.train_dataloader()):
+    #         video_data, sensor_data, labels, _, flow = batch 
+    #         _ = backbone.video_model(video_data.to(device), None)
+    #         _ = backbone.sensor_model(sensor_data.to(device))
+    #         print("update default setting...", i)
+    #         if i == 200:
+    #             break
+    # backbone.eval()
 
     print("--- Starting Linear Probing ---")
     trainer.fit(model, datamodule)
     datamodule.setup("fit")
+
+    # ============================================================
+    # Efficiency Profiling (GFLOPS & FPS)
+    # ============================================================
+    if getattr(args, 'profile', False) and is_master_process:
+        print("\n--- Running Efficiency Profiling ---")
+        profile_model_efficiency(model, datamodule, args)
 
     print("--- Testing ---")
     trainer.test(model=model, dataloaders=datamodule.test_dataloader())
@@ -765,11 +1116,16 @@ if __name__ == "__main__":
     parser.add_argument('--linear_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--probe_mode', type=str, default='meanpool', choices=['lstm', 'meanpool'], help="Choose probing strategy: 'lstm' for temporal model or 'meanpool' for simple temporal average pooling")
     parser.add_argument('--supervision', type=bool, default=False, help='If True, skip backbone weight loading and run with frozen hyperparameter configs only')
     parser.add_argument('--sensor_only', action='store_true', help='Train sensor-only model from scratch (no checkpoint)')
     parser.add_argument('--sensor_model_name', type=str, default='dlinear', choices=['dlinear', 'timesnet', 'moment', 'mantis', 'imu2clip', 'comodo'])
+    parser.add_argument('--embedding_dim', type=str, default=256, help='for sensor only mode')
+    parser.add_argument('--encoder_type', type=str, default='sensor', choices=['video', 'sensor', 'sensor-video'], 
+                        help='추론 시 사용할 인코더 타입: sensor(기본값), video, sensor-video(두 임베딩 concat)')
+    parser.add_argument('--use_flow', action='store_true', help='Use optical flow')
+    parser.add_argument('--profile', action='store_true', help='Run GFLOPS and FPS profiling after training')
 
     args = parser.parse_args()
     main(args)

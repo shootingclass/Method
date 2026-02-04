@@ -118,7 +118,16 @@ class PRIMUSLightningModule(BasePretrainModule):
         self.ssl_loss = InfoNCE(symmetric_loss=True, learn_temperature=True)
 
         self.sensor_model = MW2StackRNNPoolingMultihead(num_sensors=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
-        self.video_model = Clip4CLIPModel(freeze=True)
+        self.video_model = Clip4CLIPModel(freeze=False)
+
+         # ✅ t-SNE용 캐시 경로 (args에 tsne_cache_dir 넣어주면 됨)
+        self.tsne_cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/tsne_cache/primus_detailed_prudent"
+
+        # ✅ validation에서 임시로 모아둘 버퍼들
+        self.train_z_video = []
+        self.train_z_sensor = []
+        self.train_labels = []
+        self.train_preds = []
 
     def setup(self, stage: str):
         if self.hparams.nnclr and stage == 'fit':
@@ -190,19 +199,26 @@ class PRIMUSLightningModule(BasePretrainModule):
 
         x_video = videos
         y_video = torch.zeros((len(x_sensor), 512), dtype=torch.float32).to(self.device)
-        for i in range(len(batch)):
+        for i in range(len(x_sensor)):
             videos, sensors, labels, sample_ids, _ = batch
             idx, sample_id = sample_ids
-            folder_name = sample_id[i].split('_')[0]  # "S3-ADL1"
-            cache_path = os.path.join(self.hparams.baseline_video_cache_dir, folder_name, sample_id[i] + '.pt')
+            # print(sample_id[0])
+            # folder_name = sample_id[i].split('_')[0]  # "S3-ADL1"
+            # cache_path = os.path.join(self.hparams.baseline_video_cache_dir, folder_name, sample_id[i] + '.pt')
 
-            if os.path.exists(cache_path):
+            if False and os.path.exists(cache_path):
                 y_video[i] = torch.load(cache_path).to(self.device)
             else:
-                y_video[i] = self.video_model.get_video_embeddings(x_video[i].unsqueeze(0))
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                torch.save(y_video[i].cpu().detach(), cache_path)
+                x = x_video[i]
+                feat, _ = self.video_model.get_video_embeddings(x.unsqueeze(dim=0))
+                y_video[i] = feat.squeeze(0)
+                # os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                # torch.save(y_video[i].cpu().detach(), cache_path)
         out["video"] = y_video
+        self.train_z_video.append(y_video.cpu().detach())
+        self.train_z_sensor.append(y_sensor['emb'].cpu().detach())
+        self.train_labels.append(labels.cpu().detach())
+        self.train_preds.append(labels.cpu().detach())
 
         return out
 
@@ -210,7 +226,6 @@ class PRIMUSLightningModule(BasePretrainModule):
           # y: {modality[str]: y_*} where y_*: B x size_embeddings
         print("training step batch idx:", batch_idx)
         y = self(batch, train_time=True)
-
         # Use NCE loss
         # y_query_modality = y[self.source_modality]
         loss_output = 0.0
@@ -231,7 +246,7 @@ class PRIMUSLightningModule(BasePretrainModule):
                 ssl_loss = self.ssl_loss(query=y[f"ssl_view=0"], positive_key=y[f"ssl_view={(i+1)}"])
 
                 self.log("train_ssl_loss", ssl_loss, logger=True, sync_dist=True)
-                loss_output += (self.hparams.ssl_coeff)*ssl_loss
+                # loss_output += (self.hparams.ssl_coeff)*ssl_loss
 
 
         if self.hparams.nnclr:
@@ -264,6 +279,67 @@ class PRIMUSLightningModule(BasePretrainModule):
     
         self.log("train_loss", loss_output, logger=True, sync_dist=True)
         return loss_output
+
+    def on_train_epoch_end(self):
+        if self.tsne_cache_dir is None:
+            return
+
+        if len(self.train_z_video) == 0:
+            return
+
+        # 1) concat
+        z_video = torch.cat(self.train_z_video, dim=0).numpy()
+        z_sensor = torch.cat(self.train_z_sensor, dim=0).numpy()
+        labels  = torch.cat(self.train_labels, dim=0).numpy()
+        preds   = torch.cat(self.train_preds, dim=0).numpy()
+
+        # 2) 클래스 수 (라벨이 -1 이상인 경우만 사용)
+        if (labels >= 0).any():
+            num_clusters = int(labels[labels >= 0].max() + 1)
+        else:
+            num_clusters = -1
+
+        # 3) 저장
+        self.save_tsne_cache(
+            save_dir=self.tsne_cache_dir,
+            epoch=self.current_epoch,
+            z_video=z_video,
+            z_sensor=z_sensor,
+            labels=labels,
+            preds=preds,
+            num_clusters=num_clusters,
+            prefix="",  # 필요하면 "primus_" 같은 prefix 줄 수도 있음
+        )
+
+        # 4) 버퍼 비우기
+        self.train_z_video.clear()
+        self.train_z_sensor.clear()
+        self.train_labels.clear()
+        self.train_preds.clear()
+
+    def save_tsne_cache(
+        self,
+        save_dir,
+        epoch,
+        z_video=None,
+        z_sensor=None,
+        labels=None,
+        preds=None,
+        num_clusters=None,
+        prefix="",
+    ):
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"{prefix}epoch_{epoch:04d}.npz")
+
+        np.savez(
+            save_path,
+            z_video=z_video if z_video is not None else np.array([]),
+            z_sensor=z_sensor if z_sensor is not None else np.array([]),
+            labels=labels if labels is not None else np.array([]),
+            preds=preds if preds is not None else np.array([]),
+            num_clusters=np.array(num_clusters if num_clusters is not None else -1),
+        )
+        print(f"[t-SNE cache] Saved to {save_path}")
 
     def predict_step(self, batch, batch_idx: int):
         return self(batch)

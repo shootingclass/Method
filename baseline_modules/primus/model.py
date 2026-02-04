@@ -10,6 +10,8 @@ import json
 from PIL import Image
 from torchvision.transforms import Normalize
 from transformers import CLIPVisionModelWithProjection
+from matplotlib import cm
+import torch.nn.functional as F
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, pool_type="max", embedding_size=32):
@@ -86,7 +88,41 @@ class Clip4CLIPModel(pl.LightningModule):
         print("Loading clip4clip model ...")
 
         self.flag_freeze = freeze
-        self.video_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+        from transformers import CLIPVisionModelWithProjection, CLIPVisionConfig
+
+        config = CLIPVisionModelWithProjection.from_pretrained(
+            "openai/clip-vit-base-patch32"
+        ).config
+
+        config.output_hidden_states = True  # 🔥 핵심
+        config.return_dict = True           # 안전하게
+
+        self.video_model = CLIPVisionModelWithProjection.from_pretrained(
+            "openai/clip-vit-base-patch32",
+            config=config
+        )
+        # self.video_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+
+        self.video_model.eval()
+
+        if self.flag_freeze:
+            self.eval()
+            self.freeze()
+
+    from matplotlib import cm
+import torch.nn.functional as F
+import numpy as np
+
+class Clip4CLIPModel(pl.LightningModule):
+
+    def __init__(self, freeze):
+        super(Clip4CLIPModel, self).__init__()
+        print("Loading clip4clip model ...")
+
+        self.flag_freeze = freeze
+        self.video_model = CLIPVisionModelWithProjection.from_pretrained(
+            "openai/clip-vit-base-patch32"
+        )
 
         self.video_model.eval()
 
@@ -95,21 +131,85 @@ class Clip4CLIPModel(pl.LightningModule):
             self.freeze()
 
     def get_video_embeddings(self, video, device: Optional[str] = None):
+        """
+        video: [B, T, 3, H, W] 또는 [B, T, H, W, 3]
+        return:
+          video_features: [B, D]
+          overlay_list:   길이 B*T 의 numpy uint8 이미지 리스트
+        """
 
-        # This is a forward pass if features are precomputed
+        # precomputed features인 경우
         if len(video.shape) == 2:
-            return video
+            return video, None
 
-        # video: [batch_size x n_frames x grid x grid x 3]
-        batch_size, n_frames, _, grid, _ = video.shape
-        print(video.shape)
-        video = video.reshape(batch_size * n_frames, 3, grid, grid) # [batch_size * n_frames x 3 x grid x grid] to parallelize
-        visual_output_raw = self.video_model(video)
-        video_features = visual_output_raw["image_embeds"]
-        video_features = video_features.reshape(batch_size, n_frames, -1)
+        # --- 0) 입력 shape 정리 ---
+        if video.shape[2] == 3:
+            # [B, T, 3, H, W]
+            B, T, C, H, W = video.shape
+            video_btchw = video
+        else:
+            # [B, T, H, W, 3]
+            B, T, H, W, C = video.shape
+            video_btchw = video.permute(0, 1, 4, 2, 3)  # → [B,T,3,H,W]
 
-        # average over frames
+        video_orig = video_btchw  # overlay용 원본 보관
+        video_flat = video_btchw.reshape(B * T, 3, H, W)  # CLIP 입력
+
+        # --- 1) CLIP forward ---
+        visual_output_raw = self.video_model(video_flat)
+
+        # 🔑 여기! last_hidden_state는 vision_model_output 안에 있음
+        token_feats = visual_output_raw.last_hidden_state
+        # token_feats: [B*T, 50, 768]  (CLS + 49 patch)
+
+        # --- 2) patch token → spatial map ---
+        patch_tokens = token_feats[:, 1:, :]           # [B*T, 49, 768]
+        num_patches = patch_tokens.shape[1]            # 49
+        S = int(num_patches ** 0.5)                    # 7
+        spatial_map = patch_tokens.reshape(B * T, S, S, patch_tokens.shape[-1])  # [B*T, 7,7,768]
+
+        # --- 3) frame별 overlay 생성 ---
+        overlay_list = []
+
+        for idx in range(B * T):
+            b = idx // T
+            t = idx % T
+
+            # feature map → heatmap
+            feat = spatial_map[idx]                 # [7,7,768]
+            heat = feat.mean(-1).detach().cpu().numpy()      # [7,7]
+
+            hmin, hmax = heat.min(), heat.max()
+            if hmax == hmin:
+                heat_norm = np.zeros_like(heat)
+            else:
+                heat_norm = (heat - hmin) / (hmax - hmin + 1e-8)
+
+            cmap = cm.get_cmap("jet")
+            heat_rgb = cmap(heat_norm)[:, :, :3]    # [7,7,3], 0~1
+
+            heat_t = torch.from_numpy(heat_rgb).permute(2, 0, 1)[None].float()
+            heat_up = F.interpolate(
+                heat_t, size=(H, W), mode="bilinear", align_corners=False
+            )[0].permute(1, 2, 0).numpy()          # [H,W,3]
+
+            # 원본 프레임
+            frame = video_orig[b, t].detach().cpu()  # [3,H,W]
+            if frame.min() < 0:  # -1~1 → 0~1
+                frame = (frame + 1) / 2.0
+            frame_np = frame.permute(1, 2, 0).numpy()  # [H,W,3]
+
+            # overlay
+            alpha = 0.45
+            overlay = (1 - alpha) * frame_np + alpha * heat_up
+            overlay_uint8 = (np.clip(overlay, 0, 1) * 255).astype(np.uint8)
+
+            overlay_list.append(overlay_uint8)
+
+        # --- 4) frame 평균 CLIP embedding ---
+        video_features = visual_output_raw.image_embeds  # [B*T, D]
+        video_features = video_features.reshape(B, T, -1)
         video_features = video_features.mean(dim=1)
         video_features = video_features / video_features.norm(dim=-1, keepdim=True)
 
-        return video_features
+        return video_features, overlay_list

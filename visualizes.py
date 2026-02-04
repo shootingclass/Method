@@ -10,6 +10,8 @@ from typing import List
 from sklearn.manifold import TSNE
 from torchvision.transforms.functional import to_pil_image
 from scipy.optimize import linear_sum_assignment
+import seaborn as sns
+import pandas as pd
 
 
 #################################################################
@@ -19,6 +21,8 @@ START_INDEX = 134+60
 END_INDEX = 231
 # START_INDEX = 1
 # END_INDEX = 11
+
+ACTION_MERGE_LABELS = None
 
 ACTION_MERGE_LABELS_OPPORTUNITY = {
         0: 'Door 1',
@@ -47,20 +51,36 @@ ACTION_MERGE_LABELS_OPPORTUNITY_ALL = {0: 'Open Door 1',
     11: 'Close Drawer 2',
     12: 'Open Drawer 3',
     13: 'Close Drawer 3',
-    14: 'Clean Table',
-    15: 'Drink from Cup',
-    16: 'Toggle Switch'}
-
-ACTION_MERGE_LABELS_HWU_USP = {
-    0: "Ktch_B4_Cupboard",
-    1: "Ktch_Motion_1",
-    2: "Ktch_Motion_2",
-    3: "Ktch_T1_Cupboard",
-    4: "Ktch_T2_Cupboard",
-    5: "Ktch_T3_Cupboard",
-    6: "None Behavior"
 }
 
+# ACTION_MERGE_LABELS_HWU_USP = {
+#     0: "Ktch_B4_Cupboard",
+#     1: "Ktch_Motion_1",
+#     2: "Ktch_Motion_2",
+#     3: "Ktch_T1_Cupboard",
+#     4: "Ktch_T2_Cupboard",
+#     5: "Ktch_T3_Cupboard",
+#     6: "None Behavior"
+# }
+
+# ACTION_MERGE_LABELS_HWU_USP = {
+#     0: "close Ktch_B4_Cupboard",
+#     1: "close Ktch_T1_Cupboard",
+#     2: "close Ktch_T2_Cupboard",
+#     3: "close Ktch_T3_Cupboard",
+
+#     4: "open Ktch_B4_Cupboard",
+#     5: "open Ktch_T1_Cupboard",
+#     6: "open Ktch_T2_Cupboard",
+#     7: "open Ktch_T3_Cupboard",
+
+#     8: "random",
+# }
+
+ACTION_MERGE_LABELS_HWU_USP = {
+    0: "Open",
+    1: "Close",
+}
 #################################################################
 
 
@@ -296,8 +316,13 @@ def visualize_tsne_2d(embeddings, true_labels, pred_labels=None, prototypes=None
     reduced_prototypes = reduced_all[len(embeddings):] if prototypes is not None else None
 
     # --- 컬러맵 설정 ---
-    cmap = plt.cm.get_cmap('tab20', num_classes)
+    cmap = plt.cm.get_cmap('tab10', num_classes)
     colors = cmap(np.linspace(0, 1, num_classes))
+    if num_classes == 2:
+        colors = np.array([
+            [0.2, 0.4, 0.8, 1.0],   # blue-ish
+            [0.9, 0.3, 0.3, 1.0],   # red-ish
+        ])
 
     # --- pred_labels 존재 여부에 따라 subplot 구성 ---
     if pred_labels is None:
@@ -380,8 +405,13 @@ def visualize_tsne_3d(embeddings, true_labels, pred_labels=None, prototypes=None
     reduced_embeddings = reduced_all[:len(embeddings)]
     reduced_prototypes = reduced_all[len(embeddings):] if prototypes is not None else None
 
-    cmap = plt.cm.get_cmap('tab20', num_classes)
+    cmap = plt.cm.get_cmap('tab10', num_classes)
     colors = cmap(np.linspace(0, 1, num_classes))
+    if num_classes == 2:
+        colors = np.array([
+            [0.2, 0.4, 0.8, 1.0],   # blue-ish
+            [0.9, 0.3, 0.3, 1.0],   # red-ish
+        ])
 
     # --- pred_labels가 없는 경우: 단일 3D plot ---
     if pred_labels is None:
@@ -626,94 +656,336 @@ def cross_modal_retrieval(z_video_np, z_sensor_np):
     return acc
 
 
+CUM_WFINAL = {"Hard": None, "False": None, "Easy": None, "count": 0}
+CUM_ATTRACT = None  # sim_stable 기반 누적 맵
+
 
 @torch.no_grad()
 def visualize_Wfinal_differences(
-    self, W_final_np, hard_mask, false_mask, motion_same_mask,
-    labels_np, class_names, step_tag, logger=None
+    W_final_np, sim_stb_np, hard_mask, false_mask, motion_same_mask,
+    labels_np, class_names, step_tag, epoch, logger=None
 ):
-    """🔥 Hard/False/Easy 관계 간 W_final 차이 시각화 통합 함수"""
+    """
+    🎯 Summary visualization of Hard / False / Easy regions for W_final.
+    - W_final_np: (N, N) similarity / weight matrix (numpy)
+    - hard_mask, false_mask, motion_same_mask: boolean (N, N)
+    - labels_np: (N,)
+    - class_names: list[str]
+    """
+    """
+    🎯 Sim_Stable Attraction Map
+    - 각 anchor 클래스가 가장 유사하다고 인식한 target 클래스를 epoch마다 누적 시각화.
 
-    # ============= 1️⃣ 데이터프레임 구성 =============
-    N = len(labels_np)
-    mask_upper = np.triu(np.ones((N, N), dtype=bool), k=1)
-    data = []
-    for i in range(N):
-        for j in range(i+1, N):
-            relation = None
-            if hard_mask[i, j]:
-                relation = "Hard"
-            elif false_mask[i, j]:
-                relation = "False"
-            elif motion_same_mask[i, j]:
-                relation = "Easy(o)"
-            else:
-                continue
-            data.append({
-                "anchor_class": class_names[labels_np[i]],
-                "relation": relation,
-                "W_final": W_final_np[i, j],
-            })
-    df = pd.DataFrame(data)
+    Args:
+        sim_stb_np: (N, N) similarity matrix (높을수록 유사)
+        labels_np: (N,)
+        class_names: list[str]
+        step_tag: wandb 로깅 태그 prefix
+        epoch: 현재 epoch (int)
+        logger: wandb logger (optional)
+    """
 
-    # ============= 2️⃣ Class-wise violinplot =============
-    plt.figure(figsize=(14, 6))
-    sns.violinplot(x="anchor_class", y="W_final", hue="relation", data=df,
-                   split=True, inner="quartile", palette="Set2", cut=0)
-    plt.xticks(rotation=45, ha="right")
-    plt.title("Per-class W_final Distribution by Relation Type")
-    plt.tight_layout()
-    fig1 = plt.gcf()
-    if logger is not None:
-        logger.experiment.log({f"{step_tag}/classwise_Wfinal_violin": wandb.Image(fig1)})
-    plt.close(fig1)
+    global CUM_ATTRACT
 
-    # ============= 3️⃣ Global Mean Comparison =============
-    mean_vals = df.groupby("relation")["W_final"].mean().reset_index()
-    plt.figure(figsize=(5, 5))
-    sns.barplot(x="relation", y="W_final", data=mean_vals, palette="Set2")
-    plt.ylabel("Mean W_final")
-    plt.title("Global Mean W_final by Relation Type")
-    fig2 = plt.gcf()
-    if logger is not None:
-        logger.experiment.log({f"{step_tag}/global_Wfinal_means": wandb.Image(fig2)})
-    plt.close(fig2)
+    num_classes = len(class_names)
+    if CUM_ATTRACT is None:
+        CUM_ATTRACT = np.zeros((num_classes, num_classes), dtype=np.int32)
 
-    # ============= 4️⃣ Class-wise ΔW_final (False - Hard) =============
-    diff_vals = []
-    for c_idx, cname in enumerate(class_names):
-        class_mask = (labels_np == c_idx)
-        pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
-        hard_vals = W_final_np[hard_mask & pair_mask]
-        false_vals = W_final_np[false_mask & pair_mask]
-        easy_vals = W_final_np[motion_same_mask & pair_mask]
-        if len(hard_vals) == 0 or len(false_vals) == 0:
+    # ===============================================================
+    # 1️⃣ 각 anchor class별로 가장 유사한 target class 찾기
+    # ===============================================================
+    for a in range(num_classes):
+        a_mask = (labels_np == a)
+        if not np.any(a_mask):
             continue
-        diff_vals.append({
-            "class_name": cname,
-            "Δ(False−Hard)": np.mean(false_vals) - np.mean(hard_vals),
-            "Δ(Easy−Hard)": np.mean(easy_vals) - np.mean(hard_vals) if len(easy_vals)>0 else np.nan
-        })
-    df_diff = pd.DataFrame(diff_vals)
 
-    plt.figure(figsize=(8, 3))
-    sns.barplot(x="class_name", y="Δ(False−Hard)", data=df_diff, color="#27ae60")
-    plt.xticks(rotation=45, ha="right")
-    plt.title("Per-class ΔW_final (False - Hard)")
-    plt.ylabel("ΔW_final")
+        # target class별 평균 유사도 계산
+        sim_means = []
+        for j in range(num_classes):
+            j_mask = (labels_np == j)
+            if not np.any(j_mask):
+                sim_means.append(np.nan)
+                continue
+            sim_vals = sim_stb_np[np.ix_(a_mask, j_mask)]
+            sim_means.append(np.nanmean(sim_vals))
+
+        # 가장 높은 유사도를 보인 target class
+        j_star = np.nanargmax(sim_means)
+        CUM_ATTRACT[a, j_star] += 1
+
+    # ===============================================================
+    # 2️⃣ Heatmap 시각화
+    # ===============================================================
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        CUM_ATTRACT,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        cmap="YlGnBu",
+        annot=False,
+        cbar=True,  # ✅ 색상 막대는 유지
+        cbar_kws={'ticks': []}  # ✅ 눈금(숫자) 제거, 색상 그라데이션만 남김
+    )
+    plt.title("Most Similar Class per Anchor")
+    plt.xlabel("Most similar class (j*)")
+    plt.ylabel("Anchor class (a)")
     plt.tight_layout()
-    fig3 = plt.gcf()
-    if logger is not None:
-        logger.experiment.log({f"{step_tag}/per_class_Wfinal_diff": wandb.Image(fig3)})
-    plt.close(fig3)
 
-    # ============= 5️⃣ Easy까지 포함한 비교 boxplot =============
-    plt.figure(figsize=(10, 5))
-    sns.boxplot(x="relation", y="W_final", data=df, palette="Set3")
-    plt.title("Distribution of W_final by Relation Type (All Classes)")
-    fig4 = plt.gcf()
-    if logger is not None:
-        logger.experiment.log({f"{step_tag}/relation_boxplot": wandb.Image(fig4)})
-    plt.close(fig4)
+    if logger:
+        logger.experiment.log({f"{step_tag}/sim_stable_attraction": wandb.Image(plt.gcf())})
+    plt.close()
 
-    print(f"✅ {step_tag}: 4 visualizations (classwise, global mean, Δ per class, boxplot) logged.")
+    print(f"✅ [Epoch {epoch}] Sim_Stable Attraction Map updated & logged ({step_tag})")
+
+    """
+    🧭 Sim_Stable Attraction Map (Non-cumulative / snapshot)
+    - 각 anchor 클래스가 "이번 epoch 기준"으로 가장 유사하다고 인식한 target 클래스를 시각화.
+    - 누적 X, 매 epoch마다 새로 초기화됨.
+    """
+
+    num_classes = len(class_names)
+    snapshot_mat = np.zeros((num_classes, num_classes), dtype=np.int32)
+
+    # ===============================================================
+    # 1️⃣ 각 anchor class별로 가장 유사한 target class 찾기
+    # ===============================================================
+    for a in range(num_classes):
+        a_mask = (labels_np == a)
+        if not np.any(a_mask):
+            continue
+
+        sim_means = []
+        for j in range(num_classes):
+            j_mask = (labels_np == j)
+            if not np.any(j_mask):
+                sim_means.append(np.nan)
+                continue
+            sim_vals = sim_stb_np[np.ix_(a_mask, j_mask)]
+            sim_means.append(np.nanmean(sim_vals))
+
+        j_star = np.nanargmax(sim_means)
+        snapshot_mat[a, j_star] += 1
+
+    # ===============================================================
+    # 2️⃣ Heatmap 시각화 (리셋형)
+    # ===============================================================
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        snapshot_mat,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        cmap="YlGnBu",
+        annot=False,
+        cbar=True,
+        cbar_kws={'ticks': []}
+    )
+    plt.title(f"Most Similar Class per Anchor (Epoch {epoch})")
+    plt.xlabel("Most similar class (j*)")
+    plt.ylabel("Anchor class (a)")
+    plt.tight_layout()
+
+    if logger:
+        logger.experiment.log({f"qual/sim_stable_snapshot": wandb.Image(plt.gcf())})
+    plt.close()
+
+    print(f"✅ [Epoch {epoch}] Sim_Stable Attraction Snapshot logged (qual)")
+        # ===============================================================
+    # 8️⃣ False vs Hard W_final 차이 (수치 로그)
+    # ===============================================================
+    false_wvals = W_final_np[false_mask]
+    hard_wvals = W_final_np[hard_mask]
+    if len(false_wvals) > 0 and len(hard_wvals) > 0:
+        diff_sum = np.sum(false_wvals) - np.sum(hard_wvals)
+        diff_mean = np.mean(false_wvals) - np.mean(hard_wvals)
+    else:
+        diff_sum, diff_mean = np.nan, np.nan
+
+    print(f"[Epoch {epoch}] ΔW_final(False−Hard): sum={diff_sum:.4f}, mean={diff_mean:.4f}")
+    if logger:
+        logger.experiment.log({
+            f"qual/delta_wfinal_sum": diff_sum,
+            f"qual/delta_wfinal_mean": diff_mean
+        })
+
+    # ===============================================================
+    # 9️⃣ 선택 클래스 합산 BoxPlot (False vs Hard)
+    # ===============================================================
+    subset_keywords = ["Open Drawer 3", "Open Dish", "Close Door2"]  # 🔧 필요시 수정
+    subset_class_ids = [
+        i for i, cname in enumerate(class_names)
+        if any(k.lower() in cname.lower() for k in subset_keywords)
+    ]
+
+    if len(subset_class_ids) > 0:
+        data_subset = []
+        N = len(labels_np)
+
+        for i in range(N):
+            for j in range(i + 1, N):
+                ci, cj = int(labels_np[i]), int(labels_np[j])
+
+                # 선택된 클래스에 속하지 않으면 skip
+                if ci not in subset_class_ids and cj not in subset_class_ids:
+                    continue
+
+                if hard_mask[i, j]:
+                    rel = "Hard"
+                elif false_mask[i, j]:
+                    rel = "False"
+                else:
+                    continue
+
+                data_subset.append({
+                    "relation": rel,
+                    "W_final": W_final_np[i, j],
+                })
+
+        if len(data_subset) > 0:
+            import pandas as pd
+            df_subset = pd.DataFrame(data_subset)
+
+            plt.figure(figsize=(6, 5))
+            sns.boxplot(x="relation", y="W_final", data=df_subset, palette="Set2")
+            plt.title(f"W_final Distribution (Selected Classes Combined)")
+            plt.xlabel("Relation Type")
+            plt.ylabel("W_final Value")
+            plt.tight_layout()
+
+            if logger:
+                logger.experiment.log({f"qual/subset_boxplot_combined": wandb.Image(plt.gcf())})
+            plt.close()
+
+
+
+
+        # ===============================================================
+    # 8️⃣ False vs Hard W_final 차이 (수치 로그 + CDF Plot)
+    # ===============================================================
+    false_wvals = W_final_np[false_mask]
+    hard_wvals = W_final_np[hard_mask]
+    if len(false_wvals) > 0 and len(hard_wvals) > 0:
+        diff_sum = np.sum(false_wvals) - np.sum(hard_wvals)
+        diff_mean = np.mean(false_wvals) - np.mean(hard_wvals)
+
+        # ✅ CDF 시각화 (길이 차이 안전 처리)
+        fn_sorted = np.sort(false_wvals)
+        hn_sorted = np.sort(hard_wvals)
+
+        # 길이 차이 해결을 위한 공통 y축 생성
+        max_len = max(len(fn_sorted), len(hn_sorted))
+        y_common = np.linspace(0, 1, max_len)
+
+        # 보간(interpolation)
+        fn_interp = np.interp(y_common, np.linspace(0, 1, len(fn_sorted)), fn_sorted)
+        hn_interp = np.interp(y_common, np.linspace(0, 1, len(hn_sorted)), hn_sorted)
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(fn_interp, y_common, label='False Negatives (Same Class)', color='blue', linewidth=2)
+        plt.plot(hn_interp, y_common, label='Hard Negatives (Diff Class)', color='red', linewidth=2)
+        plt.title("CDF of $W_{final}$", fontsize=14)
+        plt.xlabel("Weight Value", fontsize=12)
+        plt.ylabel("Cumulative Probability", fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.legend(fontsize=12)
+
+        # ✅ 두 분포 사이 음영 영역 (길이 일치)
+        plt.fill_betweenx(y_common, fn_interp, hn_interp, where=(hn_interp > fn_interp), color='gray', alpha=0.2)
+
+        print("✅ CDF is logged!!")
+        if logger:
+            logger.experiment.log({f"qual/Wfinal_CDF_False_vs_Hard": wandb.Image(plt.gcf())})
+        plt.close()
+
+    else:
+        print("[Warning!] no more heatmap")
+        diff_sum, diff_mean = np.nan, np.nan
+
+    print(f"[Epoch {epoch}] ΔW_final(False−Hard): sum={diff_sum:.4f}, mean={diff_mean:.4f}")
+    if logger:
+        logger.experiment.log({
+            f"qual/delta_wfinal_sum": diff_sum,
+            f"qual/delta_wfinal_mean": diff_mean
+        })
+    try: 
+        visualize_Wfinal_anchorwise(W_final_np, labels_np, class_names, step_tag, epoch, logger)
+    except Exception as e:
+        print("anchorwise Wfinal error", e)
+
+
+CUM_WFINAL_ANCHORWISE = None  # 🔹 전역 누적 맵
+
+@torch.no_grad()
+def visualize_Wfinal_anchorwise(
+    sim_stb_np, labels_np, class_names, step_tag, epoch, logger=None
+):
+    """
+    🎯 Anchor-wise W_final Structure Map
+    - 각 anchor class가 target class를 얼마나 유사하게 보는지를 W_final로 누적 시각화.
+    - W_final은 epoch마다 normalization하여 비교 가능하게 함.
+    - 값이 낮을수록(anchor→target 간 더 유사), 색이 밝게 표시됨.
+
+    Args:
+        W_final_np: (N, N) similarity / distance matrix (낮을수록 유사)
+        labels_np: (N,)
+        class_names: list[str]
+        step_tag: wandb logging prefix
+        epoch: current epoch (int)
+        logger: wandb logger (optional)
+    """
+    global CUM_WFINAL_ANCHORWISE
+    num_classes = len(class_names)
+
+    # 1️⃣ Initialization (epoch=0 시점)
+    if CUM_WFINAL_ANCHORWISE is None:
+        CUM_WFINAL_ANCHORWISE = np.zeros((num_classes, num_classes), dtype=np.float64)
+        CUM_WFINAL_ANCHORWISE_count = np.zeros((num_classes, num_classes), dtype=np.int32)
+        CUM_WFINAL_ANCHORWISE = {
+            "sum": np.zeros((num_classes, num_classes), dtype=np.float64),
+            "count": np.zeros((num_classes, num_classes), dtype=np.int32),
+            "epoch": 0,
+        }
+
+    # 2️⃣ Normalize W_final (epoch마다 스케일 달라서)
+    W_norm = (sim_stb_np - np.nanmin(sim_stb_np)) / (np.nanmax(sim_stb_np) - np.nanmin(sim_stb_np) + 1e-8)
+
+    # 3️⃣ Anchor→Target 평균 계산 후 누적
+    for a in range(num_classes):
+        a_mask = (labels_np == a)
+        if not np.any(a_mask):
+            continue
+        for j in range(num_classes):
+            j_mask = (labels_np == j)
+            if not np.any(j_mask):
+                continue
+            mean_val = np.nanmean(W_norm[np.ix_(a_mask, j_mask)])
+            if not np.isnan(mean_val):
+                CUM_WFINAL_ANCHORWISE["sum"][a, j] += mean_val
+                CUM_WFINAL_ANCHORWISE["count"][a, j] += 1
+
+    CUM_WFINAL_ANCHORWISE["epoch"] += 1
+
+    # 4️⃣ Epoch까지의 평균 계산
+    avg_mat = CUM_WFINAL_ANCHORWISE["sum"] / np.maximum(CUM_WFINAL_ANCHORWISE["count"], 1)
+
+    # 5️⃣ 시각화
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        avg_mat,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        cmap="YlGnBu_r",  # 밝을수록 유사
+        vmin=0, vmax=1,
+        annot=False,
+        cbar=True,
+        cbar_kws={'label': 'Similarity'}
+    )
+    plt.title(f"Anchor-wise Similarity Structure (accumulated up to epoch {epoch})")
+    plt.xlabel("Target class (j)")
+    plt.ylabel("Anchor class (a)")
+    plt.tight_layout()
+
+    if logger:
+        logger.experiment.log({f"{step_tag}/similarity_anchorwise": wandb.Image(plt.gcf())})
+    plt.close()
+
+    print(f"✅ [Epoch {epoch}] Anchor-wise Similarity structure map updated ({step_tag})")

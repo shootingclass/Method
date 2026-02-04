@@ -1,1 +1,1 @@
-from .module import CAVMAELightningModule
+from .module import EVIMAELightningModule

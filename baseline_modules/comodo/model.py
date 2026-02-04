@@ -102,8 +102,8 @@ class VideoTeacher(nn.Module):
             self.processor = VideoMAEImageProcessor.from_pretrained(model_name)
             self.use_mean_pooling = self.model.config.use_mean_pooling
         elif "timesformer" in model_name.lower():
-            # self.model = TimesformerModel.from_pretrained(model_name, **kwargs)
-            self.model = TimesformerForVideoClassification.from_pretrained(model_name, **kwargs)
+            self.model = TimesformerModel.from_pretrained(model_name, **kwargs)
+            # self.model = TimesformerForVideoClassification.from_pretrained(model_name, **kwargs)
             self.processor = AutoImageProcessor.from_pretrained(model_name)
             self.use_mean_pooling = True
         self.device = device
@@ -187,28 +187,122 @@ class VideoTeacherMLP(nn.Module):
     def size(self):
         return self.processor.size
 
-    def encode(self, video_tensor: torch.Tensor, normalize_embeddings: bool = True):
+    # def encode(self, video_tensor: torch.Tensor, normalize_embeddings: bool = True):
+
+    #     with torch.no_grad():
+    #         # video_tensor: [batch_size, num_frames, num_channels, height, width]
+    #         video_tensor = video_tensor.to(self.device)
+
+    #         # video_hidden_state: [batch_size, num_frames, hidden_size]
+    #         video_hidden_state, *_ = self.model(video_tensor, return_dict=False)
+
+    #         # video_embeddings: [batch_size, hidden_size]
+    #         if self.use_mean_pooling:
+    #             video_embeddings = video_hidden_state.mean(dim=1)
+    #         else:
+    #             video_embeddings = video_hidden_state[:, 0]
+
+    #         video_embeddings = self.mlp(video_embeddings)
+
+    #         if normalize_embeddings:
+    #             video_embeddings = F.normalize(video_embeddings, p=2, dim=1)
+
+    #         del video_tensor, video_hidden_state
+    #     return video_embeddings
+    def encode(self, video_tensor: torch.Tensor, normalize_embeddings: bool = True,
+           return_overlay=False):
+        """
+        return:
+            video_embeddings
+            (optionally) overlay_list   # if return_overlay=True
+        """
+
+        import numpy as np
+        import torch.nn.functional as F
+        import matplotlib.cm as cm
 
         with torch.no_grad():
-            # video_tensor: [batch_size, num_frames, num_channels, height, width]
+            B, T, C, H, W = video_tensor.shape
             video_tensor = video_tensor.to(self.device)
 
-            # video_hidden_state: [batch_size, num_frames, hidden_size]
-            video_hidden_state, *_ = self.model(video_tensor, return_dict=False)
+            # -----------------------------------------------------
+            # 1) Teacher forward
+            # -----------------------------------------------------
+            outputs = self.model(video_tensor, output_hidden_states=True, return_dict=True)
 
-            # video_embeddings: [batch_size, hidden_size]
+            # hidden_states[-1]: [B, T*Patch, D]
+            hidden = outputs.hidden_states[-1]  # [B, N_tokens, dim]
+
+            # -----------------------------------------------------
+            # 2) Patch token reshape → feature map
+            # VideoMAE / Timesformer → patch tokens always include cls at token 0
+            # Remove CLS
+            patch_tokens = hidden[:, 1:, :]  # [B, Npatches, D]
+
+            # spatial dims
+            num_patches = patch_tokens.shape[1]
+            spatial_dim = int(np.sqrt(num_patches // T))   # e.g., 14 for VideoMAE
+            tokens_per_frame = spatial_dim * spatial_dim
+
+            # reshape to [B, T, H', W', dim]
+            patch_tokens = patch_tokens.reshape(B, T, spatial_dim, spatial_dim, -1)
+
+            overlay_list = []
+
+            # -----------------------------------------------------
+            # 3) Overlay per-frame heatmap
+            # -----------------------------------------------------
+            if return_overlay:
+                for t in range(T):
+
+                    feat = patch_tokens[0, t]  # [H',W',D]
+                    heat = feat.mean(-1).cpu().numpy()  # [H',W']
+
+                    # normalize heatmap
+                    hmin, hmax = heat.min(), heat.max()
+                    heat_norm = (heat - hmin) / (hmax - hmin + 1e-8)
+
+                    # colormap
+                    cmap = cm.get_cmap('jet')
+                    heat_rgb = cmap(heat_norm)[:, :, :3]
+
+                    # upsample torch
+                    heat_t = torch.from_numpy(heat_rgb).permute(2, 0, 1)[None].float()
+                    heat_up = F.interpolate(
+                        heat_t,
+                        size=(H, W),
+                        mode='bilinear',
+                        align_corners=False
+                    )[0].permute(1, 2, 0).numpy()
+
+                    # original frame
+                    frame = video_tensor[0, t].detach().cpu()
+                    if frame.min() < 0: frame = (frame + 1) / 2
+                    frame_np = frame.permute(1, 2, 0).numpy()
+
+                    # overlay
+                    alpha = 0.45
+                    overlay = (1-alpha)*frame_np + alpha*heat_up
+                    overlay_uint8 = (np.clip(overlay, 0, 1)*255).astype(np.uint8)
+
+                    overlay_list.append(overlay_uint8)
+
+            # -----------------------------------------------------
+            # 4) Teacher embedding (original COMODO)
+            # -----------------------------------------------------
+            video_hidden_state = outputs.last_hidden_state   # [B,T,dim] or [B,dim]
             if self.use_mean_pooling:
                 video_embeddings = video_hidden_state.mean(dim=1)
             else:
                 video_embeddings = video_hidden_state[:, 0]
 
-            video_embeddings = self.mlp(video_embeddings)
-
             if normalize_embeddings:
                 video_embeddings = F.normalize(video_embeddings, p=2, dim=1)
 
-            del video_tensor, video_hidden_state
-        return video_embeddings
+            if return_overlay:
+                return video_embeddings, overlay_list
+            else:
+                return video_embeddings
 
 
 class IMUStudent(nn.Module):

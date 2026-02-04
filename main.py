@@ -37,7 +37,10 @@ def set_model(args, datamodule):
         args.sensor_seq_len = 128
         args.min_cluster_size = 100
         args.mid_label = False
-        args.threshold_classifier_confidence = 0.90
+        if args.centroid_threshold > 0.99:
+            args.threshold_classifier_confidence = 0.00
+        else:  
+            args.threshold_classifier_confidence = 0.90 # 잠시
     elif args.dataset_name == "HWU-USP":
         args.num_sensors = 6
         args.num_classes = 7
@@ -45,7 +48,10 @@ def set_model(args, datamodule):
         args.sensor_seq_len = 128
         args.min_cluster_size = 30
         args.mid_label = True
-        args.threshold_classifier_confidence = 0.99
+        if args.centroid_threshold > 0.99:
+            args.threshold_classifier_confidence = 0.00
+        else:
+            args.threshold_classifier_confidence = 0.99 # 잠시
 
     args.baseline_video_cache_dir = f"./video_caches/{args.model_name}/{args.dataset_name}"
     args.seed = 42
@@ -82,16 +88,16 @@ def set_model(args, datamodule):
         args.sensor_target_len = 150
         return IMU2CLIPLightningModule(args)
     elif args.model_name == "mae":
-        from baseline_modules.mae import CAVMAELightningModule
+        from baseline_modules.mae import EVIMAELightningModule
         args.masking_ratio = 0.75
-        args.contrast_loss_weight = 0.01
+        args.mi_loss_weight = 0.01
         args.mae_loss_weight = 1.0
         args.norm_pix_loss = True
         args.lrscheduler_start = 10
         args.lrscheduler_decay = 0.5
         args.lrscheduler_step = 5
         args.embedding_dim = 768 # VIT
-        return CAVMAELightningModule(args)
+        return EVIMAELightningModule(args)
     else:
         NameError(f"Invalid model name: {args.model_name}")   
 
@@ -128,7 +134,7 @@ class SaveSpecificEpochCallback(pl.Callback):
             except Exception as e:
                 print(f"[rank{trainer.global_rank}] pre-save barrier skip: {e}")
 
-        # --- checkpoint 저장
+        # --- checkpoint 저장 (rank 0만)
         if epoch in self.save_epochs and trainer.is_global_zero:
             save_path = os.path.join(
                 self.save_dir,
@@ -138,9 +144,13 @@ class SaveSpecificEpochCallback(pl.Callback):
             trainer.save_checkpoint(save_path)
             print(f"✅ [rank0] saved: {save_path}")
 
-        if trainer.global_rank != 0 or trainer.global_rank != "0":
-            print("end print")
-            strategy.barrier("post-save sync")
+        # --- post-save barrier (모든 rank가 동기화되도록)
+        if epoch in self.save_epochs:
+            try:
+                if strategy is not None and hasattr(strategy, "barrier"):
+                    strategy.barrier("post-save sync")
+            except Exception as e:
+                print(f"[rank{trainer.global_rank}] post-save barrier skip: {e}")
 
         print(f"[rank{trainer.global_rank}] epoch {epoch} callback done")
 
@@ -193,18 +203,16 @@ def main(args):
         bs=args.batch_size,
         save_dir=f"./checkpoints/{args.model_name}/{args.dataset_name}/manual_epochs"
     )
-    if args.model_name != "methodd":
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
-            # filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
-            save_top_k=1,            # 가장 좋은 모델 1개만 저장
-            monitor="train/contrastive_loss",      # val_loss를 기준으로 성능을 판단
-            mode="min",              # val_loss는 낮을수록 좋으므로 'min' 모드
-            save_last=True,
-        )
-        callbacks = [DatasetEpochCallback(), checkpoint_callback]
-    else:
-        callbacks = [DatasetEpochCallback()]
+    
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=f"./checkpoints/{args.model_name}/{args.dataset_name}",  # 모델이 저장될 폴더
+        # filename="pretrained_model-{epoch:02d}-{train_loss:.2f}", # 저장될 파일 이름 형식
+        save_top_k=1,            # 가장 좋은 모델 1개만 저장
+        monitor="train/contrastive_loss",      # val_loss를 기준으로 성능을 판단
+        mode="min",              # val_loss는 낮을수록 좋으므로 'min' 모드
+        save_last=True,
+    )
+    callbacks = [DatasetEpochCallback(), checkpoint_callback]
 
     # 4. 트레이너 설정 및 학습 시작
     trainer = pl.Trainer(
@@ -242,9 +250,10 @@ if __name__ == '__main__':
     parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
     parser.add_argument("--project_name", type=str, default="Method_Test_Lightning", help="WandB project name")
     parser.add_argument("--save_stage_cache", type=bool, default=False, help="Whether use stage cache")
+    parser.add_argument("--save_weights", type=bool, default=False, help="Whether save weights")
 
     # 학습 인자    
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=26)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_frames", type=int, default=20)
@@ -257,12 +266,13 @@ if __name__ == '__main__':
     parser.add_argument("--bad_correction_epoch", type=int, default=10)
 
     parser.add_argument("--momentum_m", type=float, default=0.999)
-    parser.add_argument("--lambda_hard", type=float, default=4.0)
+    parser.add_argument("--lambda_hard", type=float, default=3.0)
     parser.add_argument("--motion_damp_temp", type=float, default=0.1)
-    parser.add_argument("--contrastive_temp", type=float, default=0.07)
+    parser.add_argument("--contrastive_temp", type=float, default=0.10)
     parser.add_argument("--ablation_study", type=str, default=None)
 
     parser.add_argument("--damp_warmup_epochs", type=int, default=5)
+    parser.add_argument("--use_flow", action='store_true', help="Use optical flow")
 
     
     args = parser.parse_args()

@@ -181,7 +181,7 @@ class ClipConsistentTransforms:
 
 
 class VideoSensorDataset(Dataset):
-    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index, cache_dir):
+    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index, cache_dir, use_flow=False):
         super().__init__()
         
         self.data_root = data_root
@@ -214,10 +214,14 @@ class VideoSensorDataset(Dataset):
             if 'optical_flow_dir' in item:
                 relative_path_optical_flow = item['optical_flow_dir']
                 optical_flow_path = os.path.join(self.data_root, relative_path_optical_flow)
+                print("optical flow path", optical_flow_path)
             else:
                 optical_flow_path = None
+                # print(self.data_root, item)
             
             self.samples.append((video_path, sensor_path, label, item_id, optical_flow_path))
+
+        self.use_flow = use_flow
 
     def __len__(self):
         return len(self.samples)
@@ -226,14 +230,14 @@ class VideoSensorDataset(Dataset):
         video_path, sensor_path, label, item_id, flow_path = self.samples[idx]
         
         ######### 비디오 전처리 #########       
-        if self.current_epoch <= self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
+        if self.current_epoch < self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
             # 1. self.num_frames 개수만큼의 가짜 이미지 '리스트'를 생성합니다.
             dummy_clip = [Image.new('RGB', (224, 224)) for _ in range(self.num_frames)]
 
             # 2. 이미지 리스트(클립)를 transform에 전달합니다.
             # self.transform은 내부적으로 이 리스트를 올바른 모양의 텐서로 변환해 줄 것입니다.
             frames_tensor = self.transform(dummy_clip)
-            # print("fake clip used", self.current_epoch)
+            print("fake clip used", self.current_epoch)
 
         ######### 비디오 전처리 #########       
         # 1. OpenCV를 사용하여 비디오 캡처 객체 생성
@@ -301,7 +305,6 @@ class VideoSensorDataset(Dataset):
                         # 락을 시도 (배타적 락). 다른 프로세스가 락을 잡고 있으면 여기서 대기합니다.
 
                         fcntl.flock(f_lock, fcntl.LOCK_EX)
-                        # print("clip is cached", cache_path)
 
                         # 3. 락을 획득한 후, 혹시 그사이에 다른 워커가 캐시를 만들었는지 다시 확인 (Double Check)
                         #    (우리가 락을 기다리는 동안, 앞선 워커가 캐싱을 완료했을 수 있음)
@@ -369,7 +372,7 @@ class VideoSensorDataset(Dataset):
             sensor_data = self.sensor_transform(sensor_data)
 
         # Optical flow 전처리
-        if flow_path is not None:
+        if self.use_flow and flow_path is not None:
             try:
                 flow_path = os.path.join(flow_path, "flow.npy")
                 flow = np.load(flow_path) 
@@ -384,12 +387,16 @@ class VideoSensorDataset(Dataset):
                         flow, size=(224, 224),
                         mode="bilinear", align_corners=False
                     )
+                    print("flow is resized")
             except: 
-                flow = {}
+                print(f"File error: {flow_path}")
+                # 파일이 없으면 0으로 채워진 빈 텐서 (크기 [1, 2, H, W] 등)를 생성하거나 
+                # 아예 에러를 발생시켜 해당 샘플을 제외하는 것이 더 좋습니다.
+                flow = torch.empty(0)
                 
         else:
             flow = {}
-
+            print("no flow")
         return frames_tensor, sensor_data, label, [idx, item_id], flow
     
     def set_epoch(self, epoch):

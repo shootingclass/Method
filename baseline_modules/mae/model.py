@@ -95,7 +95,7 @@ class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
-        # 모달리티별 LayerNorm은 CAVMAE 논문 의도가 아니라면 제거 가능
+        # 모달리티별 LayerNorm은 EVIMAE 논문 의도가 아니라면 제거 가능
         self.norm1 = norm_layer(dim) 
         # self.norm1_a = norm_layer(dim) # 사용 안 함
         # self.norm1_v = norm_layer(dim) # 사용 안 함
@@ -190,11 +190,11 @@ class Block(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
     
-class CAVMAE(nn.Module):
+class EVIMAE(nn.Module):
     def __init__(self,
                  sensor_in_chans=37, sensor_seq_len=128, sensor_patch_size=(4, 16),
                  img_size=224, video_patch_size=16, video_in_chans=3,
-                 embed_dim=768, modality_specific_depth=11, num_heads=12,
+                 embed_dim=768, modality_specific_depth=11, num_heads=32,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
         super().__init__()
@@ -228,15 +228,19 @@ class CAVMAE(nn.Module):
         self.pos_embed_v = nn.Parameter(torch.zeros(1, self.patch_embed_v.num_patches, embed_dim), requires_grad=False)
 
         # 이하 __init__ 동일 ...
-        self.blocks_s = nn.ModuleList([Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) for _ in range(modality_specific_depth)])
-        self.blocks_v = nn.ModuleList([Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) for _ in range(modality_specific_depth)])
-        self.blocks_u = nn.ModuleList([Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) for _ in range(12 - modality_specific_depth)])
+        self.blocks_s = nn.ModuleList([Block(embed_dim, num_heads) for _ in range(1)])
+        self.blocks_v = nn.ModuleList([Block(embed_dim, num_heads) for _ in range(1)])
+        self.blocks_u = nn.ModuleList([Block(embed_dim, num_heads) for _ in range(1)])
+
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_embed_dim, decoder_num_heads)
+            for _ in range(4)
+        ])
         self.norm_s, self.norm_v, self.norm = norm_layer(embed_dim), norm_layer(embed_dim), norm_layer(embed_dim)
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.decoder_pos_embed_s = nn.Parameter(torch.zeros(1, self.patch_embed_s.num_patches, decoder_embed_dim), requires_grad=False)
         self.decoder_pos_embed_v = nn.Parameter(torch.zeros(1, self.patch_embed_v.num_patches, decoder_embed_dim), requires_grad=False)
-        self.decoder_blocks = nn.ModuleList([Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) for _ in range(decoder_depth)])
         self.decoder_norm = norm_layer(decoder_embed_dim)
         self.decoder_pred_s = nn.Linear(decoder_embed_dim, self.sensor_patch_size[0] * self.sensor_patch_size[1] * 1, bias=True) # in_chans=1
         self.video_patch_size_tuple = to_tuple(video_patch_size) # video_patch_size가 int일 수 있으므로 튜플 변환
@@ -359,15 +363,41 @@ class CAVMAE(nn.Module):
         pred_v = self.decoder_pred_v(x[:, num_s_patches_total:])
         
         return pred_s, pred_v
-    
-    # forward_contrastive (이전과 동일)
-    def forward_contrastive(self, s_rep, v_rep):
-        s_rep_agg = s_rep.mean(dim=1); v_rep_agg = v_rep.mean(dim=1)
-        s_rep_norm = F.normalize(s_rep_agg, dim=-1); v_rep_norm = F.normalize(v_rep_agg, dim=-1)
-        total = torch.mm(s_rep_norm, v_rep_norm.t()) / 0.05
-        nce = -torch.mean(torch.diag(F.log_softmax(total, dim=1)))
-        c_acc = (torch.argmax(total, dim=1) == torch.arange(len(total), device=s_rep.device)).float().mean()
-        return nce, c_acc
+
+    def forward_mi_loss(self, s_rep, v_rep):
+        """
+        EVIMA 스타일 cross-covariance 기반 mutual information loss.
+        s_rep, v_rep: [B, L, D] (masked된 토큰들)
+        """
+        B, Ls, D = s_rep.shape
+        B, Lv, Dv = v_rep.shape
+        assert D == Dv, "sensor/video dim mismatch"
+
+        # 토큰 차원까지 flatten: [B*L, D]
+        s = s_rep.reshape(B * Ls, D)
+        v = v_rep.reshape(B * Lv, D)
+
+        L = min(Ls, Lv)
+
+        s = s_rep.reshape(B * Ls, D)
+        v = v_rep.reshape(B * Lv, D)
+
+        # 길이 맞추기
+        s = s[:L]
+        v = v[:L]
+
+        # 평균 제거 (zero-mean)
+        s = s - s.mean(dim=0, keepdim=True)
+        v = v - v.mean(dim=0, keepdim=True)
+
+        # cross-covariance C ∈ R^{D×D}
+        N = s.size(0)
+        C = (s.T @ v) / (N - 1)   # [D, D]
+
+        # EVIMA 계열: -tr(Cᵀ C) 를 최소화 (즉, ‖C‖_F^2 최대화)
+        mi_loss = - torch.trace(C.T @ C) / (D * D)
+
+        return mi_loss
 
     # forward_mae_loss (패딩 로직 제거, 슬라이싱 유지)
     def forward_mae_loss(self, input_data, pred, mask, patch_size, in_chans):
@@ -416,7 +446,7 @@ class CAVMAE(nn.Module):
         return loss
 
     # forward (패딩 로직 이동)
-    def forward(self, sensor, video, mask_ratio_s, mask_ratio_v, mae_loss_weight, contrast_loss_weight):
+    def forward(self, sensor, video, mask_ratio_s, mask_ratio_v, mae_loss_weight, mi_loss_weight):
         # --- 패딩 로직 ---
         if len(sensor.shape) == 3: sensor = sensor.unsqueeze(1)
         B, C_in, H, W = sensor.shape
@@ -442,13 +472,15 @@ class CAVMAE(nn.Module):
         loss_mae_v = self.forward_mae_loss(video, pred_v, mask_v, self.video_patch_size_tuple, 3) # __init__에서 튜플로 변환됨
         loss_mae = mae_loss_weight * (loss_mae_s + loss_mae_v)
         
-        loss_c, c_acc = self.forward_contrastive(latent_c_s, latent_c_v)
-        loss_c = contrast_loss_weight * loss_c
-        
+        mi_loss = self.forward_mi_loss(latent_c_s, latent_c_v)
+        loss_c = mi_loss_weight * mi_loss
+
+        c_acc = torch.tensor(0.0, device=loss_mae.device)
+
         loss = loss_mae + loss_c
-        
+
         return loss, loss_mae, loss_mae_s, loss_mae_v, loss_c, c_acc
-    # CAVMAE 클래스 내부
+    # EVIMAE 클래스 내부
 
     def forward_sensor_only(self, sensor):
         # 1. 패딩 (forward 함수와 동일하게 적용)
@@ -489,4 +521,30 @@ class CAVMAE(nn.Module):
 
         # 4. 최종 특징 벡터 생성 (예: 평균 풀링)
         x = s.mean(dim=1) 
+        return x
+
+    def forward_video_only(self, video):
+        """비디오만 입력받아 임베딩 반환"""
+        # video: (B, T, C, H, W)
+        B, T, C, H, W = video.shape
+        
+        # 1. Patch Embedding (프레임별로 처리)
+        video_reshaped = video.reshape(B * T, C, H, W)
+        v_patches = self.patch_embed_v(video_reshaped)
+        num_patches_v_per_frame = self.patch_embed_v.num_patches
+        v = v_patches.reshape(B, T * num_patches_v_per_frame, -1)
+        
+        # 2. Positional Embedding + Modality Token
+        pos_embed_v_repeated = self.pos_embed_v.repeat(1, T, 1)
+        v = v + pos_embed_v_repeated + self.modality_v
+        
+        # 3. 비디오 전용 블록 통과
+        for blk in self.blocks_v:
+            v = blk(v)
+        
+        # 4. Normalization
+        v = self.norm_v(v)
+        
+        # 5. 최종 특징 벡터 생성 (평균 풀링)
+        x = v.mean(dim=1)
         return x

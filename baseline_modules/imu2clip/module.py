@@ -16,7 +16,7 @@ class IMU2CLIPLightningModule(BasePretrainModule):
         self.loss = InfoNCE(symmetric_loss=True, learn_temperature=True)
 
         self.sensor_model = MW2StackRNNPooling(num_sensors=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
-        self.video_model = ClipPLModel(freeze=True)
+        self.video_model = ClipPLModel(freeze=False)
 
     def forward(self, batch):
         # x_sensor: (batch_size x 6 x window_size)
