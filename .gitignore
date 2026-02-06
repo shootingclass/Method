@@ -5,6 +5,8 @@
 /wandbs/
 /Shell/wandb/
 /Visualization/
+/checkpoints/
+/linear_olds/
 
 # 일반적인 Python 관련 파일 제외
 __pycache__/
