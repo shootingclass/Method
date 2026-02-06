@@ -13,11 +13,12 @@ import torch.distributed as dist
 from torchvision.transforms.functional import crop, resize
 import torchvision
 import cv2
+import math
 from PIL import Image, ImageDraw
 
-from visualizes import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX, visualize_cropped_tensor, denormalize, compute_hungarian_matching, visualize_joint_space, compute_alignment_score, cross_modal_retrieval
+from analysis.visualizes import visualize_tsne, visualize_sensor_name, START_INDEX, END_INDEX, visualize_cropped_tensor, denormalize, compute_hungarian_matching, visualize_joint_space, compute_alignment_score, cross_modal_retrieval
 from tqdm import tqdm
-from method_utils import gather, time_warp, log_optical_flow_overlay_to_wandb
+from method_utils import gather, time_warp
 
 
 #################################################################
@@ -132,11 +133,6 @@ from method_utils import gather, time_warp, log_optical_flow_overlay_to_wandb
 #         mmcl_out = self.mmcl_head(emb)
 #         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 #         return out
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 # # -----------------------------------------------------------
 # # 🧩 Temporal Attention Layer
@@ -285,9 +281,7 @@ class Block(torch.nn.Module):
 #         mmcl_out = self.mmcl_head(emb)
 #         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
 #         return out
-import torch
-import torch.nn as nn
-import math
+
 
 # -----------------------------------------------------------
 # 🛠️ Transformer용 Positional Encoding (Sinusoidal)
@@ -498,10 +492,11 @@ class MotionEncoder(nn.Module):
       - CosineProj: norm-invariant projection layer
       - optional cosine regularization for self-consistency
     """
-    def __init__(self, in_channels=5, base_dim=32, latent_dim=256, use_cosine_proj=True):
+    def __init__(self, in_channels=5, base_dim=32, latent_dim=256, use_cosine_proj=True, use_flow=True):
         super().__init__()
         self.in_channels = in_channels
         self.latent_dim = latent_dim
+        self.use_flow = use_flow  # Store whether to use optical flow
 
         # 3D backbone (temporal gradient feature)
         self.backbone = nn.Sequential(
@@ -528,16 +523,26 @@ class MotionEncoder(nn.Module):
         B, T, _, H, W = videos.shape
 
         video_diff = videos[:, 1:] - videos[:, :-1]
-
-        if isinstance(flows, torch.Tensor):
+        
+        if self.use_flow:
+            # WITH flow: MUST provide actual flow data
+            if not isinstance(flows, torch.Tensor):
+                raise ValueError(
+                    f"MotionEncoder initialized with use_flow=True, but flows is not a tensor! "
+                    f"Got type: {type(flows)}. "
+                    f"Either provide optical flow data or initialize with use_flow=False."
+                )
+            
+            # Adjust flow temporal dimension if needed
             if flows.shape[1] > video_diff.shape[1]:
                 flows = flows[:, : video_diff.shape[1]]
             elif flows.shape[1] < video_diff.shape[1]:
                 flows = torch.cat([flows, flows[:, -1:, :, :, :]], dim=1)
-            x = torch.cat([video_diff, flows], dim=2)
+            
+            x = torch.cat([video_diff, flows], dim=2)  # [B, T-1, 5, H, W]
         else:
-            pad = torch.zeros(B, T - 1, 2, H, W, device=videos.device, dtype=videos.dtype)
-            x = torch.cat([video_diff, pad], dim=2)
+            # WITHOUT flow: use 3 channels (RGB diff only) - NO ZERO PADDING!
+            x = video_diff  # [B, T-1, 3, H, W]
 
         x = x.permute(0, 2, 1, 3, 4)
         feature_5d = self.backbone(x)
@@ -614,7 +619,7 @@ class VisionModel(nn.Module):
     Simplified MOSO: directly extract v_appearance from shared encoder.
     Keeps MotionEncoder for Stage2 alignment.
     """
-    def __init__(self, in_channels=3, base_dim=64, latent_dim=256):
+    def __init__(self, in_channels=3, base_dim=64, latent_dim=256, use_flow=True):
         super().__init__()
         # shared encoder (2D feature extractor)
         self.shared_encoder = SharedEncoder(in_channels, base_dim, out_dim=latent_dim)
@@ -630,10 +635,13 @@ class VisionModel(nn.Module):
         )
 
         # motion encoder for stage2
+        # Use 3 channels (RGB diff) when no flow, 5 channels (RGB diff + flow) with flow
+        motion_in_channels = in_channels + 2 if use_flow else in_channels
         self.motion_encoder = MotionEncoder(
-            in_channels=in_channels+2 ,  # RGB + optical flow
+            in_channels=motion_in_channels,  # 5 if use_flow else 3
             base_dim=base_dim // 2,
-            latent_dim=latent_dim
+            latent_dim=latent_dim,
+            use_flow=use_flow
         )
 
     def forward(self, video, flows):

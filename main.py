@@ -253,7 +253,7 @@ if __name__ == '__main__':
     parser.add_argument("--save_weights", type=bool, default=False, help="Whether save weights")
 
     # 학습 인자    
-    parser.add_argument("--epochs", type=int, default=26)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_frames", type=int, default=20)

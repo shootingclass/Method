@@ -284,36 +284,75 @@ def set_module_params(args):
         
     return args
 
-def get_backbone_with_mode(args):
-    # 기존 pretrained checkpoint 로드 루틴
-    backbone = load_pretrained_model(args)
-        # ⚠️ 반드시 device 이동 이후에 freeze
-    if hasattr(backbone, "to"):
-        print("move to cuda")
-        backbone = backbone.to("cuda")
+# def get_backbone_with_mode(args):
+#     # 기존 pretrained checkpoint 로드 루틴
+#     backbone = load_pretrained_model(args)
+#         # ⚠️ 반드시 device 이동 이후에 freeze
+#     if hasattr(backbone, "to"):
+#         print("move to cuda")
+#         backbone = backbone.to("cuda")
     
-    # backbone.train()
+#     # backbone.train()
+#     backbone.eval()
+#     for p in backbone.parameters():
+#         p.requires_grad = False
+
+#     # 모델 내 첫 번째 BN 레이어를 찾는 예시
+#     for name, m in backbone.named_modules():
+#         if isinstance(m, torch.nn.BatchNorm2d):
+#             print(f"Layer: {name}")
+#             print(f" - Running Mean (첫 5개): {m.running_mean[:5]}")
+#             print(f" - Running Var (첫 5개): {m.running_var[:5]}")
+#             break
+
+#     # ✅ 3️⃣ Gradient 상태 확인 (디버깅용)
+#     total_params = sum(1 for _ in backbone.parameters())
+#     trainable_params = sum(p.requires_grad for p in backbone.parameters())
+#     print(f"[Backbone Grad Check] Trainable parameters: {trainable_params}/{total_params}")
+#     if trainable_params:
+#         sample_layers = [n for n, p in backbone.named_parameters() if p.requires_grad][:5]
+#         print(f"→ Sample trainable layers: {sample_layers}")
+#     else:
+#         print("✅ All parameters are frozen (no grad flow to backbone).")
+
+#     return backbone
+
+def get_backbone_with_mode(args):
+    # 1. 모델 로드 (CPU 상태 유지 권장)
+    print(f"Loading pretrained model from {args.ckpt_name}...")
+    backbone = load_pretrained_model(args)
+
+    # 2. 삭제됨: backbone.to("cuda") -> PL Trainer에게 맡김
+
+    # 2. Linear Probing 설정 (Eval Mode + Freeze)
+    # 주의: 이 설정은 LightningModule 내부에서도 유지되어야 함
     backbone.eval()
     for p in backbone.parameters():
         p.requires_grad = False
 
-    # 모델 내 첫 번째 BN 레이어를 찾는 예시
+    # 3. BN 통계치 Sanity Check (매우 좋음)
+    print("--- [BN Statistics Check] ---")
+    bn_found = False
     for name, m in backbone.named_modules():
-        if isinstance(m, torch.nn.BatchNorm2d):
+        if isinstance(m, torch.nn.BatchNorm2d) or isinstance(m, torch.nn.BatchNorm1d):
             print(f"Layer: {name}")
-            print(f" - Running Mean (첫 5개): {m.running_mean[:5]}")
-            print(f" - Running Var (첫 5개): {m.running_var[:5]}")
+            print(f" - Running Mean (First 5): {m.running_mean[:5].cpu().numpy()}") # numpy로 보기 좋게
+            print(f" - Running Var (First 5): {m.running_var[:5].cpu().numpy()}")
+            bn_found = True
             break
 
-    # ✅ 3️⃣ Gradient 상태 확인 (디버깅용)
+    if not bn_found:
+        print(" Warning: No BatchNorm layer found in backbone.")
+
+    # 4. Gradient 상태 확인
     total_params = sum(1 for _ in backbone.parameters())
     trainable_params = sum(p.requires_grad for p in backbone.parameters())
-    print(f"[Backbone Grad Check] Trainable parameters: {trainable_params}/{total_params}")
-    if trainable_params:
-        sample_layers = [n for n, p in backbone.named_parameters() if p.requires_grad][:5]
-        print(f"→ Sample trainable layers: {sample_layers}")
+
+    print(f"--- [Backbone Freeze Status] ---")
+    if trainable_params == 0:
+        print(f" All parameters frozen. (Trainable: 0 / Total: {total_params})")
     else:
-        print("✅ All parameters are frozen (no grad flow to backbone).")
+        print(f" Warning: {trainable_params} parameters are still trainable!")
 
     return backbone
 
@@ -556,10 +595,10 @@ class LinearProbeLightningModule(pl.LightningModule):
 
         self.log("val/val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val/val_acc", self.val_accuracy, on_epoch=True, prog_bar=True)
-        self.log("val/val_f1_micro", self.val_f1_micro, on_step=False, on_epoch=True, prog_bar=False) # prog_bar는 선택사항
-        self.log("val/val_f1_macro", self.val_f1_macro, on_step=False, on_epoch=True, prog_bar=True)
+        # self.log("val/val_f1_micro", self.val_f1_micro, on_step=False, on_epoch=True, prog_bar=False) # prog_bar는 선택사항
+        # self.log("val/val_f1_macro", self.val_f1_macro, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/val_f1_weighted", self.val_f1_weighted, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/val_mAUC", self.val_auroc, on_step=False, on_epoch=True, prog_bar=True)
+        # self.log("val/val_mAUC", self.val_auroc, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/val_mAP", self.val_ap, on_step=False, on_epoch=True, prog_bar=True)
 
         
@@ -610,10 +649,10 @@ class LinearProbeLightningModule(pl.LightningModule):
 
         self.log("test/loss", loss, on_epoch=True)
         self.log("test/acc", self.test_accuracy, on_epoch=True)
-        self.log("test/f1_macro", self.test_f1_macro, on_epoch=True)
-        self.log("test/f1_micro", self.test_f1_micro, on_step=False, on_epoch=True, prog_bar=False) # prog_bar는 선택사항
+        # self.log("test/f1_macro", self.test_f1_macro, on_epoch=True)
+        # self.log("test/f1_micro", self.test_f1_micro, on_step=False, on_epoch=True, prog_bar=False) # prog_bar는 선택사항
         self.log("test/f1_weighted", self.test_f1_weighted, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("test/mAUC", self.test_auroc, on_epoch=True)
+        # self.log("test/mAUC", self.test_auroc, on_epoch=True)
         self.log("test/mAP", self.test_ap, on_epoch=True)
 
     def on_test_epoch_end(self):
@@ -1113,7 +1152,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint_path', type=str, required=True)
-    parser.add_argument('--linear_epochs', type=int, default=50)
+    parser.add_argument('--linear_epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=4)

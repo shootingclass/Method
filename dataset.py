@@ -161,8 +161,8 @@ class ClipConsistentTransforms:
             # --- 수정 끝 ---
             
             frame = TF.gaussian_blur(frame, kernel_size=[5, 5], sigma=sigma)
-
-            tensor_frames.append(T.ToTensor()(frame))
+            # Transform and Normalize to 0-1
+            tensor_frames.append(T.ToTensor()(frame)) 
 
         # 3. 텐서 기반 증강 및 정규화
         # 비디오 데이터는 (C, T, H, W) 또는 (T, C, H, W) 형태가 일반적입니다.
@@ -171,7 +171,7 @@ class ClipConsistentTransforms:
         clip_tensor = torch.stack(tensor_frames, dim=0)
 
         # Normalize
-        clip_tensor /= 255.0
+        # clip_tensor /= 255.0  # REMOVED: T.ToTensor() already scales to [0, 1]
         # clip_tensor = TF.normalize(clip_tensor, mean=self.mean, std=self.std)
 
         return clip_tensor
@@ -230,7 +230,7 @@ class VideoSensorDataset(Dataset):
         video_path, sensor_path, label, item_id, flow_path = self.samples[idx]
         
         ######### 비디오 전처리 #########       
-        if self.current_epoch < self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
+        if self.current_epoch <= self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
             # 1. self.num_frames 개수만큼의 가짜 이미지 '리스트'를 생성합니다.
             dummy_clip = [Image.new('RGB', (224, 224)) for _ in range(self.num_frames)]
 
@@ -378,8 +378,6 @@ class VideoSensorDataset(Dataset):
                 flow = np.load(flow_path) 
                 flow = torch.from_numpy(flow).float()  # [T, 2, H, W]
                 # 값 정규화
-                # flow = torch.clamp(flow, -20, 20) / 20.0
-                    # ✅ Optical flow 크기 확인 및 resize
                 T, C, H, W = flow.shape
                 if H > 224 or W > 224:
                     # bilinear resize (flow는 벡터이므로 interpolation 모드 주의)

@@ -17,6 +17,21 @@
 #     --video_classifier_epoch 0 \
 #     --bad_correction_epoch 0
 
+# python main.py \
+#     --dataset_name HWU-USP \
+#     --model_name method \
+#     --project_name ECCV_Pretraining \
+#     --epochs 50 \
+#     --lr 1e-4 \
+#     --batch_size 48 \
+#     --num_frames 20 \
+#     --embedding_dim 512 \
+#     --threshold_epoch 0 \
+#     --centroid_threshold 0.75 \
+#     --video_classifier_epoch 0 \
+#     --bad_correction_epoch 0 \
+#     --use_flow
+
 python main.py \
     --dataset_name Opportunity++ \
     --model_name method \
@@ -29,4 +44,5 @@ python main.py \
     --threshold_epoch 0 \
     --centroid_threshold 0.75 \
     --video_classifier_epoch 0 \
-    --bad_correction_epoch 0
+    --bad_correction_epoch 0 \
+    --use_flow

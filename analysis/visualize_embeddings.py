@@ -1,5 +1,10 @@
 
 import os
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import json
 import argparse
 import torch
@@ -18,7 +23,7 @@ from linear_probe import set_module_params, get_backbone_with_mode # Import util
 
 # Hardcoded defaults/paths (fallback)
 DATA_ROOT = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/"
-DEFAULT_CHECKPOINT = "/home/jaemo/Method/checkpoints/method/Opportunity++/noFlow.ckpt"
+DEFAULT_CHECKPOINT = "/home/jaemo/Method/checkpoints/method/Opportunity++/last-v2.ckpt"
 JSON_PATH = "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action/pretrain_cropped_with_flow.json"
 
 def load_video_frames(video_path, num_frames=20, transform=None):

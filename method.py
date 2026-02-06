@@ -13,7 +13,7 @@ import math
 import os
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from method_utils import gather, log_video_recon_grid, log_video_recon_gif, to_vis_motion, CovarianceAlignmentLoss, overlay_motion_heatmap, log_optical_flow_overlay_to_wandb, log_shared_feat_overlay_to_wandb
+from method_utils import gather, CovarianceAlignmentLoss, overlay_motion_heatmap
 import copy
 import torch.distributed as dist
 from sklearn.metrics import confusion_matrix
@@ -24,7 +24,7 @@ import matplotlib.colors # Matplotlib Colormap을 numpy 배열로 변환
 
 # --- 사용자 정의 모듈 임포트 ---
 from model import SensorEncoder, SensorMotionEncoder, SensorTransformerEncoder, SensorModel, VisionModel, ClusteringModule
-from visualizes import visualize_Wfinal_differences
+from analysis.visualizes import visualize_Wfinal_differences
 
 ####################################################################
 
@@ -37,7 +37,10 @@ class MethodLightningModule(pl.LightningModule):
         self.save_hyperparameters(args)
         # 1. 모델 구성 요소 초기화
 
-        self.video_model = VisionModel(latent_dim=self.hparams.embedding_dim)
+        self.video_model = VisionModel(
+            latent_dim=self.hparams.embedding_dim,
+            use_flow=self.hparams.use_flow  # Pass use_flow to VisionModel
+        )
         self.sensor_appearance_encoder= SensorEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
         self.sensor_motion_encoder = SensorMotionEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
         self.clustering_module = ClusteringModule(
@@ -705,7 +708,7 @@ class MethodLightningModule(pl.LightningModule):
             # self.training_steps_outputs[-1]["z_video"] = F.normalize((z_video_online), dim=1)
             self.training_steps_outputs[-1]["z_sensor"] = F.normalize((z_sensor_online), dim=1)
             self.training_steps_outputs[-1]["v_motion"] = F.normalize((v_motion), dim=1)
-            self.training_steps_outputs[-1]["s_motion"]= F.normalize((sensor_motion), dim=1)
+            self.training_steps_outputs[-1]["s_motion"]= F.normalize((sensor_motion_emb), dim=1)
             self.training_steps_outputs[-1]["v_appearance"] = F.normalize((v_app), dim=1)
 
             motion_labels = self.clustering_module._remap_pairwise_2(labels)
@@ -893,292 +896,125 @@ class MethodLightningModule(pl.LightningModule):
 
             
 
-            if self.global_rank == 0 and (batch_idx % 5 == 0):
-                print(type(labels[0]))
-                if self.hparams.dataset_name=="Opportunity++" or labels[0] in [0, 3, 4, 5]:
+            # if self.global_rank == 0 and (batch_idx % 5 == 0):
+            #     print(type(labels[0]))
+            #     if self.hparams.dataset_name=="Opportunity++" or labels[0] in [0, 3, 4, 5]:
                         
-                    # ======================================================
-                    # I. 데이터 준비
-                    # ======================================================
-                    raw_feature_map = model_output["motion_feature_map"]   # [B, C, T', H', W']
-                    single_motion_feat = raw_feature_map[0].detach().cpu() # [C, T', H', W']
+            #         # ======================================================
+            #         # I. 데이터 준비
+            #         # ======================================================
+            #         raw_feature_map = model_output["motion_feature_map"]   # [B, C, T', H', W']
+            #         single_motion_feat = raw_feature_map[0].detach().cpu() # [C, T', H', W']
 
-                    _, T_orig, _, H_orig, W_orig = videos.shape
+            #         _, T_orig, _, H_orig, W_orig = videos.shape
                     
-                    # Appearance shared feature map
-                    spatial_feat = model_output["spatial_feature_map"][0].detach().cpu()  # [C, H', W']
+            #         # Appearance shared feature map
+            #         spatial_feat = model_output["spatial_feature_map"][0].detach().cpu()  # [C, H', W']
 
-                    # =========================================
-                    # II. Appearance Feature Heatmap 준비
-                    # =========================================
-                    # (A) 채널 평균
-                    appearance_map = spatial_feat.mean(dim=0).numpy()    # [H', W']
+            #         # =========================================
+            #         # II. Appearance Feature Heatmap 준비
+            #         # =========================================
+            #         # (A) 채널 평균
+            #         appearance_map = spatial_feat.mean(dim=0).numpy()    # [H', W']
 
-                    # (B) Normalize
-                    min_a, max_a = appearance_map.min(), appearance_map.max()
-                    if max_a == min_a:
-                        appearance_norm = np.zeros_like(appearance_map)
-                    else:
-                        appearance_norm = (appearance_map - min_a) / (max_a - min_a + 1e-8)
+            #         # (B) Normalize
+            #         min_a, max_a = appearance_map.min(), appearance_map.max()
+            #         if max_a == min_a:
+            #             appearance_norm = np.zeros_like(appearance_map)
+            #         else:
+            #             appearance_norm = (appearance_map - min_a) / (max_a - min_a + 1e-8)
 
-                    # (C) Colormap → torch → upsample
-                    cmap = cm.get_cmap('jet')
-                    appearance_rgb = cmap(appearance_norm)[:, :, :3]      # [H',W',3]
-                    appearance_tensor = torch.from_numpy(appearance_rgb).permute(2,0,1).unsqueeze(0).float()
+            #         # (C) Colormap → torch → upsample
+            #         cmap = cm.get_cmap('jet')
+            #         appearance_rgb = cmap(appearance_norm)[:, :, :3]      # [H',W',3]
+            #         appearance_tensor = torch.from_numpy(appearance_rgb).permute(2,0,1).unsqueeze(0).float()
 
-                    upsampled_appearance = F.interpolate(
-                        appearance_tensor, size=(H_orig, W_orig), mode='bilinear', align_corners=False
-                    )[0].permute(1,2,0).numpy()   # [H,W,3]
+            #         upsampled_appearance = F.interpolate(
+            #             appearance_tensor, size=(H_orig, W_orig), mode='bilinear', align_corners=False
+            #         )[0].permute(1,2,0).numpy()   # [H,W,3]
 
-                    # =========================================
-                    # III. 전체 프레임 Motion + Appearance overlay
-                    # =========================================
-                    motion_log_images = []
-                    motion_overlaid_images = []
-                    appearance_overlaid_images = []
+            #         # =========================================
+            #         # III. 전체 프레임 Motion + Appearance overlay
+            #         # =========================================
+            #         motion_log_images = []
+            #         motion_overlaid_images = []
+            #         appearance_overlaid_images = []
 
-                    C_feat, T_feat, H_feat, W_feat = single_motion_feat.shape
+            #         C_feat, T_feat, H_feat, W_feat = single_motion_feat.shape
 
-                    # motion feature map을 frame별로 쓰기 위해 time min(T_feat, T_orig) 맞추기
-                    T_use = min(T_feat, T_orig)
+            #         # motion feature map을 frame별로 쓰기 위해 time min(T_feat, T_orig) 맞추기
+            #         T_use = min(T_feat, T_orig)
 
-                    for t in range(T_use):
+            #         for t in range(T_use):
 
-                        # ----------------------------------------------------
-                        # 1️⃣ Motion Feature Heatmap (per-frame)
-                        # ----------------------------------------------------
-                        img_map = single_motion_feat[:, t].mean(dim=0).numpy()   # [H',W']
+            #             # ----------------------------------------------------
+            #             # 1️⃣ Motion Feature Heatmap (per-frame)
+            #             # ----------------------------------------------------
+            #             img_map = single_motion_feat[:, t].mean(dim=0).numpy()   # [H',W']
 
-                        m_min, m_max = img_map.min(), img_map.max()
-                        if m_max == m_min:
-                            m_norm = np.zeros_like(img_map)
-                        else:
-                            m_norm = (img_map - m_min) / (m_max - m_min + 1e-8)
+            #             m_min, m_max = img_map.min(), img_map.max()
+            #             if m_max == m_min:
+            #                 m_norm = np.zeros_like(img_map)
+            #             else:
+            #                 m_norm = (img_map - m_min) / (m_max - m_min + 1e-8)
 
-                        # 저장용 raw grayscale
-                        motion_log_images.append(
-                            wandb.Image((m_norm * 255).astype(np.uint8),
-                                        caption=f"E{self.current_epoch}/{sample_id[0]}_Motion_T{t}")
-                        )
+            #             # 저장용 raw grayscale
+            #             motion_log_images.append(
+            #                 wandb.Image((m_norm * 255).astype(np.uint8),
+            #                             caption=f"E{self.current_epoch}/{sample_id[0]}_Motion_T{t}")
+            #             )
 
-                        # Jet colormap
-                        motion_rgb = cmap(m_norm)[:, :, :3]   # [H',W',3]
-                        motion_tensor = torch.from_numpy(motion_rgb).permute(2,0,1).unsqueeze(0).float()
+            #             # Jet colormap
+            #             motion_rgb = cmap(m_norm)[:, :, :3]   # [H',W',3]
+            #             motion_tensor = torch.from_numpy(motion_rgb).permute(2,0,1).unsqueeze(0).float()
 
-                        motion_up = F.interpolate(
-                            motion_tensor, size=(H_orig, W_orig),
-                            mode='bilinear', align_corners=False
-                        )[0].permute(1,2,0).numpy()
+            #             motion_up = F.interpolate(
+            #                 motion_tensor, size=(H_orig, W_orig),
+            #                 mode='bilinear', align_corners=False
+            #             )[0].permute(1,2,0).numpy()
 
-                        # ----------------------------------------------------
-                        # 2️⃣ 원본 프레임 준비 (0~1 float)
-                        # ----------------------------------------------------
-                        frame = videos[0, t].detach().cpu()  # [C,H,W], -1~1이면 아래 필요
-                        frame = frame.mul_(255.0)
-                        frame = frame.clamp(0,1)
-                        frame_np = frame.permute(1,2,0).numpy()
+            #             # ----------------------------------------------------
+            #             # 2️⃣ 원본 프레임 준비 (0~1 float)
+            #             # ----------------------------------------------------
+            #             frame = videos[0, t].detach().cpu()  # [C,H,W], -1~1이면 아래 필요
+            #             frame = frame.mul_(255.0)
+            #             frame = frame.clamp(0,1)
+            #             frame_np = frame.permute(1,2,0).numpy()
 
-                        # ----------------------------------------------------
-                        # 3️⃣ Motion Overlay
-                        # ----------------------------------------------------
-                        alpha = 0.5
-                        motion_overlay = (1-alpha)*frame_np + alpha*motion_up
-                        motion_overlay_uint8 = (np.clip(motion_overlay,0,1)*255).astype(np.uint8)
+            #             # ----------------------------------------------------
+            #             # 3️⃣ Motion Overlay
+            #             # ----------------------------------------------------
+            #             alpha = 0.5
+            #             motion_overlay = (1-alpha)*frame_np + alpha*motion_up
+            #             motion_overlay_uint8 = (np.clip(motion_overlay,0,1)*255).astype(np.uint8)
 
-                        motion_overlaid_images.append(
-                            wandb.Image(motion_overlay_uint8,
-                                        caption=f"E{self.current_epoch}/{sample_id[0]}_MotionOverlay_T{t}")
-                        )
+            #             motion_overlaid_images.append(
+            #                 wandb.Image(motion_overlay_uint8,
+            #                             caption=f"E{self.current_epoch}/{sample_id[0]}_MotionOverlay_T{t}")
+            #             )
 
-                        # ----------------------------------------------------
-                        # 4️⃣ Appearance Overlay (모든 프레임 동일 appearance heatmap)
-                        # ----------------------------------------------------
-                        appearance_overlay = (1-alpha)*frame_np + alpha*upsampled_appearance
-                        appearance_overlay_uint8 = (np.clip(appearance_overlay,0,1)*255).astype(np.uint8)
+            #             # ----------------------------------------------------
+            #             # 4️⃣ Appearance Overlay (모든 프레임 동일 appearance heatmap)
+            #             # ----------------------------------------------------
+            #             appearance_overlay = (1-alpha)*frame_np + alpha*upsampled_appearance
+            #             appearance_overlay_uint8 = (np.clip(appearance_overlay,0,1)*255).astype(np.uint8)
 
-                        appearance_overlaid_images.append(
-                            wandb.Image(appearance_overlay_uint8,
-                                        caption=f"E{self.current_epoch}/{sample_id[0]}_AppearanceOverlay_T{t}")
-                        )
+            #             appearance_overlaid_images.append(
+            #                 wandb.Image(appearance_overlay_uint8,
+            #                             caption=f"E{self.current_epoch}/{sample_id[0]}_AppearanceOverlay_T{t}")
+            #             )
 
-                    # ======================================================
-                    # WandB Logging
-                    # ======================================================
-                    if self.logger and hasattr(self.logger.experiment, 'log'):
-                        self.logger.experiment.log({
-                            "motion_feature_maps/raw_sequence": motion_log_images,
-                            "motion_feature_maps/overlaid_sequence": motion_overlaid_images,
-                            "appearance_maps/overlaid_sequence": appearance_overlaid_images,
-                            "epoch": self.current_epoch,
-                            "global_step": self.global_step,
-                        })
-
-                    
-# ✅ 다음 코드가 있다면 구문 오류가 해결됩니다. (이전 로그에 있던 `:` 제거)
-#                   ):
-
-                # W_conditional_damp_cpu = W_conditional_damp.detach().cpu().numpy()
-
-                # # --- 이제 shape 맞음 ---
-                # same_mask = labels_np[:, None] == labels_np[None, :]
-                # diff_mask = labels_np[:, None] != labels_np[None, :]
-
-                # same_mean = W_conditional_damp_cpu[same_mask].mean()
-                # diff_mean = W_conditional_damp_cpu[diff_mask].mean()
-
-                # print(f"[DEBUG] Same-label W_damp mean: {same_mean:.4f} | Diff-label W_damp mean: {diff_mean:.4f}")
-
-
-                # sim_vid_mom_cpu = sim_vid_mom.detach().cpu().numpy()
-
-                # same_mean_v = sim_vid_mom_cpu[same_mask].mean()
-                # diff_mean_v = sim_vid_mom_cpu[diff_mask].mean()
-
-                # print(f"[DEBUG] Same-label vid_mom mean: {same_mean_v:.4f} | Diff-label vid_mom mean: {diff_mean_v:.4f}")
-
-
-                # sim_sen_mom_cpu = sim_sen_mom.detach().cpu().numpy()
-
-                # same_mean_s = sim_sen_mom_cpu[same_mask].mean()
-                # diff_mean_s = sim_sen_mom_cpu[diff_mask].mean()
-
-                # print(f"[DEBUG] Same-label s_mom mean: {same_mean_s:.4f} | Diff-label s_mom mean: {diff_mean_s:.4f}")
-
-                # # --- wandb 시각화 동일 ---
-                # sorted_idx = np.argsort(labels_np)
-                # W_sorted = W_conditional_damp_cpu[sorted_idx][:, sorted_idx]
-                # sorted_labels = labels_np[sorted_idx]
-
-                # fig, ax = plt.subplots(figsize=(8, 7))
-                # im = ax.imshow(W_sorted, cmap='magma', interpolation='nearest')
-                # plt.colorbar(im, ax=ax, label='W_damp value')
-
-                # boundaries = np.where(np.diff(sorted_labels) != 0)[0]
-                # for b in boundaries:
-                #     ax.axhline(b + 0.5, color='white', linewidth=0.8)
-                #     ax.axvline(b + 0.5, color='white', linewidth=0.8)
-
-                # ax.set_title(f"W_damp heatmap | same={same_mean:.3f}, diff={diff_mean:.3f}")
-                # ax.set_xlabel("Samples (sorted by motion label)")
-                # ax.set_ylabel("Samples (sorted by motion label)")
-                # plt.tight_layout()
-
-                # if self.logger is not None:  # rank 0에서만 wandb 업로드
-                #     self.logger.experiment.log({
-                #         "debug/W_motion_heatmap": wandb.Image(fig),
-                #         "debug/W_motion_same_mean": same_mean,
-                #         "debug/W_motion_diff_mean": diff_mean
-                #     })
-                # plt.close(fig)
-
-                # # --- 추가: 각 similarity 히스토그램 ---
-                # def plot_similarity_hist(mat, name, color_same, color_diff):
-                #     same_vals = mat[same_mask].flatten()
-                #     diff_vals = mat[diff_mask].flatten()
-                #     plt.figure(figsize=(6, 4))
-                #     plt.hist(same_vals, bins=50, alpha=0.6, color=color_same, label="same-label")
-                #     plt.hist(diff_vals, bins=50, alpha=0.6, color=color_diff, label="diff-label")
-                #     plt.title(f"{name} Similarity Dist.\n(same={same_vals.mean():.3f}, diff={diff_vals.mean():.3f})")
-                #     plt.xlabel("Similarity"); plt.ylabel("Frequency"); plt.legend(); plt.tight_layout()
-                #     if self.logger is not None:
-                #         self.logger.experiment.log({f"debug/{name}_hist": wandb.Image(plt)})
-                #     plt.close()
-
-                # plot_similarity_hist(sim_vid_mom_cpu, "Vid_Motion", "royalblue", "lightcoral")
-                # plot_similarity_hist(sim_sen_mom_cpu, "Sen_Motion", "seagreen", "orange")
-                # plot_similarity_hist(sim_stable.cpu(), "Stable_Motion", "mediumpurple", "gray")
-
-                # print(f"[DEBUG] Logged W_damp heatmap + similarity histograms to wandb")
-
-            # if self.global_rank == 0 and (self.global_step % 5) == 0:
-            #     wandb.log({"train/algin loss": align_loss,
-            #               "train/contrastive loss": custom_contrastive_loss})
-                # self.log("train/contrastive loss", custom_contrastive_loss)
-                # ✅ Debugging hook
-           
-                # try:
-                #     self.debug_motion_and_weights_regions_by_composite_class(
-                #         # W_app, W_conditional_damp, W_final,             # [N, N]
-                #         W_app, W_conditional_damp, W_conditional_damp*W_app,
-                #         sim_vid_mom, sim_sen_mom, sim_cross_mom, sim_stable, 
-                #         motion_damp_factor,  # [N, N]
-                #         labels_np,
-                #         spatial_labels_np, motion_labels_np,  # [N]
-                #         class_names=self.class_names_list,
-                #         sim_vid_raw=sim_vid_raw,
-                #         sim_sen_raw=sim_sen_raw,
-                #         sim_z_vid_raw=sim_z_vid_raw,
-                #         sim_z_sen_raw=sim_z_sen_raw,
-                #         sim_app_vid=sim_app_vid,
-                #         sim_app_sen=sim_app_sen,
-                #         step_tag="debug/W_and_MotionSim_regions",
-                #         logger=self.logger,
-                #     )
-                # except Exception as e:
-                #     print("[Warning] debug motion fail!!", e)
-
-                #     # ============================================================
-                #     # 🧭 Sensor Embedding Distances: False vs Hard Samples
-                #     # ============================================================
-                #     with torch.no_grad():
-                #         z_sen_np = z_sensor.cpu().numpy()
-
-                #         N = len(spatial_labels_np)
-                #         spatial_eq = spatial_labels_np[:, None] == spatial_labels_np[None, :]
-                #         motion_eq  = motion_labels_np[:, None] == motion_labels_np[None, :]
-
-                #         false_mask = spatial_eq & motion_eq
-                #         hard_mask  = spatial_eq & ~motion_eq
-
-                #         # 상삼각만 남겨 대칭 중복 제거
-                #         triu_mask = np.triu(np.ones_like(false_mask, dtype=bool), k=1)
-                #         false_mask &= triu_mask
-                #         hard_mask  &= triu_mask
-
-                #         # --- ✅ 실제 L2 거리 계산 ---
-                #         # (1) 각 샘플 간 거리 직접 계산 (메모리 폭발 방지 위해 torch.cdist 사용 권장)
-                #         z_tensor = torch.from_numpy(z_sen_np).float().to(self.device)
-                #         dist_mat = torch.cdist(z_tensor, z_tensor, p=2).cpu().numpy()  # L2 거리
-
-                #         # (2) False/Hard pair 추출
-                #         false_dists = dist_mat[false_mask]
-                #         hard_dists  = dist_mat[hard_mask]
-
-                #         mean_false = np.mean(false_dists) if len(false_dists) > 0 else np.nan
-                #         mean_hard  = np.mean(hard_dists) if len(hard_dists) > 0 else np.nan
-
-                #         print(f"[Sensor Space - Raw L2] mean dist (False={mean_false:.4f}, Hard={mean_hard:.4f})")
-
-                #         # --- W&B 로그 ---
-                #         if self.logger is not None:
-                #             self.logger.experiment.log({
-                #                 "debug/z_sensor_raw_mean_false_dist": mean_false,
-                #                 "debug/z_sensor_raw_mean_hard_dist": mean_hard,
-                #             })
-
-                #         # --- Histogram 시각화 ---
-                #         plt.figure(figsize=(6, 4))
-                #         plt.hist(false_dists, bins=40, alpha=0.6, color="skyblue", label=f"False ({len(false_dists)})")
-                #         plt.hist(hard_dists, bins=40, alpha=0.6, color="salmon", label=f"Hard ({len(hard_dists)})")
-                #         plt.title(f"z_sensor L2 Distance Dist.\nFalse={mean_false:.3f}, Hard={mean_hard:.3f}")
-                #         plt.xlabel("Euclidean distance ‖z_i − z_j‖₂")
-                #         plt.ylabel("Frequency")
-                #         plt.legend()
-                #         plt.tight_layout()
-                #         if self.logger is not None:
-                #             self.logger.experiment.log({
-                #                 "debug/z_sensor_raw_false_vs_hard_l2_hist": wandb.Image(plt.gcf())
-                #             })
-                #         plt.close()
-
-
-                #     self.visualize_classwise_motion_similarity(
-                #         sim_vid_mom=sim_vid_mom,                # [N, D]
-                #         sim_sen_mom=sim_sen_mom,                # [N, D]
-                #         motion_labels=labels_gathered,      # [N]
-                #         class_names=self.class_names,
-                #         logger=self.logger
-                #     )
+            #         # ======================================================
+            #         # WandB Logging
+            #         # ======================================================
+            #         if self.logger and hasattr(self.logger.experiment, 'log'):
+            #             self.logger.experiment.log({
+            #                 "motion_feature_maps/raw_sequence": motion_log_images,
+            #                 "motion_feature_maps/overlaid_sequence": motion_overlaid_images,
+            #                 "appearance_maps/overlaid_sequence": appearance_overlaid_images,
+            #                 "epoch": self.current_epoch,
+            #                 "global_step": self.global_step,
+            #             })
 
 
             # --- 7-F: 최종 손실 결합 ---
@@ -1186,34 +1022,6 @@ class MethodLightningModule(pl.LightningModule):
                 # lambda_align * align_loss +
                 lambda_contrastive * custom_contrastive_loss
             )
-            # -------------------------------------------------------------
-            # 6) 종료
-            # -------------------------------------------------------------
-        def log_grad(module, name="sensor_motion_encoder"):
-            total_grad = 0.0
-            count = 0
-            for p in module.parameters():
-                if p.grad is not None:
-                    total_grad += p.grad.detach().abs().mean().item()
-                    count += 1
-            if count == 0:
-                print(f"[{name}] ⚠️ no grad found")
-                return 0.0
-            mean_grad = total_grad / count
-            print(f"[{name}] mean abs grad = {mean_grad:.6f}")
-            return mean_grad
-
-        # # training_step 끝부분 직전에
-        # if self.global_step % 3 == 0 and self.epoch > 0:  # 로그 주기 조절 가능
-        #     g_sensor_motion = log_grad(self.sensor_motion_encoder, "sensor_motion_encoder")
-        #     self.log("debug/grad/sensor_motion_encoder", g_sensor_motion)
-
-        #     for name, p in self.sensor_motion_encoder.named_parameters():
-        #         if p.grad is not None:
-        #             print(name, p.grad.abs().mean().item())
-        #         else:
-        #             print(name, "⚠️ no grad")
-
 
         print("final_loss!! ", final_loss)
         return final_loss
@@ -1264,83 +1072,16 @@ class MethodLightningModule(pl.LightningModule):
                     # 메모리 초기화
                 self.debug.clear()
 
-                # # ===============================================================
-                # # 🧱 1️⃣ feature-level concat
-                # # ===============================================================
-                # z_vid_all = torch.cat([o['z_vid_mom'] for o in outputs if 'z_vid_mom' in o], dim=0)
-                # z_sen_all = torch.cat([o['z_sen_mom'] for o in outputs if 'z_sen_mom' in o], dim=0)
-
-                # # ===============================================================
-                # # 🧩 2️⃣ label-level concat
-                # # ===============================================================
-                # def safe_hstack(key):
-                #     arrs = [o[key] for o in outputs if key in o]
-                #     if len(arrs) == 0:
-                #         return np.array([])
-                #     return np.hstack(arrs)
-
-                # labels_all = safe_hstack("labels_np")
-                # spatial_labels_all = safe_hstack("spatial_labels_np")
-                # motion_labels_all = safe_hstack("motion_labels_np")
-                
-                # max_samples = 2048
-                # if z_vid_all.shape[0] > max_samples:
-                #     idx = torch.randperm(z_vid_all.shape[0])[:max_samples]
-                #     z_vid_all = z_vid_all[idx]
-                #     z_sen_all = z_sen_all[idx]
-                #     labels_all = labels_all[idx]
-                #     spatial_labels_all = spatial_labels_all[idx]
-                #     motion_labels_all = motion_labels_all[idx]
-
-                # # ===============================================================
-                # # 🧮 3️⃣ 전체 pairwise similarity 계산
-                # # ===============================================================
-                # z_vid_all = F.normalize(z_vid_all, dim=1)
-                # z_sen_all = F.normalize(z_sen_all, dim=1)
-
-                # sim_vid_mom_all = z_vid_all @ z_vid_all.T
-                # sim_sen_mom_all = z_sen_all @ z_sen_all.T
-                # sim_cross_mom_all = z_vid_all @ z_sen_all.T
-
-                # # (선택적으로 W_final = sim_vid_mom_all * sim_sen_mom_all 같은 것도 계산 가능)
-                # W_app_all = sim_vid_mom_all
-                # W_final_all = sim_vid_mom_all * sim_sen_mom_all
-
-                # # ===============================================================
-                # # 🚀 4️⃣ 디버깅 함수 호출
-                # # ===============================================================
-                # self.debug_motion_and_weights_regions_by_composite_class(
-                #     W_app_all, None, W_final_all,
-                #     sim_vid_mom_all, sim_sen_mom_all, sim_cross_mom_all, None, None,
-                #     labels_all, spatial_labels_all, motion_labels_all,
-                #     class_names=self.class_names_list,
-                #     step_tag=f"qual/W_and_MotionSim_regions",
-                #     logger=self.logger,
-                # )
-
             except Exception as e:
                 print(f"[ERROR] Failed Epoch Debug Logging: {e}")
             finally:
                 self.debug.clear()
-
-
-      # 1️⃣ rank 0이 아닌 프로세스는 먼저 대기 (pre-save barrier)
-        # if dist.is_initialized() and self.global_rank != 0:
-        #     print(f"[rank{self.global_rank}] waiting before save")
-        #     dist.barrier()
-
-        # 2️⃣ rank 0만 체크포인트 저장
 
         save_epochs = [0, 1, 3, 5, 10, 15, 20, 25]
         if self.epoch in save_epochs or self.epoch % 10 == 0:
             save_path = f"/home/jaemo/Method/checkpoints/method/{self.hparams.dataset_name}/manual_epochs/manual_epoch_{self.epoch}.ckpt"
             self.trainer.save_checkpoint(save_path)
             print(f"[rank0] checkpoint saved: {save_path}")
-
-
-        # # 3️⃣ 나머지 rank도 barrier 통과 후 진행
-        # if dist.is_initialized() and self.global_rank != 0:
-        #     print(f"[rank{self.global_rank}] resume after rank0 save")
             
         outputs = self.training_steps_outputs
         print(f"{self.global_rank} Epoch {self.epoch} - Collected {len(outputs)} training step outputs.")
@@ -1361,29 +1102,6 @@ class MethodLightningModule(pl.LightningModule):
                     "epoch/epoch": self.current_epoch
                 })
             print(f"[✔] Epoch {self.current_epoch} Average Memory Update Ratio: {avg_change_ratio.item():.4f}")
-        
-
-            # save_path = os.path.join("./", "change_ratios_log.csv")
-            
-            # # 2. 저장할 데이터 준비
-            # epoch_data = {
-            #     'epoch': self.current_epoch,
-            #     'avg_change_ratio': avg_change_ratio.item()
-            # }
-            
-            # # 3. 파일 쓰기 (누적)
-            # is_new_file = not os.path.exists(save_path)
-            
-            # with open(save_path, 'a', newline='') as f:
-            #     writer = csv.DictWriter(f, fieldnames=epoch_data.keys())
-                
-            #     # 파일이 새로 생성되었다면 헤더를 씁니다.
-            #     if is_new_file:
-            #         writer.writeheader()
-                    
-            #     writer.writerow(epoch_data)
-                
-            # print(f"[💾] Saved change ratio for epoch {self.current_epoch} to {save_path}")
 
         self.epoch += 1
         self.clustering_module.update_epoch(self.epoch)
@@ -1398,84 +1116,6 @@ class MethodLightningModule(pl.LightningModule):
         if self.epoch % 2 == 0:
             print(f"\nEpoch {self.epoch}: Running ODC evaluation on training data...")
             self.clustering_module.evaluate(outputs)
-        
-        # try:
-        #     if self.global_rank == 0 and len(self.train_video_accs) > 0:
-        #         mean_acc = torch.stack(self.train_video_accs).mean().item()
-        #         wandb.log({"train/video_classifier_acc_mapped": mean_acc, "epoch": self.epoch})
-        #         print(f"[Epoch {self.epoch}] Video classifier acc (avg): {mean_acc:.4f}")
-        #         self.train_video_accs.clear()
-        # except Exception as e:
-        #     print(e)
-        
-        # try:
-        #     if self.global_rank == 0 and hasattr(self, "cm_data"):
-        #         preds_list = self.cm_data.get("preds", [])
-        #         labels_list = self.cm_data.get("labels", [])
-
-        #         if len(preds_list) > 0 and len(labels_list) > 0:
-        #             preds_all = torch.cat(preds_list).numpy()
-        #             labels_all = torch.cat(labels_list).numpy()
-
-
-        #             cm = confusion_matrix(labels_all, preds_all)
-        #             fig, ax = plt.subplots(figsize=(6, 6))
-        #             sns.heatmap(cm, annot=False, cmap="Blues", fmt="d", ax=ax)
-        #             ax.set_xlabel("Predicted")
-        #             ax.set_ylabel("True")
-        #             ax.set_title(f"Confusion Matrix")
-
-        #             wandb.log({
-        #                 f"video_classifier/confusion_matrix": wandb.Image(fig)
-        #             })
-        #             plt.close(fig)
-        #         else:
-        #             print(f"[Warn] Skipping confusion matrix log — no predictions in cm_data (len={len(preds_list)})")
-
-        #         # 초기화
-        #         self.cm_data = {"preds": [], "labels": []}
-        # except Exception as e:
-        #     print(e)
-         
-        #  # ✅ confidence 시각화
-        # try:
-        #     if self.global_rank == 0 and hasattr(self, "video_confidence_log"):
-
-        #         confs = torch.cat(self.video_confidence_log).numpy()
-        #         plt.figure(figsize=(6, 4))
-        #         sns.histplot(confs, bins=20, kde=True, color='steelblue')
-        #         plt.title(f"Video Classifier Confidence")
-        #         plt.xlabel("Max Probability")
-        #         plt.ylabel("Frequency")
-        #         plt.grid(alpha=0.3)
-
-        #         wandb.log({
-        #             f"video_classifier/confidence_hist": wandb.Image(plt)
-        #         })
-        #         plt.close()
-        #         self.video_confidence_log = []  # 초기화
-            
-        #     if self.global_rank == 0 and hasattr(self, "log_buffer"):
-        #         acc_all = torch.stack(self.log_buffer["classifier_all"]).mean().item()
-        #         acc_good = torch.stack(self.log_buffer["acc_good"]).mean().item()
-        #         acc_bad = torch.stack(self.log_buffer["acc_bad"]).mean().item()
-        #         good_ratio = torch.stack(self.log_buffer["good_ratio"]).mean().item()
-
-        #         wandb.log({
-        #             "video_classifier/train_classifier_all": acc_all,
-        #             "video_classifier/train_acc_good": acc_good,
-        #             "video_classifier/train_acc_bad": acc_bad,
-        #             "video_classifier/train_good_ratio": good_ratio,
-        #             "epoch": self.current_epoch,
-        #         })
-
-        #         print(f"[Epoch {self.current_epoch}] acc_all={acc_all:.3f}, acc_good={acc_good:.3f}, acc_bad={acc_bad:.3f}, good_ratio={good_ratio:.2f}")
-
-        #         # 버퍼 초기화
-        #         self.log_buffer = {}
-        #         self.cm_data = {"preds": [], "labels": []}
-        # except Exception as e:
-        #     print(e)
 
         print("evaluate called on rank", self.global_rank)
 
@@ -1487,311 +1127,261 @@ class MethodLightningModule(pl.LightningModule):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-4)
         return optimizer
    
-    @torch.no_grad()
-    def debug_motion_and_weights_regions_by_composite_class(
-        self,
-        W_app, W_damp, W_final,             # [N, N]
-        sim_vid_mom, sim_sen_mom, sim_cross_mom, # [N, N]
-        sim_stable, motion_damp_factor,      # [N, N]
-        labels_np, spatial_labels_np, motion_labels_np,  # [N], [N], [N]
-        class_names,  # 총 14개 라벨 이름 (예: ["Door1-Open", "Door1-Close", ...])
-        sim_vid_raw=None,
-        sim_sen_raw=None,
-        sim_z_vid_raw=None,
-        sim_z_sen_raw=None,
-        sim_app_vid=None,
-        sim_app_sen=None,
-        step_tag="debug/W_and_MotionSim_byCompositeClass",
-        logger=None,
-    ):
-        """
-        🎯 Class-wise symmetric region analysis based on (spatial, motion) decomposition.
-        - labels_np: 전체 클래스 (예: 14개)
-        - spatial_labels_np: 7개 공간적 클래스
-        - motion_labels_np: 2개 동작 클래스
-        """
+    # @torch.no_grad()
+    # def debug_motion_and_weights_regions_by_composite_class(
+    #     self,
+    #     W_app, W_damp, W_final,             # [N, N]
+    #     sim_vid_mom, sim_sen_mom, sim_cross_mom, # [N, N]
+    #     sim_stable, motion_damp_factor,      # [N, N]
+    #     labels_np, spatial_labels_np, motion_labels_np,  # [N], [N], [N]
+    #     class_names,  # 총 14개 라벨 이름 (예: ["Door1-Open", "Door1-Close", ...])
+    #     sim_vid_raw=None,
+    #     sim_sen_raw=None,
+    #     sim_z_vid_raw=None,
+    #     sim_z_sen_raw=None,
+    #     sim_app_vid=None,
+    #     sim_app_sen=None,
+    #     step_tag="debug/W_and_MotionSim_byCompositeClass",
+    #     logger=None,
+    # ):
+    #     """
+    #     🎯 Class-wise symmetric region analysis based on (spatial, motion) decomposition.
+    #     - labels_np: 전체 클래스 (예: 14개)
+    #     - spatial_labels_np: 7개 공간적 클래스
+    #     - motion_labels_np: 2개 동작 클래스
+    #     """
 
-        # ===============================================================
-        # 1️⃣ 기본 세팅
-        # ===============================================================
-        W_app_np   = W_app.detach().cpu().numpy()
-        W_damp_np  = W_damp.detach().cpu().numpy()
-        W_final_np = W_final.detach().cpu().numpy()
-        motion_damp_np = motion_damp_factor.detach().cpu().numpy()
-        sim_vid_np = sim_vid_mom.detach().cpu().numpy()
-        sim_sen_np = sim_sen_mom.detach().cpu().numpy()
-        sim_cross_np = sim_cross_mom.detach().cpu().numpy()
-        sim_stb_np = sim_stable.detach().cpu().numpy()
-        sim_vid_raw_np = sim_vid_raw.detach().cpu().numpy() if sim_vid_raw is not None else None  # ✅ (2)
-        sim_sen_raw_np = sim_sen_raw.detach().cpu().numpy() if sim_sen_raw is not None else None  # ✅ (2)
-        sim_z_vid_raw_np = sim_z_vid_raw.detach().cpu().numpy() if sim_z_vid_raw is not None else None  # ✅ (2)
-        sim_z_sen_raw_np = sim_z_sen_raw.detach().cpu().numpy() if sim_z_sen_raw is not None else None  # ✅ (2)
+    #     # ===============================================================
+    #     # 1️⃣ 기본 세팅
+    #     # ===============================================================
+    #     W_app_np   = W_app.detach().cpu().numpy()
+    #     W_damp_np  = W_damp.detach().cpu().numpy()
+    #     W_final_np = W_final.detach().cpu().numpy()
+    #     motion_damp_np = motion_damp_factor.detach().cpu().numpy()
+    #     sim_vid_np = sim_vid_mom.detach().cpu().numpy()
+    #     sim_sen_np = sim_sen_mom.detach().cpu().numpy()
+    #     sim_cross_np = sim_cross_mom.detach().cpu().numpy()
+    #     sim_stb_np = sim_stable.detach().cpu().numpy()
+    #     sim_vid_raw_np = sim_vid_raw.detach().cpu().numpy() if sim_vid_raw is not None else None  # ✅ (2)
+    #     sim_sen_raw_np = sim_sen_raw.detach().cpu().numpy() if sim_sen_raw is not None else None  # ✅ (2)
+    #     sim_z_vid_raw_np = sim_z_vid_raw.detach().cpu().numpy() if sim_z_vid_raw is not None else None  # ✅ (2)
+    #     sim_z_sen_raw_np = sim_z_sen_raw.detach().cpu().numpy() if sim_z_sen_raw is not None else None  # ✅ (2)
         
-        sim_app_vid_np = sim_app_vid.detach().cpu().numpy() if sim_app_vid is not None else None  # ✅ (2)
-        sim_app_sen_np = sim_app_sen.detach().cpu().numpy() if sim_app_sen is not None else None  # ✅ (2)
+    #     sim_app_vid_np = sim_app_vid.detach().cpu().numpy() if sim_app_vid is not None else None  # ✅ (2)
+    #     sim_app_sen_np = sim_app_sen.detach().cpu().numpy() if sim_app_sen is not None else None  # ✅ (2)
 
-        N = W_app_np.shape[0]
-        num_classes = len(class_names)
+    #     N = W_app_np.shape[0]
+    #     num_classes = len(class_names)
 
-        mask_upper = np.triu(np.ones((N, N), dtype=bool), k=1)
+    #     mask_upper = np.triu(np.ones((N, N), dtype=bool), k=1)
 
-        # ===============================================================
-        # 2️⃣ Pair 관계 정의
-        # ===============================================================
-        same_spatial = (spatial_labels_np[:, None] == spatial_labels_np[None, :])
-        same_motion  = (motion_labels_np[:, None]  == motion_labels_np[None, :])
+    #     # ===============================================================
+    #     # 2️⃣ Pair 관계 정의
+    #     # ===============================================================
+    #     same_spatial = (spatial_labels_np[:, None] == spatial_labels_np[None, :])
+    #     same_motion  = (motion_labels_np[:, None]  == motion_labels_np[None, :])
 
-        hard_mask   = (same_spatial & ~same_motion) & mask_upper
-        false_mask  = (same_spatial & same_motion) & mask_upper
-        motion_same_mask = (~same_spatial &  same_motion) & mask_upper  # ✅ 다른 spatial, 같은 motion
-        motion_diff_mask = (~same_spatial & ~same_motion) & mask_upper  # ✅
+    #     hard_mask   = (same_spatial & ~same_motion) & mask_upper
+    #     false_mask  = (same_spatial & same_motion) & mask_upper
+    #     motion_same_mask = (~same_spatial &  same_motion) & mask_upper  # ✅ 다른 spatial, 같은 motion
+    #     motion_diff_mask = (~same_spatial & ~same_motion) & mask_upper  # ✅
 
-                # ===============================================================
-        # 🧮 6️⃣ Hard vs False classification accuracy (per class)
-        # ===============================================================
-        print("\n[Hard-vs-False Accuracy based on W_final ranking]\n")
-        acc_per_class = {}
-        auc_per_class = {}
+    #             # ===============================================================
+    #     # 🧮 6️⃣ Hard vs False classification accuracy (per class)
+    #     # ===============================================================
+    #     print("\n[Hard-vs-False Accuracy based on W_final ranking]\n")
+    #     acc_per_class = {}
+    #     auc_per_class = {}
 
-        for class_idx, class_name in enumerate(class_names):
-            # 이 클래스에 해당하는 샘플만 anchor로 선택
-            class_mask = (labels_np == class_idx)
-            if not np.any(class_mask):
-                continue
+    #     for class_idx, class_name in enumerate(class_names):
+    #         # 이 클래스에 해당하는 샘플만 anchor로 선택
+    #         class_mask = (labels_np == class_idx)
+    #         if not np.any(class_mask):
+    #             continue
 
-            # Anchor가 이 클래스인 경우의 pair
-            sub_false = W_final_np[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))][false_mask[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))]]
-            sub_hard  = W_final_np[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))][hard_mask[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))]]
+    #         # Anchor가 이 클래스인 경우의 pair
+    #         sub_false = W_final_np[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))][false_mask[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))]]
+    #         sub_hard  = W_final_np[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))][hard_mask[np.ix_(class_mask, np.ones_like(class_mask, dtype=bool))]]
 
-            if len(sub_false) == 0 or len(sub_hard) == 0:
-                continue
+    #         if len(sub_false) == 0 or len(sub_hard) == 0:
+    #             continue
 
-            # 두 분포를 합치고 False는 label=1, Hard는 label=0 으로 표시
-            vals = np.concatenate([sub_false, sub_hard])
-            labels = np.concatenate([np.ones_like(sub_false), np.zeros_like(sub_hard)])
+    #         # 두 분포를 합치고 False는 label=1, Hard는 label=0 으로 표시
+    #         vals = np.concatenate([sub_false, sub_hard])
+    #         labels = np.concatenate([np.ones_like(sub_false), np.zeros_like(sub_hard)])
 
-            # W_final 기준으로 오름차순 정렬 (낮을수록 "False"일 확률이 높음)
-            order = np.argsort(vals)
-            sorted_vals = vals[order]
-            sorted_labels = labels[order]
+    #         # W_final 기준으로 오름차순 정렬 (낮을수록 "False"일 확률이 높음)
+    #         order = np.argsort(vals)
+    #         sorted_vals = vals[order]
+    #         sorted_labels = labels[order]
 
-            # 실제 False 수
-            n_false = np.sum(sorted_labels == 1)
+    #         # 실제 False 수
+    #         n_false = np.sum(sorted_labels == 1)
 
-            # 뒤에서 n_false개가 모두 False면 perfect → 실제로 몇 개 맞췄는지 계산
-            predicted_false_mask = np.zeros_like(sorted_labels, dtype=bool)
-            predicted_false_mask[-n_false:] = True
+    #         # 뒤에서 n_false개가 모두 False면 perfect → 실제로 몇 개 맞췄는지 계산
+    #         predicted_false_mask = np.zeros_like(sorted_labels, dtype=bool)
+    #         predicted_false_mask[-n_false:] = True
 
-            acc = np.mean(sorted_labels[predicted_false_mask] == 1)
-            acc_per_class[class_name] = acc
-            from sklearn.metrics import roc_auc_score
-            auc = roc_auc_score(labels, vals)
-            auc_per_class[class_name] = auc
+    #         acc = np.mean(sorted_labels[predicted_false_mask] == 1)
+    #         acc_per_class[class_name] = acc
+    #         from sklearn.metrics import roc_auc_score
+    #         auc = roc_auc_score(labels, vals)
+    #         auc_per_class[class_name] = auc
 
-            print(f"{class_name:<25} | False={len(sub_false):<4} Hard={len(sub_hard):<4} | Acc={acc*100:5.2f}%")
+    #         print(f"{class_name:<25} | False={len(sub_false):<4} Hard={len(sub_hard):<4} | Acc={acc*100:5.2f}%")
 
-        # 평균 accuracy
-        if len(acc_per_class) > 0 and len(auc_per_class) > 0:
-            mean_acc = np.mean(list(acc_per_class.values()))
-            print(f"\n✅ Mean Hard-vs-False Accuracy: {mean_acc*100:.2f}%")
+    #     # 평균 accuracy
+    #     if len(acc_per_class) > 0 and len(auc_per_class) > 0:
+    #         mean_acc = np.mean(list(acc_per_class.values()))
+    #         print(f"\n✅ Mean Hard-vs-False Accuracy: {mean_acc*100:.2f}%")
 
-            if logger is not None:
-                logger.experiment.log({
-                    f"{step_tag}/hard_vs_false_acc_mean": mean_acc,
-                    **{f"AUC/hard_vs_false_acc_{cls}": auc for cls, auc in auc_per_class.items()},
-                    **{f"{step_tag}/hard_vs_false_acc_{cls}": acc for cls, acc in acc_per_class.items()}
-                })
-
-
-        try:
-            print("\n[False vs Hard Rank Distribution Plot]\n")
-
-            false_wvals = W_final_np[false_mask]
-            hard_wvals  = W_final_np[hard_mask]
-
-            if len(false_wvals) > 0 and len(hard_wvals) > 0:
-                # False=0, Hard=1 로 명시적으로 지정
-                vals = np.concatenate([false_wvals, hard_wvals])
-                labels = np.concatenate([np.zeros_like(false_wvals), np.ones_like(hard_wvals)])  
-                order = np.argsort(vals)
-
-                sorted_labels = labels[order]
-                sorted_vals = vals[order]
-
-                plt.figure(figsize=(10, 2.5))
-                plt.scatter(
-                    np.arange(len(sorted_vals)),
-                    np.zeros_like(sorted_vals),
-                    c=["royalblue" if l == 0 else "red" for l in sorted_labels],
-                    s=8,
-                    alpha=0.8,
-                    edgecolors="none",
-                )
-
-                plt.title("False (blue) vs Hard (red) Order by $W_{final}$", fontsize=13)
-                plt.xlabel("Rank (sorted by $W_{final}$)")
-                plt.yticks([])
-                plt.tight_layout()
-
-                if logger:
-                    logger.experiment.log({
-                        f"{step_tag}/false_vs_hard_rank_order": wandb.Image(plt.gcf())
-                    })
-                plt.close()
-                print(f"✅ False vs Hard rank order plot logged ({step_tag})")
-            else:
-                print("⚠️ Insufficient False/Hard samples for rank visualization.")
-
-        except Exception as e:
-            print("ordering error", e)
+    #         if logger is not None:
+    #             logger.experiment.log({
+    #                 f"{step_tag}/hard_vs_false_acc_mean": mean_acc,
+    #                 **{f"AUC/hard_vs_false_acc_{cls}": auc for cls, auc in auc_per_class.items()},
+    #                 **{f"{step_tag}/hard_vs_false_acc_{cls}": acc for cls, acc in acc_per_class.items()}
+    #             })
 
 
-        # ===============================================================
-        # 3️⃣ 통계 헬퍼
-        # ===============================================================
-        def compute_stats(vals):
-            if vals.size == 0:
-                return {k: np.nan for k in ["mean", "median", "min", "max", "q1", "q3", "count"]}
-            return {
-                "mean": np.mean(vals),
-                "median": np.median(vals),
-                "min": np.min(vals),
-                "max": np.max(vals),
-                "q1": np.quantile(vals, 0.25),
-                "q3": np.quantile(vals, 0.75),
-                "count": vals.size,
-            }
+    #     try:
+    #         print("\n[False vs Hard Rank Distribution Plot]\n")
 
-        def compute_all_stats(mat, mask):
-            out = {
-                "W_app": compute_stats(W_app_np[mask]),
-                "W_damp": compute_stats(W_damp_np[mask]),
-                "W_final": compute_stats(W_final_np[mask]),
-                "Stable": compute_stats(sim_stb_np[mask]),
-                "Vid_mom": compute_stats(sim_vid_np[mask]),
-                "Sen_mom": compute_stats(sim_sen_np[mask]),
-                "Cross_Sim": compute_stats(sim_cross_np[mask]),
-                "MotDamp": compute_stats(motion_damp_np[mask]),
-            }
-            if sim_vid_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
-                out["Vid_mom_raw"] = compute_stats(sim_vid_raw_np[mask])
-            if sim_sen_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
-                out["Sen_mom_raw"] = compute_stats(sim_sen_raw_np[mask])
-            if sim_z_vid_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
-                out["Z_vid_mom_raw"] = compute_stats(sim_z_vid_raw_np[mask])
-            if sim_z_sen_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
-                out["Z_sen_mom_raw"] = compute_stats(sim_z_sen_raw_np[mask])
-            if sim_app_vid_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
-                out["Sim_app_vid"] = compute_stats(sim_app_vid_np[mask])
-            if sim_app_sen_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
-                out["Sim_app_sen"] = compute_stats(sim_app_sen_np[mask])
-            return out
+    #         false_wvals = W_final_np[false_mask]
+    #         hard_wvals  = W_final_np[hard_mask]
 
-        # ===============================================================
-        # 4️⃣ Class-wise 통계 계산
-        # ===============================================================
-        print(f"\n[{step_tag}] Composite-class (spatial×motion) region stats\n")
-        print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Sen_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6} | {'Sim_app_sen':<10} | {'Sim_app_vid':<10} ")
-        #print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Vid_mom_raw':<6} | {'Sen_mom_raw':<6} | {'Z_vid_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
-        print("-" * 195)
+    #         if len(false_wvals) > 0 and len(hard_wvals) > 0:
+    #             # False=0, Hard=1 로 명시적으로 지정
+    #             vals = np.concatenate([false_wvals, hard_wvals])
+    #             labels = np.concatenate([np.zeros_like(false_wvals), np.ones_like(hard_wvals)])  
+    #             order = np.argsort(vals)
 
-        wandb_data = {}
+    #             sorted_labels = labels[order]
+    #             sorted_vals = vals[order]
 
-        for class_idx, class_name in enumerate(class_names):
-            # 현재 클래스 샘플 인덱스
-            class_mask = (labels_np == class_idx)
-            if not np.any(class_mask):
-                continue
+    #             plt.figure(figsize=(10, 2.5))
+    #             plt.scatter(
+    #                 np.arange(len(sorted_vals)),
+    #                 np.zeros_like(sorted_vals),
+    #                 c=["royalblue" if l == 0 else "red" for l in sorted_labels],
+    #                 s=8,
+    #                 alpha=0.8,
+    #                 edgecolors="none",
+    #             )
 
-            # 이 클래스의 샘플들이 포함된 페어
-            class_pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
+    #             plt.title("False (blue) vs Hard (red) Order by $W_{final}$", fontsize=13)
+    #             plt.xlabel("Rank (sorted by $W_{final}$)")
+    #             plt.yticks([])
+    #             plt.tight_layout()
 
-            # Hard/False 교집합
-            hard_pairs = hard_mask & class_pair_mask
-            false_pairs = false_mask & class_pair_mask
-            # print("mean and median")
-            # print("q1 and q3")
+    #             if logger:
+    #                 logger.experiment.log({
+    #                     f"{step_tag}/false_vs_hard_rank_order": wandb.Image(plt.gcf())
+    #                 })
+    #             plt.close()
+    #             print(f"✅ False vs Hard rank order plot logged ({step_tag})")
+    #         else:
+    #             print("⚠️ Insufficient False/Hard samples for rank visualization.")
 
-            region_dict = {
-                "Hard": hard_mask & class_pair_mask,
-                "False": false_mask & class_pair_mask,
-                "Easy(o)": motion_same_mask & class_pair_mask,
-                "Easy(x)": motion_diff_mask & class_pair_mask,
-            }
+    #     except Exception as e:
+    #         print("ordering error", e)
 
-            for region_name, region_mask in region_dict.items():
-                stats = compute_all_stats(W_app_np, region_mask)
-                count = stats["W_app"]["count"]
-                if count == 0:
-                    continue
 
-                print(f"{class_name:<20} | {region_name:<6} | {count:<6} | "
-                  f"{stats['W_app']['mean']:<6.2f} | "
-                  f"{stats['W_damp']['mean']:<6.2f} | "
-                  f"{stats['W_final']['mean']:<6.2f} | "
-                  f"{stats['Stable']['mean']:<6.2f} | "
-                  f"{stats['Vid_mom']['mean']:<6.2f} | "
-                  f"{stats['Sen_mom']['mean']:<6.2f} | "
-                #   f"{(stats['Vid_mom_raw']['mean'] if 'Vid_mom_raw' in stats else np.nan):<15.2f} | "
-                  f"{(stats['Sen_mom_raw']['mean'] if 'Sen_mom_raw' in stats else np.nan):<15.2f} | "
-                #   f"{(stats['Z_vid_mom_raw']['mean'] if 'Z_vid_mom_raw' in stats else np.nan):<15.2f} | "
-                  f"{(stats['Z_sen_mom_raw']['mean'] if 'Z_sen_mom_raw' in stats else np.nan):<15.2f} | "
-                  f"{stats['Cross_Sim']['mean']:<6.2f} | "
-                  f"{(stats['Sim_app_vid']['mean'] if 'Sim_app_vid' in stats else np.nan):<10.2f} | "
-                  f"{(stats['Sim_app_sen']['mean'] if 'Sim_app_sen' in stats else np.nan):<10.2f}")
+    #     # ===============================================================
+    #     # 3️⃣ 통계 헬퍼
+    #     # ===============================================================
+    #     def compute_stats(vals):
+    #         if vals.size == 0:
+    #             return {k: np.nan for k in ["mean", "median", "min", "max", "q1", "q3", "count"]}
+    #         return {
+    #             "mean": np.mean(vals),
+    #             "median": np.median(vals),
+    #             "min": np.min(vals),
+    #             "max": np.max(vals),
+    #             "q1": np.quantile(vals, 0.25),
+    #             "q3": np.quantile(vals, 0.75),
+    #             "count": vals.size,
+    #         }
 
-            print("--------------------------")
+    #     def compute_all_stats(mat, mask):
+    #         out = {
+    #             "W_app": compute_stats(W_app_np[mask]),
+    #             "W_damp": compute_stats(W_damp_np[mask]),
+    #             "W_final": compute_stats(W_final_np[mask]),
+    #             "Stable": compute_stats(sim_stb_np[mask]),
+    #             "Vid_mom": compute_stats(sim_vid_np[mask]),
+    #             "Sen_mom": compute_stats(sim_sen_np[mask]),
+    #             "Cross_Sim": compute_stats(sim_cross_np[mask]),
+    #             "MotDamp": compute_stats(motion_damp_np[mask]),
+    #         }
+    #         if sim_vid_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+    #             out["Vid_mom_raw"] = compute_stats(sim_vid_raw_np[mask])
+    #         if sim_sen_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+    #             out["Sen_mom_raw"] = compute_stats(sim_sen_raw_np[mask])
+    #         if sim_z_vid_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+    #             out["Z_vid_mom_raw"] = compute_stats(sim_z_vid_raw_np[mask])
+    #         if sim_z_sen_raw_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+    #             out["Z_sen_mom_raw"] = compute_stats(sim_z_sen_raw_np[mask])
+    #         if sim_app_vid_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+    #             out["Sim_app_vid"] = compute_stats(sim_app_vid_np[mask])
+    #         if sim_app_sen_np is not None:  # ✅ (2) 정규화되지 않은 sensor similarity 추가
+    #             out["Sim_app_sen"] = compute_stats(sim_app_sen_np[mask])
+    #         return out
+
+    #     # ===============================================================
+    #     # 4️⃣ Class-wise 통계 계산
+    #     # ===============================================================
+    #     print(f"\n[{step_tag}] Composite-class (spatial×motion) region stats\n")
+    #     print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Sen_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6} | {'Sim_app_sen':<10} | {'Sim_app_vid':<10} ")
+    #     #print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Vid_mom_raw':<6} | {'Sen_mom_raw':<6} | {'Z_vid_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
+    #     print("-" * 195)
+
+    #     wandb_data = {}
+
+    #     for class_idx, class_name in enumerate(class_names):
+    #         # 현재 클래스 샘플 인덱스
+    #         class_mask = (labels_np == class_idx)
+    #         if not np.any(class_mask):
+    #             continue
+
+    #         # 이 클래스의 샘플들이 포함된 페어
+    #         class_pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
+
+    #         # Hard/False 교집합
+    #         hard_pairs = hard_mask & class_pair_mask
+    #         false_pairs = false_mask & class_pair_mask
+    #         # print("mean and median")
+    #         # print("q1 and q3")
+
+    #         region_dict = {
+    #             "Hard": hard_mask & class_pair_mask,
+    #             "False": false_mask & class_pair_mask,
+    #             "Easy(o)": motion_same_mask & class_pair_mask,
+    #             "Easy(x)": motion_diff_mask & class_pair_mask,
+    #         }
+
+    #         for region_name, region_mask in region_dict.items():
+    #             stats = compute_all_stats(W_app_np, region_mask)
+    #             count = stats["W_app"]["count"]
+    #             if count == 0:
+    #                 continue
+
+    #             print(f"{class_name:<20} | {region_name:<6} | {count:<6} | "
+    #               f"{stats['W_app']['mean']:<6.2f} | "
+    #               f"{stats['W_damp']['mean']:<6.2f} | "
+    #               f"{stats['W_final']['mean']:<6.2f} | "
+    #               f"{stats['Stable']['mean']:<6.2f} | "
+    #               f"{stats['Vid_mom']['mean']:<6.2f} | "
+    #               f"{stats['Sen_mom']['mean']:<6.2f} | "
+    #             #   f"{(stats['Vid_mom_raw']['mean'] if 'Vid_mom_raw' in stats else np.nan):<15.2f} | "
+    #               f"{(stats['Sen_mom_raw']['mean'] if 'Sen_mom_raw' in stats else np.nan):<15.2f} | "
+    #             #   f"{(stats['Z_vid_mom_raw']['mean'] if 'Z_vid_mom_raw' in stats else np.nan):<15.2f} | "
+    #               f"{(stats['Z_sen_mom_raw']['mean'] if 'Z_sen_mom_raw' in stats else np.nan):<15.2f} | "
+    #               f"{stats['Cross_Sim']['mean']:<6.2f} | "
+    #               f"{(stats['Sim_app_vid']['mean'] if 'Sim_app_vid' in stats else np.nan):<10.2f} | "
+    #               f"{(stats['Sim_app_sen']['mean'] if 'Sim_app_sen' in stats else np.nan):<10.2f}")
+
+    #         print("--------------------------")
         
-        # print(f"\n[{step_tag}] Composite-class (spatial×motion) region stats\n")
-        # print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<13} | {'W_dmp':<13} | {'W_fin':<13} | {'Stbl':<10} | {'Vid':<10} | {'Sen':<10} | {'Sen_mom_raw':<6} | {'Cros':<6}")
-        #print(f"{'Class':<20} | {'Type':<6} | {'Cnt':<6} | {'W_app':<6} | {'W_dmp':<6} | {'W_fin':<6} | {'Stbl':<6} | {'Vid':<6} | {'Sen':<6} | {'Vid_mom_raw':<6} | {'Sen_mom_raw':<6} | {'Z_vid_mom_raw':<6} | {'Z_sen_mom_raw':<6} | {'Cros':<6}")
-        # print("-" * 195)
-
-        # for class_idx, class_name in enumerate(class_names):
-        #     # 현재 클래스 샘플 인덱스
-        #     class_mask = (labels_np == class_idx)
-        #     if not np.any(class_mask):
-        #         continue
-
-        #     # 이 클래스의 샘플들이 포함된 페어
-        #     class_pair_mask = (class_mask[:, None] | class_mask[None, :]) & mask_upper
-
-        #     # Hard/False 교집합
-        #     hard_pairs = hard_mask & class_pair_mask
-        #     false_pairs = false_mask & class_pair_mask
-        #     # print("mean and median")
-        #     # print("q1 and q3")
-
-        #     for region_name, region_mask in region_dict.items():
-        #         stats = compute_all_stats(W_app_np, region_mask)
-        #         count = stats["W_app"]["count"]
-        #         if count == 0:
-        #             continue    # 바로 밑줄에 Q1~Q3 표시 추가
-
-        #         print(f"{class_name:<20} | {region_name:<6} | {count:<6}  | "
-        #             f"{stats['W_app']['q1']:<6.2f}/{stats['W_app']['q3']:<6.2f} | "
-        #             f"{stats['W_damp']['q1']:<6.2f}/{stats['W_damp']['q3']:<6.2f} | "
-        #             f"{stats['W_final']['q1']:<6.2f}/{stats['W_final']['q3']:<6.2f} | "
-        #             f"{stats['Stable']['q1']:<6.2f}/{stats['Stable']['q3']:<6.2f} | "
-        #             f"{stats['Vid_mom']['q1']:<6.2f}/{stats['Vid_mom']['q3']:<6.2f} | "
-        #             f"{stats['Sen_mom']['q1']:<6.2f}/{stats['Sen_mom']['q3']:<6.2f} | "
-        #             # f"{(stats['Vid_mom_raw']['q1'] if 'Vid_mom_raw' in stats else np.nan):<15.2f} | "
-        #             # f"{(stats['Sen_mom_raw']['q1'] if 1'Sen_mom_raw' in stats else np.nan):<15.2f} | "
-        #             # f"{(stats['Z_vid_mom_raw']['q1'] if 'Z_vid_mom_raw' in stats else np.nan):<15.2f} | "
-        #             # f"{(stats['Z_sen_mom_raw']['q1'] if 'Z_sen_mom_raw' in stats else np.nan):<15.2f} | "
-        #             f"{stats['Cross_Sim']['q1']:<6.2f}/{stats['Cross_Sim']['q3']:<6.2f}")
-
-        #         # wandb 로깅용
-        #         for key, s in stats.items():
-        #             for stat_key in ["mean", "median", "count"]:
-        #                 wandb_data[f"{step_tag}/{class_name}/{region_name}/{key}_{stat_key}"] = s[stat_key]
-        #     print("----------------")
-
-        # ===============================================================
-        # 5️⃣ WandB 로그 업로드
-        # # ===============================================================
-        # if logger is not None and len(wandb_data) > 0:
-        #     logger.experiment.log(wandb_data)
 
         print(f"\n✅ [{step_tag}] composite class-based symmetric region stats computed.")
 
@@ -1807,110 +1397,3 @@ class MethodLightningModule(pl.LightningModule):
             epoch=self.epoch,
             logger=logger
         )
-
-
-    @torch.no_grad()
-    def visualize_classwise_motion_similarity(
-        self,
-        sim_vid_mom, sim_sen_mom,  # [N, N] Pre-computed similarity matrices
-        motion_labels,             # [N]
-        class_names=None,
-        logger=None
-    ):
-        """
-        현재 batch (또는 전체 데이터)에서 등장한 클래스 n개에 대해:
-        - (i, j): 클래스 i와 j의 평균 cosine similarity
-        - i==j 인 경우 자기 자신 제외 (intra-class mean)
-        - 입력으로 이미 계산된 N*N 유사도 행렬을 받아서 효율적으로 처리
-        """
-
-        # ---------------------------------------------------------------------
-        #  PREPARE LABELS
-        # ---------------------------------------------------------------------
-        labels_np = motion_labels.detach().cpu().numpy()
-        unique_labels = np.unique(labels_np)
-        num_classes = len(unique_labels)
-        
-        # 클래스 이름 매핑 (없으면 숫자 그대로 사용)
-        if class_names:
-            # class_names가 dict인 경우와 list인 경우 모두 처리
-            if isinstance(class_names, dict):
-                 class_names_used = [class_names.get(i, str(i)) for i in unique_labels]
-            else:
-                 class_names_used = [class_names[i] if i < len(class_names) else str(i) for i in unique_labels]
-        else:
-            class_names_used = [str(i) for i in unique_labels]
-
-        # ---------------------------------------------------------------------
-        #  CLASSWISE SIMILARITY COMPUTATION (Optimized)
-        # ---------------------------------------------------------------------
-        def compute_classwise_from_sim_matrix(sim_matrix_tensor, labels_np, unique_labels):
-            n = len(unique_labels)
-            class_sim_matrix = np.zeros((n, n))
-            
-            # 텐서를 CPU numpy로 변환 (인덱싱 편의를 위해)
-            sim_np = sim_matrix_tensor.detach().cpu().numpy()
-
-            for i, ci in enumerate(unique_labels):
-                idx_i = np.where(labels_np == ci)[0]
-                if len(idx_i) == 0: continue
-
-                for j, cj in enumerate(unique_labels):
-                    idx_j = np.where(labels_np == cj)[0]
-                    if len(idx_j) == 0: continue
-
-                    # ✅ 이미 계산된 유사도 행렬에서 해당 클래스 쌍의 부분 행렬 추출
-                    # sim_np[idx_i][:, idx_j] -> [Ni, Nj] 형태의 부분 행렬
-                    # (ixgrid를 사용하여 효율적으로 추출)
-                    sub_sim = sim_np[np.ix_(idx_i, idx_j)]
-
-                    if ci == cj:
-                        # 🔹 Intra-class: 자기 자신과의 비교(대각선 성분) 제외
-                        if len(idx_i) > 1:
-                            # 대각선 마스크 생성 (Ni x Ni)
-                            mask = ~np.eye(len(idx_i), dtype=bool)
-                            class_sim_matrix[i, j] = sub_sim[mask].mean()
-                        else:
-                            # 샘플이 1개뿐이면 자기 자신과의 유사도(1.0)를 제외할 수 없음 -> NaN 또는 1.0 처리
-                            # 여기서는 의미상 NaN이 맞으나, 편의상 1.0으로 둘 수도 있음. (보통 이런 경우는 드묾)
-                            class_sim_matrix[i, j] = np.nan 
-                    else:
-                        # 🔹 Inter-class: 모든 쌍의 평균
-                        class_sim_matrix[i, j] = sub_sim.mean()
-
-            return class_sim_matrix
-
-        # ✅ Compute using pre-calculated similarity matrices
-        sim_v_class = compute_classwise_from_sim_matrix(sim_vid_mom, labels_np, unique_labels)
-        sim_s_class = compute_classwise_from_sim_matrix(sim_sen_mom, labels_np, unique_labels)
-
-        # ---------------------------------------------------------------------
-        #  PLOT HEATMAP
-        # ---------------------------------------------------------------------
-        def plot_heatmap(mat, title, modality):
-            # NaN 값이 있을 경우 처리 (예: 0으로 대체하거나 마스킹)
-            mat_safe = np.nan_to_num(mat, nan=0.0)
-            
-            fig, ax = plt.subplots(figsize=(10, 8)) # 크기 약간 키움
-            sns.heatmap(mat_safe, cmap="magma", vmin=0, vmax=1,
-                        xticklabels=class_names_used, yticklabels=class_names_used,
-                        ax=ax, annot=True, fmt=".2f", square=True, # 정사각형 모양 유지
-                        cbar_kws={"shrink": 0.8}) # 컬러바 크기 조절
-            ax.set_title(title, fontsize=14, pad=20)
-            ax.set_xlabel("Class j", fontsize=12)
-            ax.set_ylabel("Class i", fontsize=12)
-            plt.xticks(rotation=45, ha="right") # X축 라벨 회전
-            plt.yticks(rotation=0)
-            plt.tight_layout()
-
-            if logger:
-                logger.experiment.log({f"debug/classwise_sim/{modality}": wandb.Image(fig)})
-            plt.close(fig)
-
-        plot_heatmap(sim_v_class, "Class-wise Motion Similarity (Video)", "video")
-        plot_heatmap(sim_s_class, "Class-wise Motion Similarity (Sensor)", "sensor")
-
-        # ---------------------------------------------------------------------
-        #  CONSOLE SUMMARY (Optional, too large matrices might clutter console)
-        # ——————————————————————————————————
-        # print(f"[Video Motion] classwise similarity matrix:\n{np.array2string(sim_v_class, precision=2, suppress_small=True)}")

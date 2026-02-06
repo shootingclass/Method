@@ -62,8 +62,8 @@ for model in method
 do
     # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/mae/Opportunity++/mae.ckpt --profile --linear_epochs 2
     python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type video
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor-video
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor
+    python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor-video
+    python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor
 
     # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/crossModal.ckpt --encoder_type video --use_flow
     # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/crossModal.ckpt --encoder_type sensor-video --use_flow
