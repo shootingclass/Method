@@ -16,6 +16,7 @@ from torch import nn
 import numpy as np
 import pickle
 from torch.cuda.amp import autocast,GradScaler
+import wandb
 
 
 
@@ -35,6 +36,22 @@ def train(evi_model, train_loader, test_loader, args):
         progress.append([epoch, global_step, best_epoch, best_mAP, time.time() - start_time])
         with open("%s/progress.pkl" % exp_dir, "wb") as f:
             pickle.dump(progress, f)
+            
+    # Init wandb
+    if args.exp_dir is not None:
+         # simple run name
+        run_name = f"{args.model}_{args.dataset}_ft_batch{args.batch_size}_epoch{args.n_epochs}_lr{args.lr}"
+        if args.freeze_base:
+            run_name += "_linear_probe"
+        run_name+="_"+args.ftmode
+         
+         # Check running rank for DDP
+        is_master = True
+        if 'RANK' in os.environ and int(os.environ['RANK']) > 0:
+            is_master = False
+             
+        if is_master:
+            wandb.init(project="Method_Linear_Probe", name=run_name, config=args)
 
     if not isinstance(evi_model, nn.DataParallel):
         evi_model = nn.DataParallel(evi_model)
@@ -158,8 +175,10 @@ def train(evi_model, train_loader, test_loader, args):
                     epoch, i, len(train_loader), per_sample_time=per_sample_time, per_sample_data_time=per_sample_data_time,
                         per_sample_dnn_time=per_sample_dnn_time, loss_meter=loss_meter), flush=True)
                     if np.isnan(loss_meter.avg):
-                        print("training diverged...")
                         return
+                        
+                    if is_master:
+                        wandb.log({"Train Loss": loss_meter.val, "Epoch": epoch, "Global Step": global_step})
 
                 end_time = time.time()
                 global_step += 1
@@ -171,9 +190,11 @@ def train(evi_model, train_loader, test_loader, args):
         mAP = np.mean([stat['AP'] for stat in stats])
         mAUC = np.mean([stat['auc'] for stat in stats])
         acc = stats[0]['acc'] # this is just a trick, acc of each class entry is the same, which is the accuracy of all classes, not class-wise accuracy
+        f1_weighted = stats[0]['f1_weighted']
 
         print("mAP: {:.6f}".format(mAP))
         print("acc: {:.6f}".format(acc))
+        print("f1_weighted: {:.6f}".format(f1_weighted))
         print("AUC: {:.6f}".format(mAUC))
         print("d_prime: {:.6f}".format(d_prime(mAUC)))
         print("train_loss: {:.6f}".format(loss_meter.avg))
@@ -181,6 +202,17 @@ def train(evi_model, train_loader, test_loader, args):
 
         result[epoch-1, :] = [acc, mAP, mAUC, optimizer.param_groups[0]['lr']]
         np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+        
+        if is_master:
+            wandb.log({
+                "Val mAP": mAP,
+                "Val Acc": acc,
+                "Val F1 Weighted": f1_weighted,
+                "Val AUC": mAUC,
+                "Val d-prime": d_prime(mAUC),
+                "Val Loss": valid_loss,
+                "Epoch": epoch
+            })
         print('validation finished')
 
         if args.only_val == True:
@@ -228,6 +260,43 @@ def train(evi_model, train_loader, test_loader, args):
         per_sample_data_time.reset()
         loss_meter.reset()
         per_sample_dnn_time.reset()
+
+def test(evi_model, test_loader, args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print('running on ' + str(device))
+
+    # Check running rank for DDP
+    is_master = True
+    if 'RANK' in os.environ and int(os.environ['RANK']) > 0:
+        is_master = False
+    
+    # ensure wandb is available if is_master
+    if is_master and wandb.run is None:
+        print("Warning: wandb run is not active. Test results will not be logged to wandb.")
+
+    stats, loss = validate(evi_model, test_loader, args)
+    mAP = np.mean([stat['AP'] for stat in stats])
+    acc = stats[0]['acc']
+    f1_weighted = stats[0]['f1_weighted']
+    mAUC = np.mean([stat['auc'] for stat in stats])
+
+    print("Test mAP: {:.6f}".format(mAP))
+    print("Test acc: {:.6f}".format(acc))
+    print("Test f1_weighted: {:.6f}".format(f1_weighted))
+    print("Test AUC: {:.6f}".format(mAUC))
+    print("Test d_prime: {:.6f}".format(d_prime(mAUC)))
+    print("Test loss: {:.6f}".format(loss))
+
+    if is_master and wandb.run is not None:
+        wandb.log({
+            "Test mAP": mAP,
+            "Test Acc": acc,
+            "Test F1 Weighted": f1_weighted,
+            "Test AUC": mAUC,
+            "Test d-prime": d_prime(mAUC),
+            "Test Loss": loss
+        })
+    return stats
 
 def validate(evi_model, val_loader, args, output_pred=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

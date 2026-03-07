@@ -19,7 +19,7 @@ class MethodDataModule(pl.LightningDataModule):
         super().__init__()
 
         self.set_dataset_params(args, stage)
-        self.num_frames = args.num_frames if hasattr(args, "num_frames") else 20
+        self.num_frames = args.num_frames if hasattr(args, "num_frames") else 16
         if args.model_name=="method":
             self.threshold_epoch = args.threshold_epoch
         else:
@@ -42,7 +42,14 @@ class MethodDataModule(pl.LightningDataModule):
         self.train_transform = ClipConsistentTransforms(
             size=(224, 224),
             mean=mean,
-            std=std
+            std=std,
+            training=True
+        )
+        self.val_transform = ClipConsistentTransforms(
+            size=(224, 224),
+            mean=mean,
+            std=std,
+            training=False
         )
         self.stage = stage
     
@@ -56,10 +63,10 @@ class MethodDataModule(pl.LightningDataModule):
 
         elif args.dataset_name == "HWU-USP":
             self.data_root = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/"
-            self.json_path = "/mnt/hdd4tb/junho/HWU-USP_v2/motion_2_priority_test=18"
-            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_6_with_trashes.npy"
+            self.json_path = os.path.join(self.data_root, "motion_2_priority_test=18")
+            self.stats_file_path = "/mnt/hdd4tb/junho/HWU-USP_v2/sensor_stats_6.npy"
             self.start_index, self.end_index = 4, 9
-            self.cache_dir = "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/caches"
+            self.cache_dir =  os.path.join(self.data_root, "caches")
 
         else:
             raise ValueError(f"Invalid dataset name: {args.dataset_name}")
@@ -135,7 +142,8 @@ class MethodDataModule(pl.LightningDataModule):
                 start_index=self.start_index,
                 end_index=self.end_index,
                 cache_dir=self.cache_dir,
-                use_flow=self.use_flow
+                use_flow=self.use_flow,
+                use_cache=False  # train은 랜덤 augmentation → 캐싱 X
             )
             print(f"Train dataset size: {len(self.train_dataset)}")
 
@@ -144,13 +152,14 @@ class MethodDataModule(pl.LightningDataModule):
                     json_path=self.json_val_path,
                     data_root=self.data_root,
                     num_frames=self.num_frames,
-                    transform=self.train_transform,
+                    transform=self.val_transform,
                     sensor_transform=sensor_preprocessor,
                     threshold_epoch=self.threshold_epoch,
                     start_index=self.start_index,
                     end_index=self.end_index,
                     cache_dir=self.cache_dir,
-                    use_flow=self.use_flow
+                    use_flow=self.use_flow,
+                    use_cache=True  # val은 deterministic → 캐싱 O
                 )
 
             if self.json_test_path:
@@ -158,13 +167,14 @@ class MethodDataModule(pl.LightningDataModule):
                     json_path=self.json_test_path,
                     data_root=self.data_root,
                     num_frames=self.num_frames,
-                    transform=self.train_transform,
+                    transform=self.val_transform,
                     sensor_transform=sensor_preprocessor,
                     threshold_epoch=self.threshold_epoch,
                     start_index=self.start_index,
                     end_index=self.end_index,
                     cache_dir=self.cache_dir,
-                    use_flow=self.use_flow
+                    use_flow=self.use_flow,
+                    use_cache=True  # test는 deterministic → 캐싱 O
                 )
                 
 
@@ -176,6 +186,7 @@ class MethodDataModule(pl.LightningDataModule):
             
             # encoder_type에 따라 video 포함 여부 결정
             include_video = getattr(self, 'encoder_type', 'sensor') in ['video', 'sensor-video']
+            print("encoder mode: ", include_video)
             
             shared_class_to_idx = {}
             self.train_dataset = SequenceDataset(
@@ -187,7 +198,8 @@ class MethodDataModule(pl.LightningDataModule):
                 num_frames=self.num_frames,
                 video_transform=self.train_transform if include_video else None,
                 cache_dir=os.path.join(self.cache_dir, "videos"),
-                use_flow=self.use_flow
+                use_flow=self.use_flow,
+                use_cache=False  # train은 랜덤 augmentation → 캐싱 X
             )
             self.val_dataset = SequenceDataset(
                 json_path=self.json_test_path,
@@ -196,9 +208,10 @@ class MethodDataModule(pl.LightningDataModule):
                 sensor_transform=sensor_preprocessor,
                 include_video=include_video,
                 num_frames=self.num_frames,
-                video_transform=self.train_transform if include_video else None,
+                video_transform=self.val_transform if include_video else None,
                 cache_dir=os.path.join(self.cache_dir, "videos"),
-                use_flow=self.use_flow
+                use_flow=self.use_flow,
+                use_cache=True  # val은 deterministic → 캐싱 O
             )
             self.test_dataset = SequenceDataset(
                 json_path=self.json_test_path,
@@ -207,9 +220,10 @@ class MethodDataModule(pl.LightningDataModule):
                 sensor_transform=sensor_preprocessor,
                 include_video=include_video,
                 num_frames=self.num_frames,
-                video_transform=self.train_transform if include_video else None,
+                video_transform=self.val_transform if include_video else None,
                 cache_dir=os.path.join(self.cache_dir, "videos"),
-                use_flow=self.use_flow
+                use_flow=self.use_flow,
+                use_cache=True  # test는 deterministic → 캐싱 O
             )
 
             self.collate_fn = collate_variable_length

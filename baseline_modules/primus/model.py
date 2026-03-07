@@ -81,41 +81,37 @@ class MW2StackRNNPoolingMultihead(pl.LightningModule):
         out = {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
         return out
     
-class Clip4CLIPModel(pl.LightningModule):
+# class Clip4CLIPModel(pl.LightningModule):
 
-    def __init__(self, freeze):
-        super(Clip4CLIPModel, self).__init__()
-        print("Loading clip4clip model ...")
+#     def __init__(self, freeze):
+#         super(Clip4CLIPModel, self).__init__()
+#         print("Loading clip4clip model ...")
 
-        self.flag_freeze = freeze
-        from transformers import CLIPVisionModelWithProjection, CLIPVisionConfig
+#         self.flag_freeze = freeze
+#         from transformers import CLIPVisionModelWithProjection, CLIPVisionConfig
 
-        config = CLIPVisionModelWithProjection.from_pretrained(
-            "openai/clip-vit-base-patch32"
-        ).config
+#         config = CLIPVisionModelWithProjection.from_pretrained(
+#             "openai/clip-vit-base-patch32"
+#         ).config
 
-        config.output_hidden_states = True  # 🔥 핵심
-        config.return_dict = True           # 안전하게
+#         config.output_hidden_states = True  # 🔥 핵심
+#         config.return_dict = True           # 안전하게
 
-        self.video_model = CLIPVisionModelWithProjection.from_pretrained(
-            "openai/clip-vit-base-patch32",
-            config=config
-        )
-        # self.video_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+#         self.video_model = CLIPVisionModelWithProjection.from_pretrained(
+#             "openai/clip-vit-base-patch32",
+#             config=config
+#         )
+#         # self.video_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
 
-        self.video_model.eval()
+#         self.video_model.eval()
 
-        if self.flag_freeze:
-            self.eval()
-            self.freeze()
-
-    from matplotlib import cm
-import torch.nn.functional as F
-import numpy as np
+#         if self.flag_freeze:
+#             self.eval()
+#             self.freeze()
 
 class Clip4CLIPModel(pl.LightningModule):
 
-    def __init__(self, freeze):
+    def __init__(self, freeze, lora_r=8, lora_alpha=16, lora_dropout=0.05):
         super(Clip4CLIPModel, self).__init__()
         print("Loading clip4clip model ...")
 
@@ -124,11 +120,27 @@ class Clip4CLIPModel(pl.LightningModule):
             "openai/clip-vit-base-patch32"
         )
 
-        self.video_model.eval()
-
         if self.flag_freeze:
+            # 완전 freeze (기존 동작)
+            self.video_model.eval()
             self.eval()
             self.freeze()
+        else:
+            # base 가중치 freeze + LoRA 어댑터만 학습
+            for param in self.video_model.parameters():
+                param.requires_grad = False
+
+            from peft import LoraConfig, get_peft_model
+
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=["q_proj", "v_proj"],
+                bias="none",
+            )
+            self.video_model = get_peft_model(self.video_model, lora_config)
+            self.video_model.print_trainable_parameters()
 
     def get_video_embeddings(self, video, device: Optional[str] = None):
         """

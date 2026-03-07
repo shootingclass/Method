@@ -21,9 +21,10 @@ import dataloader as dataloader
 import models, random
 import numpy as np
 import warnings
+import glob
 
 from sklearn import metrics
-from traintest_ft import train, validate
+from traintest_ft import train, validate, test
 
 print("I am process %s, running on %s: starting (%s)" % (os.getpid(), os.uname()[1], time.asctime()))
 
@@ -34,7 +35,7 @@ parser.add_argument("--data-eval", type=str, default=None, help="evaluation data
 parser.add_argument("--label-csv", type=str, default='', help="csv with class labels")
 parser.add_argument("--n_class", type=int, default=527, help="number of classes")
 parser.add_argument("--model", type=str, default='evi-mae-ft', help="the model used")
-parser.add_argument("--dataset", type=str, default="cmummac", help="the dataset used", choices=["cmummac", "wear"])
+parser.add_argument("--dataset", type=str, default="opp", help="the dataset used", choices=["opp", "hwu"])
 parser.add_argument("--noise", help='if use balance sampling', type=ast.literal_eval)
 
 parser.add_argument("--exp-dir", type=str, default="", help="directory to dump experiments")
@@ -87,8 +88,8 @@ parser.add_argument("--imu_target_length", type=int, default=48, help="the targe
 parser.add_argument("--imu_plot_type", type=str, default='fbank', help="the plot type of imu data", choices=['fbank', 'rp', 'mel', 'raw', 'stft']) 
 parser.add_argument("--imu_plot_height", type=int, default=64, help="the plot height of imu data")
 parser.add_argument("--imu_patch_size", type=int, default=8, help="the patch size of imu data")
-parser.add_argument("--imu_dataset_mean", type=float, help="the dataset imu mean, used for input normalization")
-parser.add_argument("--imu_dataset_std", type=float, help="the dataset imu std, used for input normalization")
+parser.add_argument("--imu_dataset_mean", type=str, help="the dataset imu mean, used for input normalization")
+parser.add_argument("--imu_dataset_std", type=str, help="the dataset imu std, used for input normalization")
 parser.add_argument("--imu_channel_num", type=int, default=12, help="the channel number of imu data")
 parser.add_argument("--imu_encoder_embed_dim", type=int, default=384, help="the embed dim of imu encoder")
 parser.add_argument("--imu_encoder_depth", type=int, default=12, help="the depth of imu encoder")
@@ -114,6 +115,23 @@ parser.add_argument("--video_masking_ratio", type=float, default=0.75, help="vid
 parser.add_argument("--rseed", type=int, default=42, help="random seed")
 
 args = parser.parse_args()
+
+# Populate class names for confusion matrix logging
+# User requested hardcoded class names instead of loading from CSV
+if args.dataset == 'opp':
+    args.class_names = [
+        'Open Door 1', 'Open Door 2', 'Close Door 1', 'Close Door 2',
+        'Open Fridge', 'Close Fridge', 'Open Dishwasher', 'Close Dishwasher',
+        'Open Drawer 1', 'Close Drawer 1', 'Open Drawer 2',
+        'Close Drawer 2', 'Open Drawer 3', 'Close Drawer 3'
+    ]
+elif args.dataset == 'hwu':
+    args.class_names = ['tidy', 'dishes', 'sandwich', 'cereals', 'tea']
+else:
+    # Fallback
+    args.class_names = [str(i) for i in range(args.n_class)]
+
+print(f"Using class names: {args.class_names}")
 
 # set random seed
 seed = args.rseed
@@ -153,11 +171,11 @@ val_loader = torch.utils.data.DataLoader(
 
 if args.data_eval != None:
     print('evaluation data is being used')
-    print('not implemented yet')
-    exit()
     eval_loader = torch.utils.data.DataLoader(
         dataloader.EVIDataset(args.data_eval, label_csv=args.label_csv, imu_conf=val_imu_conf),
         batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+else:
+    eval_loader = None
 
 if args.model == 'evi-mae-ft':
     video_model_dict = {
@@ -228,22 +246,82 @@ with open(args.exp_dir + '/args.json', 'w') as f:
 print('Now starting training for {:d} epochs.'.format(args.n_epochs))
 train(evi_model, train_loader, val_loader, args)
 
+if eval_loader is not None:
+    print('start final evaluation on test set')
+    # Load best model
+    best_model_path = os.path.join(args.exp_dir, "models", "best_evi_model.pth")
+    if os.path.exists(best_model_path):
+        print(f"Loading best model from {best_model_path}")
+        state_dict = torch.load(best_model_path, map_location='cpu')
+        
+        # Handle DataParallel wrapper
+        if isinstance(evi_model, torch.nn.DataParallel):
+             evi_model.load_state_dict(state_dict)
+        else:
+             # If model is not DataParallel but state_dict has keys starting with 'module.'
+             # check first key
+             first_key = next(iter(state_dict))
+             if first_key.startswith('module.'):
+                 from collections import OrderedDict
+                 new_state_dict = OrderedDict()
+                 for k, v in state_dict.items():
+                     name = k[7:] # remove `module.`
+                     new_state_dict[name] = v
+                 state_dict = new_state_dict
+             
+             evi_model.load_state_dict(state_dict)
+             
+    else:
+        print("Best model not found, using current model state.")
+
+    test(evi_model, eval_loader, args)
+
 
 
 # average the model weights of checkpoints, note it is not ensemble, and does not increase computational overhead
 def wa_model(exp_dir, start_epoch, end_epoch, wa_num=12):
-    sdA = torch.load(exp_dir + '/models/evi_model.' + str(start_epoch) + '.pth', map_location='cpu')
+    model_dir = os.path.join(exp_dir, 'models')
+    all_files = glob.glob(os.path.join(model_dir, 'evi_model.*.pth'))
+    available_epochs = []
+    
+    for f in all_files:
+        try:
+            # extract epoch number from filename 'evi_model.123.pth'
+            fname = os.path.basename(f)
+            # Expected format: evi_model.123.pth
+            parts = fname.split('.')
+            if len(parts) >= 3 and parts[0] == 'evi_model' and parts[-1] == 'pth':
+                ep = int(parts[1])
+                if start_epoch <= ep <= end_epoch:
+                    available_epochs.append(ep)
+        except ValueError:
+            pass
+
+    available_epochs.sort()
+    
+    if len(available_epochs) == 0:
+        print(f"No models found in range {start_epoch}-{end_epoch} for Weight Averaging.")
+        return None
+
+    if len(available_epochs) > wa_num:
+        # choose wa_num models from start_epoch to end_epoch
+        indices = np.linspace(0, len(available_epochs)-1, wa_num, dtype=int)
+        epoch_list = [available_epochs[i] for i in indices]
+    else:
+        epoch_list = available_epochs
+        
+    print(f"Weight averaging using {len(epoch_list)} models: {epoch_list}")
+    
+    sdA = torch.load(os.path.join(model_dir, f'evi_model.{epoch_list[0]}.pth'), map_location='cpu')
     model_cnt = 1
 
-    # choose wa_num models from start_epoch to end_epoch
-    epoch_list = np.linspace(start_epoch, end_epoch, wa_num, dtype=int)
-
-    for epoch in epoch_list: # range(start_epoch+1, end_epoch+1):
-        sdB = torch.load(exp_dir + '/models/evi_model.' + str(epoch) + '.pth', map_location='cpu')
+    for epoch in epoch_list[1:]:
+        sdB = torch.load(os.path.join(model_dir, f'evi_model.{epoch}.pth'), map_location='cpu')
         for key in sdA:
             sdA[key] = sdA[key] + sdB[key]
         model_cnt += 1
-    print('wa {:d} models from {:d} to {:d}'.format(model_cnt, start_epoch, end_epoch))
+        
+    print('wa {:d} models from {:d} to {:d}'.format(model_cnt, epoch_list[0], epoch_list[-1]))
     for key in sdA:
         sdA[key] = sdA[key] / float(model_cnt)
     return sdA

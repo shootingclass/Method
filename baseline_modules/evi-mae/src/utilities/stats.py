@@ -8,7 +8,7 @@ def d_prime(auc):
     d_prime = standard_normal.ppf(auc) * np.sqrt(2.0)
     return d_prime
 
-def calculate_stats(output, target, vpaths):
+def calculate_stats(output, target, vpaths=None):
     """Calculate statistics including mAP, AUC, etc.
 
     Args:
@@ -26,6 +26,7 @@ def calculate_stats(output, target, vpaths):
 
     # Accuracy, only used for single-label classification such as esc-50, not for multiple label one such as AudioSet
     acc = metrics.accuracy_score(ntar, nout)
+    f1_weighted = metrics.f1_score(ntar, nout, average='weighted')
 
     # Class-wise statistics
     for k in range(classes_num):
@@ -64,7 +65,8 @@ def calculate_stats(output, target, vpaths):
                     'fnr': 1. - tpr[0::save_every_steps],
                     'auc': auc,
                     # note acc is not class-wise, this is just to keep consistent with other metrics
-                    'acc': acc
+                    'acc': acc,
+                    'f1_weighted': f1_weighted
                     }
         except:
             dict = {'precisions': -1,
@@ -74,7 +76,8 @@ def calculate_stats(output, target, vpaths):
                     'fnr': -1,
                     'auc': -1,
                     # note acc is not class-wise, this is just to keep consistent with other metrics
-                    'acc': acc
+                    'acc': acc,
+                    'f1_weighted': f1_weighted
                     }
             print('class {:s} no true sample'.format(str(k)))
         stats.append(dict)

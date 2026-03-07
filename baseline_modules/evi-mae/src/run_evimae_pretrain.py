@@ -27,7 +27,7 @@ print("I am process %s, running on %s: starting (%s)" % (os.getpid(), os.uname()
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 # dataset
-parser.add_argument("--dataset", type=str, default="cmummac", help="the dataset used", choices=["wear","cmummac"])
+parser.add_argument("--dataset", type=str, default="opp", help="the dataset used", choices=["opp","hwu"])
 parser.add_argument("--data-train", type=str, default='', help="training data json")
 parser.add_argument("--data-val", type=str, default='', help="validation data json")
 parser.add_argument("--data-eval", type=str, default=None, help="evaluation data json")
@@ -72,8 +72,8 @@ parser.add_argument("--imu_mask_mode", type=str, default='unstructured', help="m
 parser.add_argument("--imu_plot_type", type=str, default='fbank', help="the plot type of imu data", choices=['fbank', 'rp', 'mel', 'raw', 'stft']) 
 parser.add_argument("--imu_plot_height", type=int, default=64, help="the plot height of imu data")
 parser.add_argument("--imu_patch_size", type=int, default=8, help="the patch size of imu data")
-parser.add_argument("--imu_dataset_mean", type=float, help="the dataset imu mean, used for input normalization")
-parser.add_argument("--imu_dataset_std", type=float, help="the dataset imu std, used for input normalization")
+parser.add_argument("--imu_dataset_mean", type=str, help="the dataset imu mean, used for input normalization")
+parser.add_argument("--imu_dataset_std", type=str, help="the dataset imu std, used for input normalization")
 parser.add_argument("--imu_channel_num", type=int, default=12, help="the channel number of imu data")
 parser.add_argument("--imu_encoder_embed_dim", type=int, default=384, help="the embed dim of imu encoder")
 parser.add_argument("--imu_encoder_depth", type=int, default=12, help="the depth of imu encoder")
@@ -125,9 +125,12 @@ else:
         dataloader.EVIDataset(args.data_train, label_csv=args.label_csv, imu_conf=imu_conf, video_masking_ratio=args.video_masking_ratio, image_as_video=args.image_as_video),
         batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-val_loader = torch.utils.data.DataLoader(
-    dataloader.EVIDataset(args.data_val, label_csv=args.label_csv, imu_conf=val_imu_conf),
-    batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+if args.data_val and args.data_val != 'None':
+    val_loader = torch.utils.data.DataLoader(
+        dataloader.EVIDataset(args.data_val, label_csv=args.label_csv, imu_conf=val_imu_conf),
+        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+else:
+    val_loader = None
 
 if args.data_eval != None:
     eval_loader = torch.utils.data.DataLoader(
@@ -181,10 +184,19 @@ if args.pretrain_path != 'None' and args.load_prepretrain:
     if not isinstance(evi_model, torch.nn.DataParallel):
         evi_model = torch.nn.DataParallel(evi_model)
 
+    model_state = evi_model.state_dict()
     useful_weight = {}
     for key in mdl_weight.keys():
         if 'graph' not in key:
-            useful_weight[key] = mdl_weight[key]
+            if key in model_state:
+                if mdl_weight[key].shape == model_state[key].shape:
+                    useful_weight[key] = mdl_weight[key]
+                else:
+                    print(f"Skipping {key} due to shape mismatch: checkpoint {mdl_weight[key].shape} != model {model_state[key].shape}")
+            else:
+                useful_weight[key] = mdl_weight[key] # Let load_state_dict handle unexpected keys if strict=False, or just ignore. 
+                # Actually strict=False will ignore unexpected keys in the state_dict argument, but it's better to only pass what we want.
+                # But here we are filtering useful_weight.
 
     miss, unexpected = evi_model.load_state_dict(useful_weight, strict=False)
     print('now load mae pretrained weights from ', args.pretrain_path)

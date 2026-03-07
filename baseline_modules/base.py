@@ -11,5 +11,6 @@ class BasePretrainModule(pl.LightningModule):
         self.save_hyperparameters(args)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=self.hparams.lr)
         return optimizer

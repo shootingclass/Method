@@ -296,6 +296,9 @@ class VideoTeacherMLP(nn.Module):
             else:
                 video_embeddings = video_hidden_state[:, 0]
 
+            # Apply MLP projection
+            video_embeddings = self.mlp(video_embeddings)
+
             if normalize_embeddings:
                 video_embeddings = F.normalize(video_embeddings, p=2, dim=1)
 

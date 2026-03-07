@@ -135,16 +135,26 @@ def train(evi_model, train_loader, test_loader, args):
             end_time = time.time()
             global_step += 1
 
-        print('start validation')
-        eval_loss_av, eval_loss_mae, eval_loss_mae_a, eval_loss_mae_v, eval_loss_c, eval_c_acc, eval_loss_g = validate(evi_model, test_loader, args)
+        if test_loader is not None:
+            print('start validation')
+            eval_loss_av, eval_loss_mae, eval_loss_mae_a, eval_loss_mae_v, eval_loss_c, eval_c_acc, eval_loss_g = validate(evi_model, test_loader, args)
 
-        print("Eval imu MAE Loss: {:.6f}".format(eval_loss_mae_a))
-        print("Eval Visual MAE Loss: {:.6f}".format(eval_loss_mae_v))
-        print("Eval Total MAE Loss: {:.6f}".format(eval_loss_mae))
-        print("Eval Contrastive Loss: {:.6f}".format(eval_loss_c))
-        print("Eval Total Loss: {:.6f}".format(eval_loss_av))
-        print("Eval Contrastive Accuracy: {:.6f}".format(eval_c_acc))
-        print("Eval Graph Loss: {:.6f}".format(eval_loss_g))
+            print("Eval imu MAE Loss: {:.6f}".format(eval_loss_mae_a))
+            print("Eval Visual MAE Loss: {:.6f}".format(eval_loss_mae_v))
+            print("Eval Total MAE Loss: {:.6f}".format(eval_loss_mae))
+            print("Eval Contrastive Loss: {:.6f}".format(eval_loss_c))
+            print("Eval Total Loss: {:.6f}".format(eval_loss_av))
+            print("Eval Contrastive Accuracy: {:.6f}".format(eval_c_acc))
+            print("Eval Graph Loss: {:.6f}".format(eval_loss_g))
+        else:
+            print("Skipping validation (no validation data provided).")
+            eval_loss_av = 0
+            eval_loss_mae = 0
+            eval_loss_mae_a = 0
+            eval_loss_mae_v = 0
+            eval_loss_c = 0
+            eval_c_acc = 0
+            eval_loss_g = 0
 
         print("Train imu MAE Loss: {:.6f}".format(loss_a_meter.avg))
         print("Train Visual MAE Loss: {:.6f}".format(loss_v_meter.avg))

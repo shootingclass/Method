@@ -1,0 +1,36 @@
+{
+  "created_at": "2026-03-03T22:25:35",
+  "data_json": "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action/linear_val.json",
+  "data_root": "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window",
+  "checkpoint_path": "/home/jaemo/Method/checkpoints/method/Opportunity++/last.ckpt",
+  "seed": 42,
+  "device": "cpu",
+  "embedding_key": "z_video_online",
+  "num_total_dataset_samples": 113,
+  "num_used_samples": 113,
+  "label_counts": {
+    "0": 10,
+    "1": 10,
+    "2": 9,
+    "3": 10,
+    "4": 12,
+    "5": 11,
+    "6": 8,
+    "7": 7,
+    "8": 6,
+    "9": 5,
+    "10": 6,
+    "11": 5,
+    "12": 7,
+    "13": 7
+  },
+  "num_negative_pairs": 5895,
+  "cosine_mean": 0.5934491753578186,
+  "cosine_std": 0.20989646017551422,
+  "cosine_min": 0.20103612542152405,
+  "cosine_max": 0.9988630414009094,
+  "outputs": {
+    "hist_png": "/home/jaemo/Method/drivens/detach_linear_val_hist_z_video/detach_linear_val_negative_pairs_hist.png",
+    "cosine_npy": "/home/jaemo/Method/drivens/detach_linear_val_hist_z_video/detach_linear_val_negative_pairs_cosine.npy"
+  }
+}

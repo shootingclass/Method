@@ -118,62 +118,43 @@ class SensorTransform:
 
 
 class ClipConsistentTransforms:
-    def __init__(self, size, mean, std):
+    def __init__(self, size, mean, std, training=True):
         self.size = size
         self.mean = mean
         self.std = std
+        self.training = training
 
     def __call__(self, clip):
-        
-        # 1. 클립 전체에 대한 랜덤 파라미터 1회 생성
-        # apply_flip = random.random() < 0.5
+        # Training일 때만 랜덤 파라미터 생성
+        if self.training:
+            jitter_params = T.ColorJitter.get_params(
+                brightness=(0.6, 1.4), contrast=(0.6, 1.4),
+                saturation=(0.6, 1.4), hue=(-0.1, 0.1)
+            )
+            sigma = random.uniform(0.1, 2.0)
 
-        jitter_params = T.ColorJitter.get_params(
-            brightness=(0.6, 1.4), contrast=(0.6, 1.4),
-            saturation=(0.6, 1.4), hue=(-0.1, 0.1)
-        )
-
-        sigma = random.uniform(0.1, 2.0)
-
-        # 2. 모든 프레임에 동일한 파라미터로 변환 적용 (루프)
         tensor_frames = []
         for frame in clip:
-            # print("shape", frame.size)
-            frame = T.Resize(self.size, antialias=True)(frame) # HWU-USP는 224*224로 resize (Opportunity++는 224*224 Crop된 비디오 사용)
+            frame = T.Resize(self.size, antialias=True)(frame)
 
-            # if apply_flip:
-            #     frame = TF.hflip(frame)
-            
-            # --- 여기가 수정된 핵심 부분입니다 ---
-            # 파라미터를 명확하게 unpacking
-            fn_indices, brightness_factor, contrast_factor, saturation_factor, hue_factor = jitter_params
+            # Training일 때만 augmentation 적용
+            if self.training:
+                fn_indices, brightness_factor, contrast_factor, saturation_factor, hue_factor = jitter_params
 
-            # 랜덤하게 결정된 함수 순서(fn_indices)대로 순회
-            for fn_id in fn_indices:
-                if fn_id == 0 and brightness_factor is not None:
-                    frame = TF.adjust_brightness(frame, brightness_factor)
-                elif fn_id == 1 and contrast_factor is not None:
-                    frame = TF.adjust_contrast(frame, contrast_factor)
-                elif fn_id == 2 and saturation_factor is not None:
-                    frame = TF.adjust_saturation(frame, saturation_factor)
-                elif fn_id == 3 and hue_factor is not None:
-                    frame = TF.adjust_hue(frame, hue_factor)
-            # --- 수정 끝 ---
-            
-            frame = TF.gaussian_blur(frame, kernel_size=[5, 5], sigma=sigma)
-            # Transform and Normalize to 0-1
-            tensor_frames.append(T.ToTensor()(frame)) 
+                for fn_id in fn_indices:
+                    if fn_id == 0 and brightness_factor is not None:
+                        frame = TF.adjust_brightness(frame, brightness_factor)
+                    elif fn_id == 1 and contrast_factor is not None:
+                        frame = TF.adjust_contrast(frame, contrast_factor)
+                    elif fn_id == 2 and saturation_factor is not None:
+                        frame = TF.adjust_saturation(frame, saturation_factor)
+                    elif fn_id == 3 and hue_factor is not None:
+                        frame = TF.adjust_hue(frame, hue_factor)
 
-        # 3. 텐서 기반 증강 및 정규화
-        # 비디오 데이터는 (C, T, H, W) 또는 (T, C, H, W) 형태가 일반적입니다.
-        # torch.stack의 dim 파라미터를 데이터 형태에 맞게 조정하세요.
-        # 예: (T, C, H, W)를 원할 경우 dim=0
+                frame = TF.gaussian_blur(frame, kernel_size=[5, 5], sigma=sigma)
+
+            tensor_frames.append(T.ToTensor()(frame))
         clip_tensor = torch.stack(tensor_frames, dim=0)
-
-        # Normalize
-        # clip_tensor /= 255.0  # REMOVED: T.ToTensor() already scales to [0, 1]
-        # clip_tensor = TF.normalize(clip_tensor, mean=self.mean, std=self.std)
-
         return clip_tensor
 
 
@@ -181,7 +162,7 @@ class ClipConsistentTransforms:
 
 
 class VideoSensorDataset(Dataset):
-    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index, cache_dir, use_flow=False):
+    def __init__(self, json_path: str, data_root: str, num_frames: int, transform, sensor_transform, threshold_epoch, start_index, end_index, cache_dir, use_flow=False, use_cache=False):
         super().__init__()
         
         self.data_root = data_root
@@ -194,7 +175,7 @@ class VideoSensorDataset(Dataset):
         self.end_index = end_index
         self.samples = []
         self.cache_dir = cache_dir
-        self.use_cache = False
+        self.use_cache = use_cache  # val/test용 캐싱 옵션
 
         # 1. JSON 파일을 읽어 (비디오 전체 경로, 레이블) 리스트 생성
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -226,124 +207,114 @@ class VideoSensorDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _get_cache_path(self, video_path):
+        """캐시 파일 경로 생성"""
+        parts = video_path.split(os.sep)
+        if len(parts) >= 2:
+            last_two_parts = '/'.join(parts[-2:])
+        else:
+            last_two_parts = os.path.basename(video_path)
+        cache_path = os.path.join(self.cache_dir, "videos", last_two_parts)
+        return cache_path.rsplit('.', 1)[0] + '.pt'
+
+    def _load_from_cache(self, cache_path):
+        """캐시에서 텐서 로드"""
+        if os.path.exists(cache_path):
+            try:
+                print("load cache", cache_path)
+                return torch.load(cache_path, weights_only=False)
+            except Exception as e:
+                print(f"Cache load failed: {cache_path}, {e}")
+        return None
+
+    def _save_to_cache(self, cache_path, tensor):
+        """텐서를 캐시에 저장 (atomic write)"""
+        import fcntl
+        try:
+            cache_dir = os.path.dirname(cache_path)
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            lock_path = cache_path + ".lock"
+            with open(lock_path, 'w') as f_lock:
+                fcntl.flock(f_lock, fcntl.LOCK_EX)
+                
+                if not os.path.exists(cache_path):
+                    temp_path = cache_path + ".tmp"
+                    torch.save(tensor, temp_path)
+                    os.rename(temp_path, cache_path)
+                    
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+            print("save cache", cache_path)
+        except Exception as e:
+            print(f"Cache save failed: {cache_path}, {e}")
+
+    def _load_video_frames(self, video_path):
+        """비디오에서 프레임 로드"""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file not found at the constructed path: {video_path}")
+            raise IOError(f"Cannot open video file, it may be corrupted or in an unsupported format: {video_path}")
+            
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if total_frames > 1:
+            frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+        else:
+            frame_indices = np.zeros(self.num_frames, dtype=int)
+        
+        frames = []
+        last_successful_frame = None
+
+        for frame_idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_pil = Image.fromarray(frame_rgb)
+                last_successful_frame = frame_pil.copy()
+                frames.append(frame_pil)
+            else:
+                if last_successful_frame is not None:
+                    frames.append(last_successful_frame.copy())
+                else:
+                    frames.append(Image.new('RGB', (224, 224)))
+        
+        cap.release()
+        return frames
+
     def __getitem__(self, idx: int):
         video_path, sensor_path, label, item_id, flow_path = self.samples[idx]
         
         ######### 비디오 전처리 #########       
-        if self.current_epoch <= self.threshold_epoch:  # threshold_epoch 동안은 센서 클러스터링 모델만 학습
-            # 1. self.num_frames 개수만큼의 가짜 이미지 '리스트'를 생성합니다.
+        if self.current_epoch <= self.threshold_epoch:
             dummy_clip = [Image.new('RGB', (224, 224)) for _ in range(self.num_frames)]
-
-            # 2. 이미지 리스트(클립)를 transform에 전달합니다.
-            # self.transform은 내부적으로 이 리스트를 올바른 모양의 텐서로 변환해 줄 것입니다.
             frames_tensor = self.transform(dummy_clip)
             print("fake clip used", self.current_epoch)
 
-        ######### 비디오 전처리 #########       
-        # 1. OpenCV를 사용하여 비디오 캡처 객체 생성
         else:
-            parts = video_path.split(os.sep)
-
-            # 3. 마지막 두 부분을 다시 '.'으로 연결
-            if len(parts) >= 2:
-                last_two_parts = '/'.join(parts[-2:])
-            cache_dir = os.path.join(self.cache_dir, "videos")
-            cache_path=os.path.join(cache_dir, last_two_parts)
-            cache_path = cache_path.rsplit('.', 1)[0] + '.pt'
-
-            cache_dir_for_file = os.path.dirname(cache_path)
-            os.makedirs(cache_dir_for_file, exist_ok=True) # exist_ok=True로 이미 존재하면 무시
-            if os.path.exists(cache_path):
-                with torch.serialization.safe_globals({Image.Image}):
-                    frames = torch.load(cache_path)
-                # print("cached clip used", cache_path)
-            else:
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
-                    if not os.path.exists(video_path):
-                        raise FileNotFoundError(f"Video file not found at the constructed path: {video_path}")
-                    raise IOError(f"Cannot open video file, it may be corrupted or in an unsupported format: {video_path}")
-                    
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # 캐싱 사용 시 (val/test)
+            if self.use_cache:
+                cache_path = self._get_cache_path(video_path)
+                frames_tensor = self._load_from_cache(cache_path)
                 
-                # 2. 프레임 인덱스 샘플링 (균등 샘플링)
-                if total_frames > 1:
-                    frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
-                else:
-                    # 프레임이 없거나 하나뿐인 비디오 처리
-                    frame_indices = np.zeros(self.num_frames, dtype=int)
-                
-                frames = []
-                successful_reads = 0
-                last_successful_frame = None
-
-                for frame_idx in frame_indices:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                    ret, frame = cap.read()
-                    
-                    if ret:
-                        successful_reads += 1
-                        # OpenCV(BGR) -> RGB -> PIL Image
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        frame_pil = Image.fromarray(frame_rgb)
-                        last_successful_frame = frame_pil.copy()
-                        frames.append(frame_pil)
-                        
+                if frames_tensor is None:
+                    # 캐시 miss: 비디오 로드 → transform → 저장
+                    frames = self._load_video_frames(video_path)
+                    if self.transform:
+                        frames_tensor = self.transform(frames)
                     else:
-                        # 프레임 읽기 실패 시, 마지막으로 성공한 프레임 또는 검은 이미지 사용
-                        if last_successful_frame is not None:
-                            frames.append(last_successful_frame.copy())
-                        else:
-                            frames.append(Image.new('RGB', (224, 224)))
-                try:
-                    # 쓰기 성공 시에만 최종 이름으로 변경
-                    # 2. 캐시 파일이 없음 -> 락을 잡고 캐시 생성 시도
-                    import fcntl
-                    lock_path = cache_path + ".lock"      # 락 파일 경로
-                    # 락 파일을 'w' 모드로 엽니다.
-                    with open(lock_path, 'w') as f_lock:
-                        # 락을 시도 (배타적 락). 다른 프로세스가 락을 잡고 있으면 여기서 대기합니다.
-
-                        fcntl.flock(f_lock, fcntl.LOCK_EX)
-
-                        # 3. 락을 획득한 후, 혹시 그사이에 다른 워커가 캐시를 만들었는지 다시 확인 (Double Check)
-                        #    (우리가 락을 기다리는 동안, 앞선 워커가 캐싱을 완료했을 수 있음)
-                        temp_cache_path = cache_path + ".tmp"
-                        
-                        if os.path.exists(cache_path):
-
-                            frames = torch.load(cache_path, weights_only=False)
-                        else:
-                            # 4. 여기 온 워커가 '최초의' 캐시 생성자임
-                            # print(f"Worker {os.getpid()} creating cache: {cache_path}")
-                            
-                            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                        
-                            torch.save(frames, temp_cache_path)
-                            os.rename(temp_cache_path, cache_path) 
-                            print("clip is cached", cache_path)
-                            
-                        # --- 기존 코드 끝 ---
-                except Exception as e:
-                    print(f"Error during atomic cache write for {cache_path}: {e}")
-                    if os.path.exists(temp_cache_path):
-                        os.remove(temp_cache_path)
-                    pass
-                finally:
-                    # 5. 모든 작업이 끝나면 (성공하든, 에러가 나든) 락 파일을 삭제
-                    #    (f_lock이 닫히면서 락 자체는 자동으로 해제됨)
-                    if os.path.exists(lock_path):
-                        os.remove(lock_path)
-
-                cap.release()
-
-            # 3. 클립 전체에 대해 한 번에 전처리 적용
-            if self.transform:
-                # transform이 이제 클립 전체를 받아 최종 텐서를 반환
-                frames_tensor = self.transform(frames)
+                        frames_tensor = torch.stack([T.ToTensor()(frame) for frame in frames])
+                    self._save_to_cache(cache_path, frames_tensor)
             else:
-                # transform이 없는 경우, 기본 ToTensor와 stack만 수행
-                frames_tensor = torch.stack([T.ToTensor()(frame) for frame in frames])
+                # 캐싱 미사용 (train): 매번 로드 + 랜덤 augmentation
+                frames = self._load_video_frames(video_path)
+                if self.transform:
+                    frames_tensor = self.transform(frames)
+                else:
+                    frames_tensor = torch.stack([T.ToTensor()(frame) for frame in frames])
 
 
         ######### 센서 전처리 #########

@@ -249,14 +249,14 @@ if __name__ == '__main__':
     parser.add_argument("--model_name", type=str, default="method")
     parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
     parser.add_argument("--project_name", type=str, default="Method_Test_Lightning", help="WandB project name")
-    parser.add_argument("--save_stage_cache", type=bool, default=False, help="Whether use stage cache")
-    parser.add_argument("--save_weights", type=bool, default=False, help="Whether save weights")
+    parser.add_argument("--save_stage_cache", action='store_true', help="Whether save stage cache")
+    parser.add_argument("--save_weights", action='store_true', help="Whether save weights")
 
     # 학습 인자    
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--num_frames", type=int, default=20)
+    parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--embedding_dim", type=int, default=512) # Total
     parser.add_argument("--alpha_fixed", type=bool, default=True)

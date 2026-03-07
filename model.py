@@ -485,74 +485,113 @@ class SharedEncoder(nn.Module):
     def forward(self, x):
         return self.net(x)  # [B, out_dim, H', W']
 
+# class MotionEncoder(nn.Module):
+#     """
+#     Motion Encoder with cosine-consistent projection.
+#     강조점:
+#       - CosineProj: norm-invariant projection layer
+#       - optional cosine regularization for self-consistency
+#     """
+#     def __init__(self, in_channels=5, base_dim=32, latent_dim=256, use_cosine_proj=True, use_flow=True):
+#         super().__init__()
+#         self.in_channels = in_channels
+#         self.latent_dim = latent_dim
+#         self.use_flow = use_flow  # Store whether to use optical flow
+
+#         # 3D backbone (temporal gradient feature)
+#         self.backbone = nn.Sequential(
+#             nn.Conv3d(in_channels, base_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
+#             nn.BatchNorm3d(base_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Conv3d(base_dim, base_dim * 2, kernel_size=3, stride=(1, 2, 2), padding=1),
+#             nn.BatchNorm3d(base_dim * 2),
+#             nn.ReLU(inplace=True),
+#             nn.Conv3d(base_dim * 2, latent_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
+#             nn.BatchNorm3d(latent_dim),
+#             nn.ReLU(inplace=True),
+#         )
+
+#         self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+
+#         # ✅ projection head 변경
+#         if use_cosine_proj:
+#             self.proj = CosineProj(latent_dim, latent_dim)
+#         else:
+#             self.proj = nn.Linear(latent_dim, latent_dim)
+
+#     def forward(self, videos, flows=None):
+#         B, T, _, H, W = videos.shape
+
+#         video_diff = videos[:, 1:] - videos[:, :-1]
+        
+#         if self.use_flow:
+#             # WITH flow: MUST provide actual flow data
+#             if not isinstance(flows, torch.Tensor):
+#                 raise ValueError(
+#                     f"MotionEncoder initialized with use_flow=True, but flows is not a tensor! "
+#                     f"Got type: {type(flows)}. "
+#                     f"Either provide optical flow data or initialize with use_flow=False."
+#                 )
+            
+#             # Adjust flow temporal dimension if needed
+#             if flows.shape[1] > video_diff.shape[1]:
+#                 flows = flows[:, : video_diff.shape[1]]
+#             elif flows.shape[1] < video_diff.shape[1]:
+#                 flows = torch.cat([flows, flows[:, -1:, :, :, :]], dim=1)
+            
+#             x = torch.cat([video_diff, flows], dim=2)  # [B, T-1, 5, H, W]
+#         else:
+#             # WITHOUT flow: use 3 channels (RGB diff only) - NO ZERO PADDING!
+#             x = video_diff  # [B, T-1, 3, H, W]
+
+#         x = x.permute(0, 2, 1, 3, 4)
+#         feature_5d = self.backbone(x)
+#         feat = self.spatial_pool(feature_5d).squeeze(-1).squeeze(-1)
+
+#         v_motion = feat.mean(dim=2)
+
+#         # projection
+#         v_motion = self.proj(v_motion)
+#         return v_motion, feature_5d
+
+import torch
+import torch.nn as nn
+import torchvision
+
+def find_last_linear_in_features(module: nn.Module) -> int:
+    last_linear = None
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            last_linear = m
+    if last_linear is None:
+        raise RuntimeError("No nn.Linear found in the given module.")
+    return last_linear.in_features
+
 class MotionEncoder(nn.Module):
-    """
-    Motion Encoder with cosine-consistent projection.
-    강조점:
-      - CosineProj: norm-invariant projection layer
-      - optional cosine regularization for self-consistency
-    """
-    def __init__(self, in_channels=5, base_dim=32, latent_dim=256, use_cosine_proj=True, use_flow=True):
+    def __init__(self, latent_dim=256, use_cosine_proj=True, use_flow=False, base_dim=32, in_channels=3, mv_model="mvit_v2_s"):
         super().__init__()
-        self.in_channels = in_channels
-        self.latent_dim = latent_dim
-        self.use_flow = use_flow  # Store whether to use optical flow
+        import torchvision
 
-        # 3D backbone (temporal gradient feature)
-        self.backbone = nn.Sequential(
-            nn.Conv3d(in_channels, base_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
-            nn.BatchNorm3d(base_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(base_dim, base_dim * 2, kernel_size=3, stride=(1, 2, 2), padding=1),
-            nn.BatchNorm3d(base_dim * 2),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(base_dim * 2, latent_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
-            nn.BatchNorm3d(latent_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
-
-        # ✅ projection head 변경
-        if use_cosine_proj:
-            self.proj = CosineProj(latent_dim, latent_dim)
+        if mv_model == "mvit_v2_s":
+            weights = torchvision.models.video.MViT_V2_S_Weights.DEFAULT
+            backbone = torchvision.models.video.mvit_v2_s(weights=weights)
         else:
-            self.proj = nn.Linear(latent_dim, latent_dim)
+            raise ValueError(mv_model)
+
+        # ✅ head가 Sequential이든 아니든 마지막 Linear의 in_features로 dim 추론
+        backbone_dim = find_last_linear_in_features(backbone.head)
+        backbone.head = nn.Identity()
+        self.backbone = backbone
+
+        self.proj = CosineProj(backbone_dim, latent_dim) if use_cosine_proj else nn.Linear(backbone_dim, latent_dim)
 
     def forward(self, videos, flows=None):
-        B, T, _, H, W = videos.shape
+        # videos: [B, T, 3, H, W]
+        x = videos.permute(0, 2, 1, 3, 4).contiguous()   # [B, 3, T, H, W]
+        feat = self.backbone(x)                          # [B, backbone_dim]
+        v_motion = self.proj(feat)
+        return v_motion, feat
 
-        video_diff = videos[:, 1:] - videos[:, :-1]
-        
-        if self.use_flow:
-            # WITH flow: MUST provide actual flow data
-            if not isinstance(flows, torch.Tensor):
-                raise ValueError(
-                    f"MotionEncoder initialized with use_flow=True, but flows is not a tensor! "
-                    f"Got type: {type(flows)}. "
-                    f"Either provide optical flow data or initialize with use_flow=False."
-                )
-            
-            # Adjust flow temporal dimension if needed
-            if flows.shape[1] > video_diff.shape[1]:
-                flows = flows[:, : video_diff.shape[1]]
-            elif flows.shape[1] < video_diff.shape[1]:
-                flows = torch.cat([flows, flows[:, -1:, :, :, :]], dim=1)
-            
-            x = torch.cat([video_diff, flows], dim=2)  # [B, T-1, 5, H, W]
-        else:
-            # WITHOUT flow: use 3 channels (RGB diff only) - NO ZERO PADDING!
-            x = video_diff  # [B, T-1, 3, H, W]
-
-        x = x.permute(0, 2, 1, 3, 4)
-        feature_5d = self.backbone(x)
-        feat = self.spatial_pool(feature_5d).squeeze(-1).squeeze(-1)
-
-        v_motion = feat.mean(dim=2)
-
-        # projection
-        v_motion = self.proj(v_motion)
-        return v_motion, feature_5d
 
 
 # --- Cosine Projection Layer ---

@@ -5,7 +5,8 @@ import pandas as pd
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
-
+import cv2
+import fcntl
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -78,8 +79,8 @@ class SequenceDataset(Dataset):
     """
     def __init__(self, json_path: str, data_root: str, class_to_idx: Dict[str, int],
                  dtype: torch.dtype = torch.float32, sensor_transform: SensorTransform = None,
-                 include_video: bool = False, num_frames: int = 20, video_transform=None,
-                 cache_dir: str = None, use_flow: bool = False):
+                 include_video: bool = False, num_frames: int = 16, video_transform=None,
+                 cache_dir: str = None, use_flow: bool = False, use_cache: bool = False):
         super().__init__()
         self.data_root = data_root
         self.class_to_idx = class_to_idx
@@ -90,6 +91,7 @@ class SequenceDataset(Dataset):
         self.video_transform = video_transform
         self.use_flow = use_flow
         self.cache_dir = cache_dir or os.path.join(data_root, "caches", "videos")
+        self.use_cache = use_cache  # val/test용 캐싱 옵션
 
         with open(json_path, 'r', encoding='utf-8') as f:
             j = json.load(f)
@@ -135,28 +137,55 @@ class SequenceDataset(Dataset):
             return None
         return data
 
+    def _get_cache_path(self, video_path: str) -> str:
+        """캐시 파일 경로 생성"""
+        rel_path = os.path.relpath(video_path, self.data_root)
+        cache_path = os.path.join(self.cache_dir, rel_path.rsplit('.', 1)[0] + '.pt')
+        return cache_path
+
+    def _load_from_cache(self, cache_path: str) -> torch.Tensor:
+        """캐시에서 텐서 로드"""
+        if os.path.exists(cache_path):
+            try:
+                print("load cache", cache_path)
+                return torch.load(cache_path, weights_only=False)
+            except Exception as e:
+                print(f"Cache load failed: {cache_path}, {e}")
+        return None
+
+    def _save_to_cache(self, cache_path: str, tensor: torch.Tensor):
+        """텐서를 캐시에 저장 (atomic write)"""
+        try:
+            cache_dir = os.path.dirname(cache_path)
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            lock_path = cache_path + ".lock"
+            with open(lock_path, 'w') as f_lock:
+                fcntl.flock(f_lock, fcntl.LOCK_EX)
+                
+                if not os.path.exists(cache_path):
+                    temp_path = cache_path + ".tmp"
+                    torch.save(tensor, temp_path)
+                    os.rename(temp_path, cache_path)
+                    
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+            print("save cache", cache_path)
+        except Exception as e:
+            print(f"Cache save failed: {cache_path}, {e}")
+
     def _load_video_frames(self, video_path: str) -> torch.Tensor:
         """비디오 프레임 로딩 (캐싱 지원)"""
-        import cv2
-        import filelock
         
         if not os.path.exists(video_path):
             return None
         
-        # 캐시 경로 생성
-        rel_path = os.path.relpath(video_path, self.data_root)
-        cache_path = os.path.join(self.cache_dir, rel_path.rsplit('.', 1)[0] + '.pt')
-        cache_dir_for_file = os.path.dirname(cache_path)
-        os.makedirs(cache_dir_for_file, exist_ok=True)
-        
-        # 캐시 존재하면 로드
-        if os.path.exists(cache_path):
-            try:
-                frames = torch.load(cache_path, weights_only=False)
-                # print("Cache load success:", cache_path)
-                return frames
-            except Exception as e:
-                print(f"Cache load failed: {cache_path}, {e}")
+        # 캐싱 사용 시 캐시 확인
+        if self.use_cache:
+            cache_path = self._get_cache_path(video_path)
+            cached_tensor = self._load_from_cache(cache_path)
+            if cached_tensor is not None:
+                return cached_tensor
         
         # 비디오에서 프레임 추출
         cap = cv2.VideoCapture(video_path)
@@ -193,17 +222,9 @@ class SequenceDataset(Dataset):
             frames_np = np.stack(frames, axis=0)
             result = torch.from_numpy(frames_np).permute(0, 3, 1, 2).float()
         
-        # 캐시 저장 (atomic write)
-        try:
-            lock_path = cache_path + ".lock"
-            with filelock.FileLock(lock_path, timeout=10):
-                if not os.path.exists(cache_path):
-                    temp_path = cache_path + ".tmp"
-                    torch.save(result, temp_path)
-                    os.rename(temp_path, cache_path)
-            print("Cache saved:", cache_path)
-        except Exception as e:
-            print(f"Cache save failed: {cache_path}, {e}")
+        # 캐싱 사용 시 저장
+        if self.use_cache:
+            self._save_to_cache(cache_path, result)
         
         return result
 
@@ -290,7 +311,7 @@ class SequenceDataset(Dataset):
                         flow_tensors.append(None)
                 else:
                     # flow path가 없으면 None
-                    print("[WARN] Don't use flow: ", item.flow_paths[i] if i < len(item.flow_paths) else "N/A")
+                    # print("[WARN] Don't use flow: ", item.flow_paths[i] if i < len(item.flow_paths) else "N/A")
                     flow_tensors.append(None)
 
         # ✅ 모든 윈도우가 너무 짧을 경우 dummy 생성
@@ -395,7 +416,7 @@ class LinearProbeLSTMDatamodule(pl.LightningDataModule):
     def __init__(self, batch_size=8, num_workers=8, pin_memory=True, sensor_transform=None):
         super().__init__()
         self.data_root = Path("/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window")
-        base = self.data_root.parent / "motion_2_almost_priority_test=18"
+        base = self.data_root / "motion_2_almost_priority_test=18"
         self.train_json = base / "linear_probe_train.json"
         self.test_json = base / "linear_probe_test.json"
 

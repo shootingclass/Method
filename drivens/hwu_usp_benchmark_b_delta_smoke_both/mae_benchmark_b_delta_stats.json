@@ -1,0 +1,61 @@
+{
+  "created_at": "2026-03-03T22:42:15",
+  "model": "MAE",
+  "data_json": "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/motion_2_priority_test=18/pretrain_cropped_with_flow_detail_prudent.json",
+  "data_root": "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window",
+  "seed": 42,
+  "device": "cpu",
+  "reduction": "mean",
+  "num_total_selected_samples": 64,
+  "num_valid_openclose_samples": 16,
+  "num_anchors_evaluated": 16,
+  "num_anchors_without_pair": 0,
+  "action_counts_valid": {
+    "open": 9,
+    "close": 7
+  },
+  "object_counts_valid": {
+    "Ktch_B4_Cupboard": 4,
+    "Ktch_T1_Cupboard": 3,
+    "Ktch_T2_Cupboard": 3,
+    "Ktch_T3_Cupboard": 6
+  },
+  "avg_hard_candidate_count": 2.0,
+  "avg_easy_candidate_count": 5.75,
+  "hard_sim_mean": 0.9379551410675049,
+  "easy_sim_mean": 0.6845308542251587,
+  "delta_mean": 0.2534243166446686,
+  "delta_std": 0.05054645240306854,
+  "delta_median": 0.23873370885849,
+  "delta_min": 0.19251465797424316,
+  "delta_max": 0.38314950466156006,
+  "inversion_ratio_delta_lt_0": 0.0,
+  "positive_ratio_delta_gt_0": 1.0,
+  "anchor_video_ids": [
+    "tidy_s02_0000005000_0000007000",
+    "tidy_s02_0000006000_0000008000",
+    "tidy_s02_0000014000_0000016000",
+    "tidy_s02_0000015000_0000017000",
+    "tidy_s02_0000022000_0000024000",
+    "tidy_s02_0000023000_0000025000",
+    "tidy_s08_0000007000_0000009000",
+    "tidy_s08_0000008000_0000010000",
+    "tidy_s08_0000010000_0000012000",
+    "tidy_s08_0000011000_0000013000",
+    "tidy_s08_0000013000_0000015000",
+    "tidy_s08_0000014000_0000016000",
+    "tidy_s08_0000021000_0000023000",
+    "tidy_s08_0000022000_0000024000",
+    "tidy_s08_0000026000_0000028000",
+    "tidy_s08_0000027000_0000029000"
+  ],
+  "outputs": {
+    "hist_png": "/home/jaemo/Method/drivens/hwu_usp_benchmark_b_delta_smoke_both/mae_benchmark_b_delta_hist.png",
+    "delta_npy": "/home/jaemo/Method/drivens/hwu_usp_benchmark_b_delta_smoke_both/mae_benchmark_b_delta_values.npy",
+    "hard_sim_npy": "/home/jaemo/Method/drivens/hwu_usp_benchmark_b_delta_smoke_both/mae_benchmark_b_hard_sim.npy",
+    "easy_sim_npy": "/home/jaemo/Method/drivens/hwu_usp_benchmark_b_delta_smoke_both/mae_benchmark_b_easy_sim.npy"
+  },
+  "checkpoint_path": "/home/jaemo/Method/checkpoints/evimae/HWU-USP/models/evi_model.299.pth",
+  "args_json": "/home/jaemo/Method/checkpoints/evimae/HWU-USP/args.json",
+  "mae_num_frames": 16
+}

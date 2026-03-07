@@ -1,0 +1,52 @@
+{
+  "sample_index": 178,
+  "seed": 42,
+  "sample_meta": "trim_2s_video_cropped/S3-Drill/S3-Drill_000437000_000439000.mp4",
+  "imu_shape": [
+    1,
+    37,
+    128,
+    128
+  ],
+  "video_shape": [
+    1,
+    3,
+    16,
+    224,
+    224
+  ],
+  "v_mask_shape": [
+    1,
+    1568
+  ],
+  "loss": 1.2431126832962036,
+  "loss_mae": 1.2431126832962036,
+  "loss_mae_a": 0.8744609355926514,
+  "loss_mae_v": 0.36865174770355225,
+  "loss_c": -0.0,
+  "contrast_acc": 1.0,
+  "loss_g": 0.0,
+  "mask_a_shape": [
+    1,
+    64
+  ],
+  "mask_v_shape": [
+    1,
+    1568
+  ],
+  "first_frame_path": "/home/jaemo/Method/drivens/mae_linear_train/8_Open_Drawer_1_all/178_S3-Drill_000437000_000439000/first_frame.png",
+  "original_info": {
+    "original_frame_dir": "/home/jaemo/Method/drivens/mae_linear_train/8_Open_Drawer_1_all/178_S3-Drill_000437000_000439000/original_frames",
+    "num_frames": 16
+  },
+  "attention_info": {
+    "feature_overlay_dir": "/home/jaemo/Method/drivens/mae_linear_train/8_Open_Drawer_1_all/178_S3-Drill_000437000_000439000/attention_overlay",
+    "num_frames": 16,
+    "patch_grid": [
+      14,
+      14
+    ],
+    "tubelets": 8,
+    "map_type": "video_token_energy_no_mask"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "created_at": "2026-03-03T22:15:22",
+  "data_json": "/mnt/hdd4tb/junho/Opportunity++/data_processed_2s_window/action/linear_val.json",
+  "checkpoint_path": "/home/jaemo/Method/checkpoints/evimae/Opportunity++/models/evi_model.299.pth",
+  "args_json": "/home/jaemo/Method/checkpoints/evimae/Opportunity++/args.json",
+  "seed": 42,
+  "device": "cpu",
+  "num_total_dataset_samples": 113,
+  "num_used_samples": 113,
+  "label_counts": {
+    "0": 10,
+    "1": 10,
+    "2": 9,
+    "3": 10,
+    "4": 12,
+    "5": 11,
+    "6": 8,
+    "7": 7,
+    "8": 6,
+    "9": 5,
+    "10": 6,
+    "11": 5,
+    "12": 7,
+    "13": 7
+  },
+  "num_negative_pairs": 5895,
+  "cosine_mean": 0.7100222110748291,
+  "cosine_std": 0.14978568255901337,
+  "cosine_min": 0.4408641457557678,
+  "cosine_max": 0.9997342228889465,
+  "outputs": {
+    "hist_png": "/home/jaemo/Method/drivens/mae_linear_val_hist/mae_linear_val_negative_pairs_hist.png",
+    "cosine_npy": "/home/jaemo/Method/drivens/mae_linear_val_hist/mae_linear_val_negative_pairs_cosine.npy"
+  }
+}

@@ -147,13 +147,24 @@ class EVIDataset(Dataset):
         elif 'cmu' in self.datapath:
             self.dataset_name = 'cmu'
             
-        else:
-            self.dataset_name = 'opp'
+        elif 'Opp' in self.datapath:
+            self.dataset_name = 'Opp'
+            self.label_num = 14
         
+        elif 'HWU' in self.datapath:
+            self.dataset_name = 'HWU'
+            if 'linear' in dataset_json_file:
+                self.label_num = 5
+            else:
+                self.label_num = 7
+
+        else:
+            raise Exception("Unknown dataset name: {}".format(self.datapath))
+
         # /home/junho/IMU-Video-MAE/data_release/Opportunity++
         # self.data_base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.datapath))))
-        self.data_base_path = os.path.dirname(os.path.dirname(os.path.dirname(self.datapath)))
-        
+        self.data_base_path = os.path.dirname(os.path.dirname(self.datapath))
+    
         # JSON 파일 열어서 데이터 로드
         with open(dataset_json_file, 'r') as fp:
             data_json = json.load(fp)
@@ -184,13 +195,45 @@ class EVIDataset(Dataset):
         # dataset spectrogram mean and std, used to normalize the input
         self.norm_mean = self.imu_conf.get('mean')
         self.norm_std = self.imu_conf.get('std')
+
+        # [MODIFIED] Support loading mean/std from a file (e.g., .npy)
+        if isinstance(self.norm_mean, str) and os.path.exists(self.norm_mean):
+                print(f'Loading mean from {self.norm_mean}')
+                # Load the file. Assume it's a .npy file with a dictionary or array.
+                # If it's the specific format we saw (dictionary with 'mean' key), handle it.
+                loaded_stats = np.load(self.norm_mean, allow_pickle=True).item()
+                if isinstance(loaded_stats, dict) and 'mean' in loaded_stats:
+                    self.norm_mean = loaded_stats['mean']
+                    print(f'Loaded mean shape: {self.norm_mean.shape}')
+                else:
+                     # Fallback if the file structure is different, or if user passed the array directly
+                    self.norm_mean = loaded_stats
+        
+        if isinstance(self.norm_std, str) and os.path.exists(self.norm_std):
+                print(f'Loading std from {self.norm_std}')
+                loaded_stats = np.load(self.norm_std, allow_pickle=True).item()
+                if isinstance(loaded_stats, dict) and 'std' in loaded_stats:
+                    self.norm_std = loaded_stats['std']
+                    print(f'Loaded std shape: {self.norm_std.shape}')
+                else:
+                    self.norm_std = loaded_stats
+
+        # Convert to torch tensor and reshape for broadcasting if it's an array
+        if isinstance(self.norm_mean, (np.ndarray, list)):
+             self.norm_mean = torch.tensor(self.norm_mean, dtype=torch.float32).view(-1, 1, 1)
+        if isinstance(self.norm_std, (np.ndarray, list)):
+             self.norm_std = torch.tensor(self.norm_std, dtype=torch.float32).view(-1, 1, 1)
+
         # skip_norm is a flag that if you want to skip normalization to compute the normalization stats using src/get_norm_stats.py, if Ture, input normalization will be skipped for correctly calculating the stats.
         # set it as True ONLY when you are getting the normalization stats.
         self.skip_norm = self.imu_conf.get('skip_norm') if self.imu_conf.get('skip_norm') else False
         if self.skip_norm:
             print('now skip normalization (use it ONLY when you are computing the normalization stats).')
         else:
-            print('use dataset mean {:.3f} and std {:.3f} to normalize the input.'.format(self.norm_mean, self.norm_std))
+            if isinstance(self.norm_mean, torch.Tensor):
+                 print('use per-channel mean/std to normalize the input.')
+            # else:
+                #  print('use dataset mean {:.3f} and std {:.3f} to normalize the input.'.format(self.norm_mean, self.norm_std))
         
         # 데이터 증강을 위한 노이즈 추가 설정
         # imu_conf에 noise 키가 있으면 그 값을 사용, noise 키가 없으면 False를 기본값으로 사용
@@ -203,10 +246,10 @@ class EVIDataset(Dataset):
 
         # label 처리
         # self.index_dict -> {'404505': '0', '404508': '1', '404511': '2', '404516': '3', '404517': '4', '404519': '5', '404520': '6', '405506': '7', '406505': '8', '406508': '9', '406511': '10', '406516': '11', '406517': '12', '406519': '13', '406520': '14', '407521': '15', '408512': '16'}
-        self.index_dict = make_index_dict(label_csv)
+        # self.index_dict = make_index_dict(label_csv)
         
-        self.label_num = len(self.index_dict)
-        print('number of classes is {:d}'.format(self.label_num))
+        # self.label_num = len(self.index_dict)
+        # print('number of classes is {:d}'.format(self.label_num))
 
         # 타겟 길이 설정
         self.target_length = self.imu_conf.get('target_length')
@@ -281,7 +324,7 @@ class EVIDataset(Dataset):
     # change python list to numpy array to avoid memory leak.
     def pro_data(self, data_json):
         for i in range(len(data_json)):
-            data_json[i] = [data_json[i]['imu_path'], data_json[i]['label'], data_json[i]['video_id'], data_json[i]['frame_path']]
+            data_json[i] = [data_json[i]['sensor_path'], data_json[i]['label'], data_json[i]['video_id'], data_json[i]['frame_path']]
         
         # dtype=str**로 넘기니까 원래 int였던 'label'도 문자형으로 바뀌게 됨
         data_np = np.array(data_json, dtype=str)
@@ -312,14 +355,22 @@ class EVIDataset(Dataset):
         elif self.dataset_name == 'wear':
             imu_to_use = [10,11,12, 1,2,3, 7,8,9, 4,5,6] # xyz acceleration for left arm, right arm, left leg, right leg
 
-        elif self.dataset_name == 'opp':
-            imu_to_use = [50,51,52, 76,77,78, 102,103,104, 118,119,120] # change to sensor columns
+        elif self.dataset_name == 'Opp':
+            imu_to_use = list(range(194,231)) # change to sensor columns
+        
+        elif self.dataset_name == 'HWU':
+            imu_to_use = list(range(4,10)) # change to sensor columns
+        
+        else:
+            raise Exception("Unknown dataset name: {}".format(self.dataset_name))
 
         # 데이터베이스 경로와 파일 이름을 결합하여 전체 파일 경로를 생성
         filename = os.path.join(self.data_base_path, filename)
         
         # CSV 파일에서 IMU 데이터를 읽어 NumPy 배열로 변환
-        IMU_data = pd.read_csv(filename, index_col=False).to_numpy() # 250, 14 for wear; 150, 64 for cmu
+        df = pd.read_csv(filename, index_col=False)
+        df = df.interpolate(method='linear', limit_direction='both').fillna(0)
+        IMU_data = df.to_numpy() # 250, 14 for wear; 150, 64 for cmu
         
         # 논문에서 말하던 Cleaning!!
         # 비디오의 특정 프레임 ID와 비디오 지속 시간을 사용하여 IMU 데이터의 시작과 끝 인덱스를 계산
@@ -331,7 +382,7 @@ class EVIDataset(Dataset):
         IMU_data = IMU_data[IMU_start:IMU_end, :] # [~64, 64]
 
         # 각 IMU 채널에 대해 스펙트로그램 생성 및 전처리
-        for imu_idx in imu_to_use:
+        for i, imu_idx in enumerate(imu_to_use):
             
             # no mixup
             # 선택된 IMU 채널의 데이터를 추출하고, 평균을 제거하여 정규화
@@ -353,9 +404,19 @@ class EVIDataset(Dataset):
                 # 오디오 처리나 스펙트로그램 변환 시 일반적으로 [채널 수, 샘플 수] 형태를 많이 쓰는데, 이를 맞추기 위한 조치
                 waveform = torch.from_numpy(one_IMU_wave[:,None]).transpose(0,1)
 
-                # 논문에서 말하던 Normalization!!
-                # 평균값을 빼서 시그널의 평균을 0으로 맞추는 정규화 과정
-                waveform = waveform - waveform.mean()
+                # Apply per-channel normalization using loaded stats
+                # self.norm_mean/std are tensors of shape [C, 1, 1]
+                if isinstance(self.norm_mean, torch.Tensor) and self.norm_mean.shape[0] == len(imu_to_use):
+                     # Use specific channel mean/std
+                     ch_mean = self.norm_mean[i].item()
+                     ch_std = self.norm_std[i].item()
+                     # Avoid division by zero
+                     if ch_std == 0: ch_std = 1.0
+                     waveform = (waveform - ch_mean) / (ch_std + 1e-6)
+                else:
+                    # Fallback or older logic (zero-centering only if no stats)
+                    waveform = waveform - waveform.mean()
+
                 
             # mixup
             else:
@@ -428,7 +489,7 @@ class EVIDataset(Dataset):
         # 나중에 모델의 forward 함수에 들어가면 다시 부위별로 3개씩 나눠주는 과정이 있음
         fbank_cat = torch.cat(fbank_list, dim=0) 
         
-        print('fbank 모양', fbank_cat.shape)
+        # print('fbank 모양', fbank_cat.shape)
         
         # 원본 IMU 신호를 NumPy 배열로 결합
         raw_cat = np.array(raw_list) # [12, 60]
@@ -543,9 +604,15 @@ class EVIDataset(Dataset):
                 fbank, raw_imu = self._imu2fbank(datum['imu'], video_frame_id_list, video_duration)
                 fbank = fbank.to(torch.float32)
                 
-            except:
+                # Normalization is now                
+                # Normalization is now done in _imu2fbank on raw data
+                # if self.skip_norm == False:
+                #    fbank = (fbank - self.norm_mean) / (self.norm_std)
+                
+            except Exception as e:
                 fbank = torch.zeros([self.target_length, 6]) + 0.01
                 print('there is an error in loading imu')
+                print(e)
                 exit()
                 
             # label smoothing 적용 부분

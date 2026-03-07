@@ -304,6 +304,7 @@ class MethodLightningModule(pl.LightningModule):
                 ckpt_dir = cache_dir
                 ckpt_candidates = [
                     os.path.join(ckpt_dir, "start_stage2_epoch=25.pt"),
+                    os.path.join(ckpt_dir, "start_stage2_epoch=20.pt"),
                     os.path.join(ckpt_dir, "start_stage2_epoch=19.pt"),
                     os.path.join(ckpt_dir, "start_stage2_epoch=15.pt"),
                 ]

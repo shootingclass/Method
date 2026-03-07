@@ -15,9 +15,8 @@ from timm.models.vision_transformer import Attention, Mlp, PatchEmbed, Block
 from .pos_embed import get_2d_sincos_pos_embed
 import torch.nn.functional as F
 from einops import rearrange
-import dgl
-from dgl.nn.pytorch.glob import AvgPooling
 from functools import partial
+from torch.utils.checkpoint import checkpoint
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
@@ -62,13 +61,13 @@ class PatchEmbed_video(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_checkpoint=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.norm1_a = norm_layer(dim)
         self.norm1_v = norm_layer(dim)
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -76,8 +75,15 @@ class Block(nn.Module):
         self.norm2_v = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, x, modality=None):
+        if self.use_checkpoint and x.requires_grad:
+            return checkpoint(self._forward, x, modality, use_reentrant=False)
+        else:
+            return self._forward(x, modality)
+
+    def _forward(self, x, modality=None):
         if modality == None:
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -171,7 +177,7 @@ class Video_Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 attn_head_dim=None):
+                 attn_head_dim=None, use_checkpoint=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Video_Attention(
@@ -182,6 +188,7 @@ class Video_Block(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Video_Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.use_checkpoint = use_checkpoint
 
         if init_values > 0:
             self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
@@ -190,6 +197,12 @@ class Video_Block(nn.Module):
             self.gamma_1, self.gamma_2 = None, None
 
     def forward(self, x):
+        if self.use_checkpoint and x.requires_grad:
+            return checkpoint(self._forward, x, use_reentrant=False)
+        else:
+            return self._forward(x)
+
+    def _forward(self, x):
         if self.gamma_1 is None: # here
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -700,13 +713,13 @@ class EVIMAE(nn.Module):
             assert len(a.shape) == 4
             assert a.shape[1] == self.imu_channel_num
 
-            a_left_arm = a[:, 0:3, :, :]
-            a_right_arm = a[:, 3:6, :, :]
-            a_left_leg = a[:, 6:9, :, :]
-            a_right_leg = a[:, 9:12, :, :]
-            a = torch.cat((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0) # b*4 3 320 128
+            # for ambient, treat each channel independently and replicate 3 times
+            C = a.shape[1]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]
+            a = torch.cat(channels, dim=0)
 
-            bs = int(a.shape[0]/4)
+            # bs corresponds to the original batch size
+            bs = int(a.shape[0]/C)
 
             # IMU patchify
             a = a.transpose(2, 3)
@@ -784,11 +797,8 @@ class EVIMAE(nn.Module):
 
             ############ EVI MAE ##############
 
-            a_left_arm = a[0:bs, :, :]
-            a_right_arm = a[bs:2*bs, :, :]
-            a_left_leg = a[2*bs:3*bs, :, :]
-            a_right_leg = a[3*bs:4*bs, :, :]
-            a_mean = torch.mean(torch.stack((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0), dim=0)
+            chunks = [a[i*bs:(i+1)*bs, :, :] for i in range(C)]
+            a_mean = torch.mean(torch.stack(chunks, dim=0), dim=0)
             a = a_mean
 
             # by default, we always use unstructured masking
@@ -839,13 +849,12 @@ class EVIMAE(nn.Module):
             assert len(a.shape) == 4
             assert a.shape[1] == self.imu_channel_num
 
-            a_left_arm = a[:, 0:3, :, :]
-            a_right_arm = a[:, 3:6, :, :]
-            a_left_leg = a[:, 6:9, :, :]
-            a_right_leg = a[:, 9:12, :, :]
-            a = torch.cat((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0)
+            # for ambient, treat each channel independently and replicate 3 times
+            C = a.shape[1]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]
+            a = torch.cat(channels, dim=0)
 
-            bs = int(a.shape[0]/4)
+            bs = int(a.shape[0]/C)
 
 
             # IMU patchify
@@ -922,11 +931,8 @@ class EVIMAE(nn.Module):
 
             ############ EVI MAE ##############
 
-            a_left_arm = a[0:bs, :, :]
-            a_right_arm = a[bs:2*bs, :, :]
-            a_left_leg = a[2*bs:3*bs, :, :]
-            a_right_leg = a[3*bs:4*bs, :, :]
-            a_mean = torch.mean(torch.stack((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0), dim=0)
+            chunks = [a[i*bs:(i+1)*bs, :, :] for i in range(C)]
+            a_mean = torch.mean(torch.stack(chunks, dim=0), dim=0)
             a = a_mean
 
             # by default, we always use unstructured masking
@@ -1178,7 +1184,7 @@ class EVIMAE(nn.Module):
 # finetune EVI-MAE model
 class EVIMAEFT(nn.Module):
     def __init__(self, label_dim, img_size=224, imu_length=1024, patch_size=16, in_chans=3, video_model_dict=None, imu_model_dict=None,
-                 embed_dim=768, modality_specific_depth=11, num_heads=12, mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, tr_pos=True):
+                 embed_dim=768, modality_specific_depth=11, num_heads=12, mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, tr_pos=True, use_checkpoint=False):
         super().__init__()
 
         self.video_img_size = video_model_dict['img_size']
@@ -1254,20 +1260,20 @@ class EVIMAEFT(nn.Module):
         # imu-branch
         self.blocks_a = nn.ModuleList([
             Block(
-                self.imu_encoder_embed_dim, self.imu_encoder_num_heads, self.video_imu_mlp_ratio, qkv_bias=self.video_imu_qkv_bias, qk_scale=self.video_imu_qk_scale, norm_layer=self.video_imu_norm_layer) 
+                self.imu_encoder_embed_dim, self.imu_encoder_num_heads, self.video_imu_mlp_ratio, qkv_bias=self.video_imu_qkv_bias, qk_scale=self.video_imu_qk_scale, norm_layer=self.video_imu_norm_layer, use_checkpoint=use_checkpoint) 
             for i in range(self.imu_encoder_depth)])
         
         # video-branch
         dpr = [x.item() for x in torch.linspace(0, self.video_drop_path_rate, self.video_encoder_depth)]  # stochastic depth decay rule
         self.blocks_video = nn.ModuleList([
             Video_Block(
-                dim=self.video_encoder_embed_dim, num_heads=self.video_encoder_num_heads, mlp_ratio=self.video_imu_mlp_ratio, qkv_bias=self.video_imu_qkv_bias, qk_scale=self.video_imu_qk_scale, drop=self.video_drop_rate, attn_drop=self.video_attn_drop_rate, drop_path=dpr[i], norm_layer=self.video_imu_norm_layer, init_values=self.video_init_values)
+                dim=self.video_encoder_embed_dim, num_heads=self.video_encoder_num_heads, mlp_ratio=self.video_imu_mlp_ratio, qkv_bias=self.video_imu_qkv_bias, qk_scale=self.video_imu_qk_scale, drop=self.video_drop_rate, attn_drop=self.video_attn_drop_rate, drop_path=dpr[i], norm_layer=self.video_imu_norm_layer, init_values=self.video_init_values, use_checkpoint=use_checkpoint)
             for i in range(self.video_encoder_depth)])
 
         # unified branch
         self.blocks_u = nn.ModuleList([
             Block(
-                self.unified_embed_dim, self.unified_num_heads, self.video_imu_mlp_ratio, qkv_bias=self.video_imu_qkv_bias, qk_scale=self.video_imu_qk_scale, norm_layer=self.video_imu_norm_layer) 
+                self.unified_embed_dim, self.unified_num_heads, self.video_imu_mlp_ratio, qkv_bias=self.video_imu_qkv_bias, qk_scale=self.video_imu_qk_scale, norm_layer=self.video_imu_norm_layer, use_checkpoint=use_checkpoint) 
             for i in range(self.unified_depth)])
 
         # independent normalization layer for imu, visual, and imu-visual
@@ -1382,19 +1388,171 @@ class EVIMAEFT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, a, v, mode):
+    def forward_embedding(self, a, v, mode):
+        """Return the embedding vector BEFORE mlp_head (for sequence-level mean pooling)."""
         if mode == 'multimodal':
             assert len(a.shape) == 4
             assert a.shape[1] == self.imu_channel_num
 
-            # reshape a to b*4, 3, 320, 128
-            a_left_arm = a[:, 0:3, :, :]
-            a_right_arm = a[:, 3:6, :, :]
-            a_left_leg = a[:, 6:9, :, :]
-            a_right_leg = a[:, 9:12, :, :]
+            # Per-channel processing: each sensor channel treated independently
+            C = a.shape[1]
+            bs = a.shape[0]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]  # each (B, 3, H, W)
+            a = torch.cat(channels, dim=0)  # (B*C, 3, H, W)
 
-            a = torch.cat((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0)
-            bs = int(a.shape[0]/4)
+            a = a.transpose(2, 3)
+            a = self.patch_embed_a(a)
+            a = a + self.pos_embed_a.type_as(a).to(a.device).clone().detach()
+            a = a + self.modality_a
+
+            v = self.patch_embed_video(v)
+            v = v + self.pos_embed_video.type_as(v).to(v.device).clone().detach()
+            v = v + self.modality_video
+
+            # Average over per-channel embeddings
+            parts = [a[i*bs:(i+1)*bs] for i in range(C)]
+            a = torch.mean(torch.stack(parts, dim=0), dim=0)
+
+            for blk in self.blocks_a:
+                a = blk(a)
+
+            for blk in self.blocks_video:
+                v = blk(v)
+
+            if a.shape[2] != v.shape[2]:
+                if a.shape[2] == 768 and v.shape[2] == 384:
+                    a = F.avg_pool1d(a, kernel_size=2, stride=2)
+                else:
+                    print('not implemented yet')
+                    exit()
+
+            x = torch.cat((a, v), dim=1)
+
+            for blk in self.blocks_u:
+                x = blk(x)
+            x = self.norm(x)
+
+            x = x.mean(dim=1)
+            return x  # (B, D)
+
+        elif mode == 'ft_imuonly':
+            assert len(a.shape) == 4
+            assert a.shape[1] == self.imu_channel_num
+
+            # Per-channel processing
+            C = a.shape[1]
+            bs = a.shape[0]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]
+            a = torch.cat(channels, dim=0)  # (B*C, 3, H, W)
+
+            a = a.transpose(2, 3)
+            a = self.patch_embed_a(a)
+            a = a + self.pos_embed_a.type_as(a).to(a.device).clone().detach()
+            a = a + self.modality_a
+
+            # Average over per-channel embeddings
+            parts = [a[i*bs:(i+1)*bs] for i in range(C)]
+            a = torch.mean(torch.stack(parts, dim=0), dim=0)
+
+            for blk in self.blocks_a:
+                a = blk(a)
+
+            if a.shape[2] != self.video_encoder_embed_dim:
+                if a.shape[2] == 768 and self.video_encoder_embed_dim == 384:
+                    a = F.avg_pool1d(a, kernel_size=2, stride=2)
+                else:
+                    print('not implemented yet')
+                    exit()
+
+            for blk in self.blocks_u:
+                a = blk(a, 'a')
+
+            a = self.norm_a(a)
+            x = a.mean(dim=1)
+            return x  # (B, D)
+
+        elif mode == 'ft_videoonly':
+            v = self.patch_embed_video(v)
+            v = v + self.pos_embed_video.type_as(v).to(v.device).clone().detach()
+            v = v + self.modality_video
+
+            for blk in self.blocks_video:
+                v = blk(v)
+
+            for blk in self.blocks_u:
+                v = blk(v, 'v')
+            v = self.norm_video(v)
+            x = v.mean(dim=1)
+            return x  # (B, D)
+
+        else:
+            raise ValueError(f'Unsupported mode for forward_embedding: {mode}')
+
+    def forward(self, a, v, mode, lengths=None, chunk_size=16):
+        # Handle sequence inputs for DataParallel sequence processing
+        # Audio/IMU: (B, S, C, H, W) -> 5 dims
+        # Video: (B, S, C, T, H, W) -> 6 dims
+        is_sequence = (a is not None and len(a.shape) == 5) or (v is not None and len(v.shape) == 6)
+        
+        if is_sequence:
+            B, S = -1, -1
+            if a is not None:
+                B, S = a.shape[0], a.shape[1]
+                # Flatten B and S
+                a = a.view(B * S, *a.shape[2:])
+            if v is not None:
+                B, S = v.shape[0], v.shape[1]
+                v = v.view(B * S, *v.shape[2:])
+            
+            # Process in chunks to avoid OOM
+            total_windows = B * S
+            x_wins_list = []
+            
+            for start_idx in range(0, total_windows, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_windows)
+                
+                a_chunk = a[start_idx:end_idx] if a is not None else None
+                v_chunk = v[start_idx:end_idx] if v is not None else None
+                
+                # forward_embedding returns (chunk_size, D)
+                # Ensure we don't pass None if it wasn't None originally, 
+                # but forward_embedding handles None for one modality? 
+                # Actually forward_embedding expects both or specific mode handling.
+                # But here we are just slicing.
+                
+                chunk_out = self.forward_embedding(a_chunk, v_chunk, mode)
+                x_wins_list.append(chunk_out)
+            
+            x_wins = torch.cat(x_wins_list, dim=0)
+            
+            # Reshape back to (B, S, D)
+            x_seq = x_wins.view(B, S, -1)
+            
+            # Masked mean pooling
+            if lengths is not None:
+                # Create mask: (B, S)
+                mask = torch.arange(S, device=x_seq.device).unsqueeze(0) < lengths.unsqueeze(1)
+                mask = mask.unsqueeze(2).float() # (B, S, 1)
+                
+                # Avoid division by zero
+                den = mask.sum(dim=1).clamp(min=1)
+                x_pooled = (x_seq * mask).sum(dim=1) / den
+            else:
+                x_pooled = x_seq.mean(dim=1)
+            
+            # Classification
+            logits = self.mlp_head(x_pooled)
+            return logits
+
+        if mode == 'multimodal':
+            assert len(a.shape) == 4
+            assert a.shape[1] == self.imu_channel_num
+
+            # Per-channel processing: each sensor channel treated independently
+            C = a.shape[1]
+            bs = a.shape[0]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]  # each (B, 3, H, W)
+            a = torch.cat(channels, dim=0)  # (B*C, 3, H, W)
 
             a = a.transpose(2, 3)
             a = self.patch_embed_a(a)
@@ -1408,6 +1566,8 @@ class EVIMAEFT(nn.Module):
             ################### Graph ###################
 
             if self.imu_enable_graph:
+                assert self.imu_channel_num == 12, \
+                    f'Graph mode requires exactly 12 channels (4 body parts x 3 axes), got {self.imu_channel_num}'
                 # STEP 1: graph construction
                 if True:
                     a_for_graph = a.clone()
@@ -1444,13 +1604,10 @@ class EVIMAEFT(nn.Module):
             #############################################
                     
             ############### EVI MAE #####################
-                    
-            a_left_arm = a[0:bs, :, :]
-            a_right_arm = a[bs:2*bs, :, :]
-            a_left_leg = a[2*bs:3*bs, :, :]
-            a_right_leg = a[3*bs:4*bs, :, :]
-            a_mean = torch.mean(torch.stack((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0), dim=0)
-            a = a_mean
+
+            # Average over per-channel embeddings
+            parts = [a[i*bs:(i+1)*bs] for i in range(C)]
+            a = torch.mean(torch.stack(parts, dim=0), dim=0)
 
             for blk in self.blocks_a:
                 a = blk(a)
@@ -1488,13 +1645,11 @@ class EVIMAEFT(nn.Module):
             assert len(a.shape) == 4
             assert a.shape[1] == self.imu_channel_num
 
-            a_left_arm = a[:, 0:3, :, :]
-            a_right_arm = a[:, 3:6, :, :]
-            a_left_leg = a[:, 6:9, :, :]
-            a_right_leg = a[:, 9:12, :, :]
-
-            a = torch.cat((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0)
-            bs = int(a.shape[0]/4)
+            # Per-channel processing
+            C = a.shape[1]
+            bs = a.shape[0]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]
+            a = torch.cat(channels, dim=0)  # (B*C, 3, H, W)
 
             a = a.transpose(2, 3)
             a = self.patch_embed_a(a)
@@ -1502,6 +1657,8 @@ class EVIMAEFT(nn.Module):
             a = a + self.modality_a
 
             if self.imu_enable_graph:
+                assert self.imu_channel_num == 12, \
+                    f'Graph mode requires exactly 12 channels (4 body parts x 3 axes), got {self.imu_channel_num}'
                 # STEP 1: graph construction
                 if True:
                     a_for_graph = a.clone()
@@ -1535,12 +1692,9 @@ class EVIMAEFT(nn.Module):
                     enc_rep, all_hidden = self.graph_encoder(body_graphs_batch, body_graphs_batch_feat, return_hidden=True)
                     graph_enc_rep_Bx512 = self.graph_pooler(body_graphs_batch, enc_rep)
 
-            a_left_arm = a[0:bs, :, :]
-            a_right_arm = a[bs:2*bs, :, :]
-            a_left_leg = a[2*bs:3*bs, :, :]
-            a_right_leg = a[3*bs:4*bs, :, :]
-            a_mean = torch.mean(torch.stack((a_left_arm, a_right_arm, a_left_leg, a_right_leg), dim=0), dim=0)
-            a = a_mean
+            # Average over per-channel embeddings
+            parts = [a[i*bs:(i+1)*bs] for i in range(C)]
+            a = torch.mean(torch.stack(parts, dim=0), dim=0)
 
             for blk in self.blocks_a:
                 a = blk(a)
@@ -1589,13 +1743,19 @@ class EVIMAEFT(nn.Module):
             return x
 
         elif mode == 'inf_imuonly':
-            if len(a.shape) == 3: a = a.unsqueeze(1)
-            elif len(a.shape) == 4: pass
-            else: assert False
+            # Per-channel processing
+            C = a.shape[1]
+            bs = a.shape[0]
+            channels = [a[:, i:i+1, :, :].repeat(1, 3, 1, 1) for i in range(C)]
+            a = torch.cat(channels, dim=0)  # (B*C, 3, H, W)
             a = a.transpose(2, 3)
             a = self.patch_embed_a(a)
             a = a + self.pos_embed_a.type_as(a).to(a.device).clone().detach()
             a = a + self.modality_a
+
+            # Average over per-channel embeddings
+            parts = [a[i*bs:(i+1)*bs] for i in range(C)]
+            a = torch.mean(torch.stack(parts, dim=0), dim=0)
 
             for blk in self.blocks_a:
                 a = blk(a)

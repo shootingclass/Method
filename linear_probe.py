@@ -418,8 +418,8 @@ class LinearProbeLightningModule(pl.LightningModule):
         emb_dim = model.hparams.embedding_dim
         if self.hparams.model_name == "method":
             emb_dim *= 2
-        elif self.hparams.model_name == "comodo":
-            emb_dim //= 2
+        # elif self.hparams.model_name == "comodo":
+        #     emb_dim //= 2
 
         # encoder_type에 따라 embedding dimension 조정
         self.encoder_type = getattr(self.hparams, 'encoder_type', 'sensor')
@@ -815,7 +815,6 @@ class LinearProbeLSTM(pl.LightningModule):
     def _encode_video_windows(self, video_windows, flow_windows=None):
         """비디오 윈도우 인코딩 (정확히 batch_size개씩 처리하여 메모리 절약)"""
         B, S, T, C, H, W = video_windows.shape
-        print("video_windows shape:", video_windows.shape)
         
         # B × S를 먼저 flatten
         total_windows = B * S
@@ -838,24 +837,23 @@ class LinearProbeLSTM(pl.LightningModule):
             else:
                 flow_chunk = None
             
-            with torch.inference_mode():
-                if self.hparams.model_name == "method":
-                    video_encoder = self.backbone.video_model
-                    chunk_reps = video_encoder(chunk, flow_chunk)["z_video_online"]
-                elif self.hparams.model_name == "imu2clip":
-                    video_encoder = self.backbone.video_model
-                    chunk = chunk.permute(0, 2, 1, 3, 4)
-                    chunk_reps = video_encoder.get_video_embeddings(chunk)
-                elif self.hparams.model_name == "primus":
-                    video_encoder = self.backbone.video_model
-                    chunk_reps, _ = video_encoder.get_video_embeddings(chunk)
-                elif self.hparams.model_name == "mae":
-                    chunk_reps = self.backbone.model.forward_video_only(chunk)
-                elif self.hparams.model_name == "comodo":
-                    video_encoder = self.backbone.video_teacher
-                    chunk_reps = video_encoder.encode(chunk)
-                else:
-                    raise ValueError(f"Unknown model_name for video: {self.hparams.model_name}")
+            if self.hparams.model_name == "method":
+                video_encoder = self.backbone.video_model
+                chunk_reps = video_encoder(chunk, flow_chunk)["z_video_online"]
+            elif self.hparams.model_name == "imu2clip":
+                video_encoder = self.backbone.video_model
+                chunk = chunk.permute(0, 2, 1, 3, 4)
+                chunk_reps = video_encoder.get_video_embeddings(chunk)
+            elif self.hparams.model_name == "primus":
+                video_encoder = self.backbone.video_model
+                chunk_reps, _ = video_encoder.get_video_embeddings(chunk)
+            elif self.hparams.model_name == "mae":
+                chunk_reps = self.backbone.model.forward_video_only(chunk)
+            elif self.hparams.model_name == "comodo":
+                video_encoder = self.backbone.video_teacher
+                chunk_reps = video_encoder.encode(chunk)
+            else:
+                raise ValueError(f"Unknown model_name for video: {self.hparams.model_name}")
             
             all_reps.append(chunk_reps)
         
@@ -962,12 +960,12 @@ class LinearProbeLSTM(pl.LightningModule):
         # scalar compute
         log_dict = {
             "val/acc": self.val_acc.compute(),
-            "val/f1_micro": self.val_f1_micro.compute(),
-            "val/f1_macro": self.val_f1_macro.compute(),
+            # "val/f1_micro": self.val_f1_micro.compute(),
+            # "val/f1_macro": self.val_f1_macro.compute(),
             "val/f1_weighted": self.val_f1_weighted.compute(),
-            "val/precision_macro": self.val_prec_macro.compute(),
-            "val/recall_macro": self.val_recall_macro.compute(),
-            "val/auroc_macro": torch.nan_to_num(self.val_auroc.compute()),
+            # "val/precision_macro": self.val_prec_macro.compute(),
+            # "val/recall_macro": self.val_recall_macro.compute(),
+            # "val/auroc_macro": torch.nan_to_num(self.val_auroc.compute()),
             "val/ap_macro": torch.nan_to_num(self.val_ap.compute()),
         }
         self.log_dict(log_dict, prog_bar=True, sync_dist=True)
@@ -980,7 +978,7 @@ class LinearProbeLSTM(pl.LightningModule):
                     xticklabels=class_names, yticklabels=class_names, ax=ax)
         ax.set_title("Validation Confusion Matrix"); ax.set_xlabel("Predicted"); ax.set_ylabel("True")
         if self.logger:
-            self.logger.experiment.log({"val/confusion_matrix": wandb.Image(fig)})
+            self.logger.experiment.log({"Validation Confusion Matrix": wandb.Image(fig)})
         plt.close(fig)
 
         # reset
@@ -1022,12 +1020,12 @@ class LinearProbeLSTM(pl.LightningModule):
     def on_test_epoch_end(self):
         log_dict = {
             "test/acc": self.test_acc.compute(),
-            "test/f1_micro": self.test_f1_micro.compute(),
-            "test/f1_macro": self.test_f1_macro.compute(),
+            # "test/f1_micro": self.test_f1_micro.compute(),
+            # "test/f1_macro": self.test_f1_macro.compute(),
             "test/f1_weighted": self.test_f1_weighted.compute(),
-            "test/precision_macro": self.test_prec_macro.compute(),
-            "test/recall_macro": self.test_recall_macro.compute(),
-            "test/auroc_macro": torch.nan_to_num(self.test_auroc.compute()),
+            # "test/precision_macro": self.test_prec_macro.compute(),
+            # "test/recall_macro": self.test_recall_macro.compute(),
+            # "test/auroc_macro": torch.nan_to_num(self.test_auroc.compute()),
             "test/ap_macro": torch.nan_to_num(self.test_ap.compute()),
         }
         self.log_dict(log_dict, prog_bar=True, sync_dist=True)
@@ -1039,7 +1037,8 @@ class LinearProbeLSTM(pl.LightningModule):
                     xticklabels=class_names, yticklabels=class_names, ax=ax)
         ax.set_title("Test Confusion Matrix"); ax.set_xlabel("Predicted"); ax.set_ylabel("True")
         if self.logger:
-            self.logger.experiment.log({"test/confusion_matrix": wandb.Image(fig)})
+            self.logger.experiment.log({"Test Confusion Matrix": wandb.Image(fig)})
+
         plt.close(fig)
 
         for m in [

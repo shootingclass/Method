@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-03-03T22:42:23",
+  "data_json": "/mnt/hdd4tb/junho/HWU-USP_v2/data_processed_2s_window/motion_2_priority_test=18/pretrain_cropped_with_flow_detail_prudent.json",
+  "num_selected_samples": 64,
+  "num_valid_openclose_samples": 16,
+  "mae_delta_mean": 0.2534243166446686,
+  "detach_delta_mean": 0.1872808337211609,
+  "mae_inversion_ratio_delta_lt_0": 0.0,
+  "detach_inversion_ratio_delta_lt_0": 0.0,
+  "outputs": {
+    "overlay_png": "/home/jaemo/Method/drivens/hwu_usp_benchmark_b_delta_smoke_both/benchmark_b_delta_overlay_mae_vs_detach.png"
+  }
+}

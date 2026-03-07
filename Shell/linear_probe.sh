@@ -58,27 +58,32 @@ echo "linear probe.sh 시작"
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --dataset_name Opportunity++ --batch_size 32 --threshold_epoch 0 --video_classifier_epoch 0 --bad_correction_epoch 0 --momentum_m 0.999  --lambda_hard 3.0 --contrastive_temp 0.10 --damp_warmup_epochs 0 --num_workers 0
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --dataset_name HWU-USP --batch_size 32 --threshold_epoch 0 --video_classifier_epoch 0 --bad_correction_epoch 0 --momentum_m 0.999  --lambda_hard 3.0 --contrastive_temp 0.10 --damp_warmup_epochs 0 --num_workers 0
 # for model in primus imu2clip comodo mae
-for model in method
+model=method
+for dataset_name in Opportunity++
 do
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/mae/Opportunity++/mae.ckpt --profile --linear_epochs 2
-    python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type video
-    python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor-video
-    python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor
-
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/crossModal.ckpt --encoder_type video --use_flow
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/crossModal.ckpt --encoder_type sensor-video --use_flow
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow.ckpt --encoder_type sensor
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow.ckpt --encoder_type video
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow.ckpt --encoder_type sensor-video
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow.ckpt --encoder_type sensor
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/crossModal.ckpt --encoder_type video --use_flow
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/crossModal.ckpt --encoder_type sensor-video --use_flow
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/crossModal.ckpt --encoder_type sensor --use_flow
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/imu2clip/Opportunity++/imu2clip_unfreezed.ckpt
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/imu2clip/Opportunity++/imu2clip_unfreezed.ckpt --encoder_type video    
-    # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/imu2clip/Opportunity++/imu2clip_unfreezed.ckpt --encoder_type sensor-video
-    echo "${model} linear probe 끝"
+    for encoder_type in video sensor-video
+    do
+        if [ "$model" == "method" ]; then   
+            python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/${dataset_name}/mvit_flow.ckpt --encoder_type ${encoder_type} --use_flow
+            # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/${dataset_name}/noFlow.ckpt --encoder_type ${encoder_type}
+            # python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/${dataset_name}/crossModal.ckpt --encoder_type ${encoder_type} --use_flow
+        else
+            python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/${dataset_name}/${model}.ckpt --encoder_type ${encoder_type}
+        fi
+        echo "${dataset_name} ${encoder_type} linear probe 끝"
+    done
 done
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/crossModal.ckpt --encoder_type sensor-video --use_flow
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/noFlow.ckpt --encoder_type sensor
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/Opportunity++/crossModal.ckpt --encoder_type video --use_flow
+
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow_diff.ckpt --encoder_type video --linear_epochs 50
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/crossModal.ckpt --encoder_type video --use_flow --probe_mode lstm
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow.ckpt --encoder_type sensor-video
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/noFlow.ckpt --encoder_type sensor
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/crossModal.ckpt --encoder_type sensor-video --use_flow
+# python linear_probe.py --batch_size 4 --checkpoint_path /home/jaemo/Method/checkpoints/${model}/HWU-USP/crossModal.ckpt --encoder_type sensor --use_flow
+
 
 # CUDA_VISIBLE_DEVICES=0 python linear_probe.py \
 #   --batch_size 1 \

@@ -1,0 +1,52 @@
+{
+  "sample_index": 2,
+  "seed": 42,
+  "sample_meta": "trim_2s_video_cropped/S4-ADL4/S4-ADL4_000421000_000423000.mp4",
+  "imu_shape": [
+    1,
+    37,
+    128,
+    128
+  ],
+  "video_shape": [
+    1,
+    3,
+    16,
+    224,
+    224
+  ],
+  "v_mask_shape": [
+    1,
+    1568
+  ],
+  "loss": 1.2466487884521484,
+  "loss_mae": 1.2466487884521484,
+  "loss_mae_a": 0.8706555366516113,
+  "loss_mae_v": 0.37599319219589233,
+  "loss_c": -0.0,
+  "contrast_acc": 1.0,
+  "loss_g": 0.0,
+  "mask_a_shape": [
+    1,
+    64
+  ],
+  "mask_v_shape": [
+    1,
+    1568
+  ],
+  "first_frame_path": "/home/jaemo/Method/drivens/mae_linear_val/4_Open_Fridge/first_frame.png",
+  "original_info": {
+    "original_frame_dir": "/home/jaemo/Method/drivens/mae_linear_val/4_Open_Fridge/original_frames",
+    "num_frames": 16
+  },
+  "attention_info": {
+    "feature_overlay_dir": "/home/jaemo/Method/drivens/mae_linear_val/4_Open_Fridge/attention_overlay",
+    "num_frames": 16,
+    "patch_grid": [
+      14,
+      14
+    ],
+    "tubelets": 8,
+    "map_type": "video_token_energy_no_mask"
+  }
+}
